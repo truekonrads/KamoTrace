@@ -1,0 +1,24 @@
+# Local evidence and enrichment must never be committed.
+*.duckdb
+*.duckdb.*
+*.sqlite3
+*.sqlite3-*
+*.jsonl
+*.mmdb
+event_history*.json
+ssm_command_session_activity*.json
+/ssm_exports/
+/data/
+/.amp/in/
+
+# Python environments and generated files.
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+
+# Build output.
+dist/
+build/
+*.egg-info/

@@ -1,0 +1,532 @@
+"""Local, read-only CloudTrail browser. Run with: kamotrace serve --database events.duckdb"""
+import argparse
+from datetime import datetime, timezone
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import json
+import math
+from pathlib import Path
+import re
+import sqlite3
+import threading
+import time
+from urllib.parse import urlsplit
+
+import duckdb
+
+
+ROOT = Path(__file__).resolve().parent
+FIELDS = {
+    "time_local": "Time (WIB)",
+    "event_name": "Operation", "event_source": "AWS service", "identity": "Identity",
+    "source_ip": "Source IP", "country": "Country", "key_id": "Access key ID",
+    "target": "Target instance", "error_code": "Error code", "identity_type": "Identity type",
+    "region": "Region", "user_agent": "User agent", "event_id": "Event ID",
+    "document_name": "SSM document", "isp": "Network / ISP",
+    "city": "City", "asn": "ASN", "ip_info": "IP attributes",
+}
+SORT_FIELDS = {*FIELDS, "time_local", "id"}
+OPERATORS = {"eq", "neq", "in", "contains", "not_contains", "empty", "not_empty", "missing", "not_missing"}
+PAGE_SIZES = (25, 50, 100, 250, 500)
+LEVELS = ("informational", "low", "medium", "high", "critical")  # Suzaku/Sigma severity order
+
+
+def parse_time(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Time must be an ISO timestamp with a timezone") from None
+    if parsed.tzinfo is None:
+        raise ValueError("Time must include a timezone; Jakarta is +07:00")
+    return parsed
+
+
+def build_query(body):
+    """Only allowlisted SQL fragments; all user values remain bound parameters."""
+    conditions, params = [], []
+    start, end = body.get("start"), body.get("end")
+    if start:
+        parse_time(start)
+        conditions.append("event_time >= ?::TIMESTAMPTZ")
+        params.append(start)
+    if end:
+        parse_time(end)
+        conditions.append("event_time < ?::TIMESTAMPTZ")
+        params.append(end)
+    if start and end and parse_time(start) >= parse_time(end):
+        raise ValueError("Start must be before end (the end is exclusive)")
+    search = body.get("search", "")
+    if not isinstance(search, str) or len(search) > 2000:
+        raise ValueError("Search must be text, up to 2,000 characters")
+    if search:
+        conditions.append("contains(lower(raw_event::VARCHAR), lower(?))")
+        params.append(search)
+    filters = body.get("filters", [])
+    if not isinstance(filters, list) or len(filters) > 20:
+        raise ValueError("Use at most 20 filters")
+    for item in filters:
+        field, op, value = item.get("field"), item.get("op"), item.get("value", "")
+        if field not in FIELDS or op not in OPERATORS:
+            raise ValueError("Unknown filter field or operator")
+        if not isinstance(value, str) or len(value) > 2000:
+            raise ValueError("Filter values must be text, up to 2,000 characters")
+        if op in ("missing", "not_missing"):
+            conditions.append(f"{field} IS {'NOT ' if op == 'not_missing' else ''}NULL")
+        elif op in ("empty", "not_empty"):
+            conditions.append(f"coalesce({field}, '') {'=' if op == 'empty' else '<>'} ''")
+        elif op in ("eq", "neq"):
+            conditions.append(f"{field} IS {'NOT ' if op == 'eq' else ''}DISTINCT FROM ?")
+            params.append(value)
+        elif op == "in":
+            values = [v.strip() for v in value.split(",") if v.strip()]
+            if not values or len(values) > 100:
+                raise ValueError("One-of filters need 1 to 100 comma-separated values")
+            conditions.append(f"{field} IN ({', '.join('?' for _ in values)})")
+            params.extend(values)
+        else:
+            conditions.append(f"{'NOT ' if op == 'not_contains' else ''}contains(lower(coalesce({field}, '')), lower(?))")
+            params.append(value)
+    tags = body.get("tags", [])
+    if not isinstance(tags, list) or len(tags) > 20 or any(not isinstance(t, str) for t in tags):
+        raise ValueError("Use at most 20 tags")
+    for tag in tags:
+        conditions.append("record_sha256 IN (SELECT hash FROM review_tags WHERE slug=?)")
+        params.append(tag)
+    if body.get("annotation_id") is not None:
+        conditions.append("record_sha256 IN (SELECT hash FROM review_notes WHERE annotation_id=?)")
+        params.append(int(body["annotation_id"]))
+    if body.get("command_key") is not None:
+        if not isinstance(body["command_key"], str):
+            raise ValueError("Command key must be text")
+        conditions.append("id IN (SELECT source_record FROM ssm_links WHERE command_key=?)")
+        params.append(body["command_key"])
+    # Imported Suzaku (Sigma) detections: every listed rule must match, like tags.
+    rules = body.get("rules", [])
+    if not isinstance(rules, list) or len(rules) > 20 or any(not isinstance(r, str) for r in rules):
+        raise ValueError("Use at most 20 detection rules")
+    for rule in rules:
+        conditions.append("id IN (SELECT source_record FROM detections WHERE rule_id=?)")
+        params.append(rule)
+    if body.get("min_level") is not None:
+        if body["min_level"] not in LEVELS:
+            raise ValueError("Minimum level must be one of: " + ", ".join(LEVELS))
+        conditions.append("id IN (SELECT source_record FROM detections WHERE level_rank >= ?)")
+        params.append(LEVELS.index(body["min_level"]))
+    sorters = body.get("sorters") or [{"field": "time_local", "dir": "desc"}]
+    if not isinstance(sorters, list) or len(sorters) > 5:
+        raise ValueError("Use at most five sort columns")
+    ordering = []
+    for sorter in sorters:
+        field, direction = sorter.get("field"), sorter.get("dir")
+        if field not in SORT_FIELDS or direction not in ("asc", "desc"):
+            raise ValueError("Unknown sort field or direction")
+        ordering.append(f"{'event_time' if field == 'time_local' else field} {direction.upper()} NULLS LAST")
+    ordering.append("id ASC")
+    try:
+        page, size = int(body.get("page", 1)), int(body.get("size", 100))
+    except (TypeError, ValueError):
+        raise ValueError("Page and size must be integers") from None
+    if page < 1 or size not in PAGE_SIZES:
+        raise ValueError("Invalid page or page size")
+    where = "\nWHERE " + "\n  AND ".join(conditions) if conditions else ""
+    sql = ("SELECT id, record_sha256, time_local, event_name, event_source, identity, source_ip, country,\n"
+           "       identity_type, key_id, target, document_name, error_code, region, isp, city, asn, ip_info, event_id\n"
+           "FROM browse_events" + where + "\nORDER BY " + ", ".join(ordering) + "\nLIMIT ? OFFSET ?")
+    return sql, params + [size, (page - 1) * size], "SELECT count(*) FROM browse_events" + where, params, size
+
+
+class Store:
+    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None):
+        self.connection = duckdb.connect(str(database), read_only=True)
+        self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
+        self.lock = threading.Lock()
+        self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
+        self.reviews.row_factory = sqlite3.Row
+        self.reviews.executescript("""
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL,
+                updated TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS annotation_events(annotation_id INTEGER REFERENCES annotations(id) ON DELETE CASCADE,
+                hash TEXT NOT NULL, PRIMARY KEY(annotation_id, hash));
+            CREATE TABLE IF NOT EXISTS tags(slug TEXT PRIMARY KEY, color TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS event_tags(hash TEXT NOT NULL, slug TEXT REFERENCES tags(slug), PRIMARY KEY(hash, slug));
+        """)
+        # Additive migration: older sidecars lack the query a note was written from.
+        if "context" not in {r["name"] for r in self.reviews.execute("PRAGMA table_info(annotations)")}:
+            self.reviews.execute("ALTER TABLE annotations ADD COLUMN context TEXT")
+            self.reviews.commit()
+        self.connection.execute("CREATE TEMP TABLE review_tags(hash VARCHAR, slug VARCHAR)")
+        self.connection.execute("CREATE TEMP TABLE review_notes(hash VARCHAR, annotation_id BIGINT)")
+        self.refresh_reviews()
+        from .enrich import load_enrichment
+        # IP enrichment comes from a sidecar written by `kamotrace enrich` (GeoLite2 and/or neutral JSONL).
+        default = database.with_suffix(".enrichment.duckdb")
+        self.enrichment_run = load_enrichment(self.connection, enrichment or (default if default.exists() else None))
+        self.connection.execute("""
+            CREATE TEMP VIEW browse_events AS
+            SELECT e.source_record AS id, e.record_sha256, e.event_id, e.event_time,
+                strftime(e.event_time AT TIME ZONE 'Asia/Jakarta', '%Y-%m-%d %H:%M:%S') AS time_local,
+                e.event_source, e.event_name, e.source_ip, e.identity_type,
+                coalesce(e.identity_arn, e.user_identity->>'$.userName',
+                    e.user_identity->>'$.principalId', e.user_identity->>'$.invokedBy', '(unattributed)') AS identity,
+                e.user_identity->>'$.accessKeyId' AS key_id,
+                coalesce(e.request_parameters->>'$.target', e.request_parameters->>'$.instanceIds',
+                    e.request_parameters->>'$.instanceId') AS target,
+                e.request_parameters->>'$.documentName' AS document_name,
+                e.error_code, e.aws_region AS region, e.user_agent, e.raw_event,
+                coalesce(g.country, '(unmapped / service / private)') AS country, g.isp, g.city, g.asn, g.ip_info
+            FROM events e LEFT JOIN ip_enrichment g ON e.source_ip = g.ip
+        """)
+        from .ssm import Commands
+        from .suzaku import load_detections
+        self.commands = Commands(ssm_export, self.connection)
+        # Suzaku detections come from a derived sidecar written by `kamotrace suzaku`; only rows the
+        # CLI linked to exactly one evidence record are queryable. Missing sidecar = no detections.
+        default = database.with_suffix(".detections.duckdb")
+        self.suzaku_run = load_detections(self.connection, detections or (default if default.exists() else None))
+        # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
+        self.connection.execute("SET enable_external_access=false")
+        self.meta = self.metadata()
+
+    def refresh_reviews(self):
+        for table, source in (("review_tags", "SELECT hash,slug FROM event_tags"),
+                              ("review_notes", "SELECT hash,annotation_id FROM annotation_events")):
+            self.connection.execute(f"DELETE FROM {table}")
+            rows = [tuple(r) for r in self.reviews.execute(source)]
+            if rows:
+                self.connection.executemany(f"INSERT INTO {table} VALUES (?,?)", rows)
+
+    def reviews_list(self):
+        with self.lock:
+            # Counts are evidence events (rows), across the whole database, independent of the current query.
+            tag_counts = dict(self.connection.execute("""SELECT r.slug, count(*) FROM review_tags r
+                JOIN events e ON e.record_sha256 = r.hash GROUP BY 1""").fetchall())
+            note_counts = dict(self.connection.execute("""SELECT r.annotation_id, count(*) FROM review_notes r
+                JOIN events e ON e.record_sha256 = r.hash GROUP BY 1""").fetchall())
+            notes = []
+            for row in self.reviews.execute("""SELECT a.id, a.body, a.updated, a.context FROM annotations a
+                    WHERE EXISTS (SELECT 1 FROM annotation_events e WHERE e.annotation_id=a.id)
+                    ORDER BY a.updated DESC, a.id DESC"""):
+                note = dict(row)
+                note["context"] = json.loads(note["context"]) if note["context"] else None
+                note["events"] = note_counts.get(note["id"], 0)
+                notes.append(note)
+            return {"annotations": notes, "tags": [{**dict(r), "events": tag_counts.get(r["slug"], 0)}
+                                                   for r in self.reviews.execute("SELECT * FROM tags ORDER BY slug")]}
+
+    def review_write(self, body):
+        action = body.get("action")
+        with self.lock:
+            with self.reviews:
+                if action in ("annotate", "tag", "untag", "link", "unlink"):
+                    hashes = body.get("hashes")
+                    if not isinstance(hashes, list) or not 1 <= len(hashes) <= 5000 or any(not isinstance(h, str) for h in hashes):
+                        raise ValueError("Select 1 to 5,000 events")
+                    hashes = list(set(hashes))
+                    found = self.connection.execute("SELECT DISTINCT record_sha256 FROM events WHERE record_sha256 IN (SELECT unnest(?))", [hashes]).fetchall()
+                    if len(found) != len(hashes):
+                        raise ValueError("Unknown event hash")
+                stamp = datetime.now(timezone.utc).isoformat()
+                if action in ("edit", "delete"):
+                    # Optimistic concurrency: the browser and agents share this sidecar, so a writer must
+                    # quote the version it read; a stale edit/delete fails instead of overwriting.
+                    current = self.reviews.execute("SELECT updated FROM annotations WHERE id=?", (int(body.get("id")),)).fetchone()
+                    if current is None:
+                        raise ValueError("Unknown annotation")
+                    if body.get("updated") != current["updated"]:
+                        raise ValueError("This note changed since it was loaded (another tab or agent wrote it); "
+                                         "reload it and reapply your change")
+                if action in ("annotate", "edit"):
+                    text = body.get("body")
+                    if not isinstance(text, str) or not text.strip() or len(text) > 30000:
+                        raise ValueError("Annotation must contain 1 to 30,000 characters")
+                    if action == "annotate":
+                        # Optional browser query state the note was written from; it is re-validated by
+                        # build_query whenever it is reopened, so it is stored as inert JSON text only.
+                        context = body.get("context")
+                        if context is not None:
+                            if not isinstance(context, dict):
+                                raise ValueError("Note context must be a JSON object")
+                            context = json.dumps(context, ensure_ascii=False)
+                            if len(context) > 20000:
+                                raise ValueError("Note context is too large")
+                        cursor = self.reviews.execute("INSERT INTO annotations(body,updated,context) VALUES (?,?,?)", (text, stamp, context))
+                        self.reviews.executemany("INSERT INTO annotation_events VALUES (?,?)", [(cursor.lastrowid, h) for h in hashes])
+                    else:
+                        self.reviews.execute("UPDATE annotations SET body=?,updated=? WHERE id=?", (text, stamp, int(body.get("id"))))
+                elif action == "delete":
+                    self.reviews.execute("DELETE FROM annotations WHERE id=?", (int(body.get("id")),))
+                elif action in ("link", "unlink"):
+                    note = int(body.get("id"))
+                    if not self.reviews.execute("SELECT 1 FROM annotations WHERE id=?", (note,)).fetchone():
+                        raise ValueError("Unknown annotation")
+                    if action == "link":
+                        self.reviews.executemany("INSERT OR IGNORE INTO annotation_events VALUES (?,?)", [(note, h) for h in hashes])
+                    else:
+                        self.reviews.executemany("DELETE FROM annotation_events WHERE annotation_id=? AND hash=?", [(note, h) for h in hashes])
+                        if not self.reviews.execute("SELECT 1 FROM annotation_events WHERE annotation_id=?", (note,)).fetchone():
+                            raise ValueError("A note needs at least one linked event; delete the note instead")
+                    self.reviews.execute("UPDATE annotations SET updated=? WHERE id=?", (stamp, note))
+                elif action == "color":
+                    slug, color = body.get("slug"), body.get("color", "")
+                    if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                        raise ValueError("Choose a six-digit hex color")
+                    if not self.reviews.execute("UPDATE tags SET color=? WHERE slug=?", (color, slug)).rowcount:
+                        raise ValueError("Unknown tag")
+                elif action in ("tag", "untag"):
+                    slug = body.get("slug", "")
+                    if not isinstance(slug, str) or len(slug) > 256 or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+                        raise ValueError("Tags must be lowercase hyphen-separated slugs, at most 256 characters")
+                    if action == "tag":
+                        color = body.get("color", "")
+                        if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                            raise ValueError("Choose a six-digit hex color")
+                        self.reviews.execute("INSERT INTO tags VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET color=excluded.color", (slug, color))
+                        self.reviews.executemany("INSERT OR IGNORE INTO event_tags VALUES (?,?)", [(h, slug) for h in hashes])
+                    else:
+                        self.reviews.executemany("DELETE FROM event_tags WHERE hash=? AND slug=?", [(h, slug) for h in hashes])
+                else:
+                    raise ValueError("Unknown review action")
+            self.refresh_reviews()
+        return {"ok": True, **({"id": cursor.lastrowid} if action == "annotate" else {}),
+                **({"updated": stamp} if action in ("annotate", "edit", "link", "unlink") else {})}
+
+    def rows(self, sql, params=None):
+        result = self.connection.execute(sql, params or [])
+        names = [column[0] for column in result.description]
+        return [dict(zip(names, row)) for row in result.fetchall()]
+
+    def metadata(self):
+        bounds = self.rows("""SELECT count(*) AS total, min(epoch_ms(event_time)) AS start_ms,
+            max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""")[0]
+        histogram = self.rows("""SELECT strftime(event_time AT TIME ZONE 'Asia/Jakarta', '%Y-%m-%d') AS day,
+            count(*) AS total, count(*) FILTER (WHERE event_source='ssm.amazonaws.com'
+            AND event_name IN ('SendCommand','StartSession')) AS ssm
+            FROM browse_events GROUP BY 1 ORDER BY 1""")
+        facets = {field: [r["value"] for r in self.rows(
+            f"SELECT DISTINCT {field} AS value FROM browse_events WHERE {field} IS NOT NULL ORDER BY 1")]
+            for field in ("event_name", "event_source", "country", "identity_type", "error_code", "document_name")}
+        return {**bounds, "histogram": histogram, "facets": facets, "fields": FIELDS,
+                "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
+                "levels": LEVELS, "detections_loaded": self.suzaku_run is not None,
+                "enrichment": self.enrichment_run,
+                "timezone": "Asia/Jakarta", "database": "cloudtrail.duckdb", "read_only": True}
+
+    def query(self, body):
+        sql, params, count_sql, count_params, size = build_query(body)
+        started = time.monotonic()
+        with self.lock:
+            total = self.connection.execute(count_sql, count_params).fetchone()[0]
+            rows = self.rows(sql, params)
+            found = self.row_detections([row["id"] for row in rows])
+            for row in rows:
+                row["tags"] = [dict(r) for r in self.reviews.execute("SELECT t.* FROM tags t JOIN event_tags e USING(slug) WHERE e.hash=? ORDER BY slug", (row["record_sha256"],))]
+                row["annotations"] = [r[0] for r in self.reviews.execute("SELECT annotation_id FROM annotation_events WHERE hash=?", (row["record_sha256"],))]
+                row["detections"] = found.get(row["id"], [])
+        return {"data": rows, "last_page": max(1, math.ceil(total / size)), "last_row": total,
+                "sql": sql, "params": params, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+
+    def histogram(self, body):
+        width = body.get("bucket_minutes", 1440)
+        if not str(width).isdigit() or not 1 <= int(width) <= 525600:
+            raise ValueError("Bucket width must be 1 to 525,600 whole minutes")
+        minutes = int(width)
+        start = body.get("start") or datetime.fromtimestamp(self.meta["start_ms"] / 1000, timezone.utc).isoformat()
+        end = body.get("end") or datetime.fromtimestamp(self.meta["end_ms"] / 1000, timezone.utc).isoformat()
+        _, _, count_sql, params, _ = build_query({**body, "start": start, "end": end})
+        if (parse_time(end) - parse_time(start)).total_seconds() / (minutes * 60) > 2000:
+            raise ValueError("More than 2,000 buckets: choose a larger bucket or a shorter time range")
+        interval = f"{minutes} minutes"
+        # Bucket the local timestamp, not UTC, so daily boundaries are Jakarta midnight.
+        # generate_series keeps empty buckets visible; the matching CTE uses exactly the grid filters.
+        sql = """WITH matching AS (
+        """ + count_sql.replace("SELECT count(*)", "SELECT event_time", 1) + """
+        ), counts AS (
+            SELECT time_bucket(?::INTERVAL, event_time AT TIME ZONE 'Asia/Jakarta') AS bucket,
+                   count(*) AS events FROM matching GROUP BY 1
+        ), buckets AS (
+            SELECT bucket FROM generate_series(
+                time_bucket(?::INTERVAL, ?::TIMESTAMPTZ AT TIME ZONE 'Asia/Jakarta'),
+                time_bucket(?::INTERVAL, (?::TIMESTAMPTZ - INTERVAL '1 microsecond') AT TIME ZONE 'Asia/Jakarta'),
+                ?::INTERVAL) AS series(bucket)
+        )
+        SELECT strftime(b.bucket, '%Y-%m-%d %H:%M:%S') AS bucket_start_local,
+               coalesce(c.events, 0) AS events
+        FROM buckets b LEFT JOIN counts c USING (bucket) ORDER BY b.bucket"""
+        bound = params + [interval, interval, start, interval, end, interval]
+        with self.lock:
+            rows = self.rows(sql, bound)
+        return {"data": rows, "total": sum(r["events"] for r in rows),
+                "bucket_minutes": minutes, "sql": sql, "params": bound}
+
+    def column_values(self, body):
+        field = body.get("field")
+        if field not in {*FIELDS, "time_local"}:
+            raise ValueError("Unknown summary column")
+        _, _, count_sql, params, _ = build_query(body)
+        if "value" in body:
+            value = body["value"]
+            if value is not None and not isinstance(value, str):
+                raise ValueError("Cell values must be text or null")
+            sql = count_sql.replace("SELECT count(*)", f"SELECT count(*) AS total, "
+                f"count(*) FILTER (WHERE {field} IS NOT DISTINCT FROM ?) AS events", 1)
+            with self.lock:
+                return self.rows(sql, [value, *params])[0]
+        sql = """WITH counts AS (
+        """ + count_sql.replace("SELECT count(*)", f"SELECT {field} AS value, count(*) AS events", 1) + """
+            GROUP BY 1
+        ), ranked AS (
+            SELECT *, row_number() OVER (ORDER BY events DESC, value ASC NULLS LAST) AS top_rank,
+                row_number() OVER (ORDER BY events ASC, value ASC NULLS LAST) AS bottom_rank,
+                sum(events) OVER () AS total, count(*) OVER () AS distinct_values
+            FROM counts
+        ) SELECT * FROM ranked WHERE top_rank <= 5 OR bottom_rank <= 5"""
+        with self.lock:
+            rows = self.rows(sql, params)
+        return {"top": [{"value": r["value"], "events": r["events"]}
+                        for r in sorted(rows, key=lambda r: r["top_rank"]) if r["top_rank"] <= 5],
+                "bottom": [{"value": r["value"], "events": r["events"]}
+                           for r in sorted(rows, key=lambda r: r["bottom_rank"]) if r["bottom_rank"] <= 5],
+                "total": int(rows[0]["total"]) if rows else 0,
+                "distinct_values": rows[0]["distinct_values"] if rows else 0}
+
+    def detail(self, record):
+        with self.lock:
+            rows = self.rows("SELECT event_id, record_sha256, raw_event::VARCHAR AS raw_json FROM events WHERE source_record=?", [record])
+            if rows:
+                rows[0]["ssm_commands"] = self.commands.for_record(record)
+                rows[0]["detections"] = self.row_detections([record]).get(record, [])
+        return rows[0] if rows else None
+
+    def row_detections(self, records):
+        """Suzaku rule matches per evidence record, most severe first. Caller holds the lock."""
+        found = {}
+        for record, rule_id, title, level, tactics, techniques in self.connection.execute("""
+                SELECT source_record, rule_id, rule_title, level, tactics, technique_ids FROM detections
+                WHERE source_record IN (SELECT unnest(?)) ORDER BY level_rank DESC, rule_title""", [records]).fetchall():
+            found.setdefault(record, []).append({"rule_id": rule_id, "title": title, "level": level,
+                                                  "tactics": tactics, "techniques": techniques})
+        return found
+
+    def detections_list(self):
+        with self.lock:
+            rules = self.rows("""SELECT rule_id, any_value(rule_title) AS title, any_value(level) AS level,
+                    any_value(level_rank) AS level_rank, any_value(tactics) AS tactics,
+                    any_value(technique_ids) AS techniques, count(DISTINCT source_record) AS events
+                FROM detections GROUP BY rule_id ORDER BY level_rank DESC, events DESC, title""")
+        for rule in rules:
+            del rule["level_rank"]
+        return {"run": self.suzaku_run, "rules": rules}
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, store, **kwargs):
+        self.store = store
+        super().__init__(*args, directory=str(ROOT / "static"), **kwargs)
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'")
+        super().end_headers()
+
+    def allowed(self):
+        # Loopback-only plus Host/Origin checks prevent DNS rebinding and cross-site requests.
+        host = self.headers.get("Host", "")
+        allowed_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+        origin = self.headers.get("Origin")
+        if host not in allowed_hosts or (origin and origin not in {"http://" + h for h in allowed_hosts}):
+            self.respond({"error": "Only local, same-origin access is allowed"}, 403)
+            return False
+        return True
+
+    def respond(self, value, status=200):
+        body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if not self.allowed():
+            return
+        path = urlsplit(self.path).path
+        if path == "/api/meta":
+            self.respond(self.store.meta)
+        elif path == "/api/reviews":
+            self.respond(self.store.reviews_list())
+        elif path == "/api/detections":
+            self.respond(self.store.detections_list())
+        elif path.startswith("/api/events/"):
+            try:
+                record = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                self.respond({"error": "Invalid record ID"}, 400)
+                return
+            detail = self.store.detail(record)
+            self.respond(detail or {"error": "Event not found"}, 200 if detail else 404)
+        elif path.startswith("/api/"):
+            self.respond({"error": "Not found"}, 404)
+        elif path in ("/", "/index.html", "/app.js", "/app.css") or path.startswith("/vendor/"):
+            super().do_GET()
+        else:
+            self.respond({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        if not self.allowed():
+            return
+        if self.path not in ("/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event"):
+            self.respond({"error": "Not found"}, 404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 1048576:
+                raise ValueError("Request must contain at most 1 MB of JSON")
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict):
+                raise ValueError("Expected a JSON object")
+            operation = {"/api/events": self.store.query, "/api/histogram": self.store.histogram,
+                         "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
+                         "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
+                         "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]
+            self.respond(operation(body))
+        except (ValueError, TypeError, AttributeError) as error:
+            self.respond({"error": str(error)}, 400)
+        except (duckdb.Error, sqlite3.Error) as error:
+            self.log_error("Database operation failed: %s", error)
+            self.respond({"error": "Database operation failed; check the server log"}, 500)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="kamotrace serve", description=__doc__)
+    parser.add_argument("--database", type=Path, required=True, help="Evidence DuckDB built by `kamotrace import`")
+    parser.add_argument("--enrichment", type=Path,
+                        help="IP enrichment from `kamotrace enrich` (default: <database>.enrichment.duckdb if present)")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--annotations", type=Path, help="SQLite sidecar (default: beside the evidence database)")
+    parser.add_argument("--ssm-export", type=Path, help="Local ssm_command_session_activity[.enriched].json export")
+    parser.add_argument("--detections", type=Path,
+                        help="Suzaku detections from `kamotrace suzaku` (default: <database>.detections.duckdb if present)")
+    args = parser.parse_args(argv)
+    for name in ("database", "enrichment", "ssm_export", "detections"):
+        path = getattr(args, name)
+        if path is not None and not path.is_file():
+            parser.error(f"--{name.replace('_', '-')} not found: {path}")
+    store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
+                  args.ssm_export, args.detections and args.detections.resolve())
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), partial(Handler, store=store))
+    detections = (f" | {store.suzaku_run['linked_rows']:,} Suzaku detections" if store.suzaku_run else "")
+    print(f"KamoTrace: http://127.0.0.1:{args.port} | {store.meta['total']:,} events{detections} | read-only", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        store.reviews.close()
+        store.connection.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>KamoTrace</title>
+    <link rel="stylesheet" href="/vendor/tabulator.min.css" />
+    <link rel="stylesheet" href="/vendor/nouislider.min.css" />
+    <link rel="stylesheet" href="/app.css" />
+    <script defer src="/vendor/tabulator.min.js"></script>
+    <script defer src="/vendor/nouislider.min.js"></script>
+    <script defer src="/vendor/marked.min.js"></script>
+    <script defer src="/vendor/purify.min.js"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <h1>KamoTrace</h1>
+        <span id="coverage">Opening local evidence…</span>
+      </div>
+      <nav class="workspace-tabs" aria-label="Evidence views">
+        <button id="events-tab" aria-pressed="true">CloudTrail events</button>
+        <button id="commands-tab" aria-pressed="false">SSM commands</button>
+      </nav>
+      <div class="utilities">
+        <button
+          id="toggle-findings"
+          aria-pressed="true"
+          aria-controls="findings"
+          title="Show or hide the Findings sidebar (tags and notes)"
+        >
+          Findings
+        </button>
+        <button id="show-sql" title="Show the generated SQL below the grid">
+          SQL
+        </button>
+        <span class="readonly">Read-only · local DuckDB</span>
+      </div>
+    </header>
+    <div class="layout">
+      <aside id="findings" aria-label="Findings: tags and notes">
+        <div class="findings-head">
+          <h2>Findings</h2>
+          <button
+            id="close-findings"
+            class="icon-button"
+            aria-label="Hide Findings sidebar"
+          >
+            ×
+          </button>
+        </div>
+        <div class="findings-tabs" role="tablist">
+          <button id="tags-tab" role="tab" aria-selected="true">Tags</button>
+          <button id="notes-tab" role="tab" aria-selected="false">Notes</button>
+          <button id="detections-tab" role="tab" aria-selected="false" hidden>
+            Detections
+          </button>
+        </div>
+        <section id="tags-pane" aria-label="Tags">
+          <input
+            id="tag-search"
+            type="search"
+            placeholder="Search tags…"
+            aria-label="Search tags"
+          />
+          <p class="hint">
+            Event counts across all evidence. Click to filter; all tag filters
+            must match. Click a swatch to recolor it everywhere.
+          </p>
+          <ul id="tag-list"></ul>
+        </section>
+        <section id="notes-pane" aria-label="Notes" hidden>
+          <input
+            id="note-search"
+            type="search"
+            placeholder="Search notes…"
+            aria-label="Search notes"
+          />
+          <p id="note-scope" class="hint" hidden></p>
+          <ul id="note-list"></ul>
+        </section>
+        <section id="detections-pane" aria-label="Suzaku detections" hidden>
+          <input
+            id="rule-search"
+            type="search"
+            placeholder="Search rules, levels, ATT&amp;CK…"
+            aria-label="Search detection rules"
+          />
+          <p class="hint">
+            Sigma rules Suzaku matched, most severe first, with linked event
+            counts. Click to filter; all rule filters must match.
+          </p>
+          <ul id="rule-list"></ul>
+          <p id="detections-run" class="hint"></p>
+        </section>
+      </aside>
+      <main>
+        <section class="time-panel" aria-label="Time range and histograms">
+          <div class="time-row">
+            <strong>Time</strong>
+            <span class="hint">WIB · UTC+7 · [from, until)</span>
+            <label
+              >From<input
+                id="start"
+                class="time-input"
+                spellcheck="false"
+                placeholder="YYYY-MM-DD HH:MM:SS"
+                aria-label="From (inclusive), Jakarta time"
+            /></label>
+            <label
+              >until<input
+                id="end"
+                class="time-input"
+                spellcheck="false"
+                placeholder="YYYY-MM-DD HH:MM:SS"
+                aria-label="Until (exclusive), Jakarta time"
+            /></label>
+            <button id="apply-time">Apply</button>
+            <span id="range-duration" class="hint"></span>
+            <span class="presets">
+              <button id="all-time">All</button
+              ><button id="last-week">Last 7 days</button
+              ><button id="last-three-days">Last 3 days</button>
+            </span>
+            <button
+              id="toggle-charts"
+              class="text-button"
+              aria-expanded="true"
+              aria-controls="charts"
+            >
+              Hide histogram
+            </button>
+          </div>
+          <div id="charts">
+            <div id="frequency-block" class="frequency-panel">
+              <div class="chart-head">
+                <h2 id="frequency-heading">Selected event frequency</h2>
+                <span id="frequency-summary" class="hint" aria-live="polite"
+                  >Loading selected events…</span
+                >
+                <label class="check"
+                  ><input id="show-context" type="checkbox" />Context: all
+                  events</label
+                >
+                <label class="bucket-label"
+                  >Bucket
+                  <select id="bucket" aria-label="Histogram bucket width">
+                    <option value="1">1 minute</option>
+                    <option value="5">5 minutes</option>
+                    <option value="15">15 minutes</option>
+                    <option value="60">1 hour</option>
+                    <option value="360">6 hours</option>
+                    <option value="1440" selected>1 day</option>
+                    <option value="10080">1 week</option>
+                    <option value="custom">Custom minutes</option>
+                  </select>
+                  <input
+                    id="custom-bucket"
+                    type="number"
+                    min="1"
+                    max="525600"
+                    step="1"
+                    value="90"
+                    aria-label="Custom bucket width in minutes"
+                    hidden
+                  />
+                </label>
+              </div>
+              <div
+                id="frequency"
+                aria-label="Histogram of all events matching the time range and filters"
+              ></div>
+              <p class="hint chart-hint">
+                Drag across the chart to select a time range · click a bucket to
+                narrow to it · Back undoes either.
+              </p>
+            </div>
+            <div class="context-strip">
+              <div class="chart-key">
+                <span class="blue-dot"></span>All events, daily context
+                <span class="red-dot"></span>SSM command/session starts
+                <span class="hint">Click a day or drag the slider</span>
+              </div>
+              <div id="timeline" aria-label="Daily event histogram"></div>
+              <div id="time-slider"></div>
+            </div>
+          </div>
+        </section>
+
+        <div id="query-bar" aria-label="Query and selection">
+          <form id="query-form" class="query-row">
+            <button
+              type="button"
+              id="back"
+              class="icon-button"
+              title="Back to the previous query (Alt+Left)"
+              aria-label="Back to the previous query"
+              disabled
+            >
+              ‹
+            </button>
+            <button
+              type="button"
+              id="forward"
+              class="icon-button"
+              title="Forward (Alt+Right)"
+              aria-label="Forward to the next query"
+              disabled
+            >
+              ›
+            </button>
+            <input
+              id="search"
+              type="search"
+              placeholder="Search entire raw event (literal, case-insensitive) — press / to focus"
+              aria-label="Search entire raw event"
+              autocomplete="off"
+            />
+            <button class="primary" type="submit" id="run">Run</button>
+            <span id="query-state" class="state applied" role="status"
+              >Applied</span
+            >
+            <button type="button" id="revert" class="text-button" hidden>
+              Revert
+            </button>
+            <button type="button" id="ssm-only">
+              SSM commands &amp; sessions</button
+            ><button type="button" id="clear">Clear all</button>
+          </form>
+          <div class="scope-row">
+            <span id="scopes" aria-label="Applied query scopes"></span>
+            <button id="add-filter" type="button" class="text-button">
+              + Filter
+            </button>
+            <span id="filter-editor" hidden>
+              <select id="filter-field" aria-label="Filter field"></select>
+              <select id="filter-op" aria-label="Filter operator"></select>
+              <input
+                id="filter-value"
+                placeholder="Value"
+                aria-label="Filter value"
+                list="filter-choices"
+              />
+              <datalist id="filter-choices"></datalist>
+              <button id="filter-save" type="button" class="primary">
+                Add
+              </button>
+              <button id="filter-cancel" type="button" class="text-button">
+                Cancel
+              </button>
+            </span>
+          </div>
+          <div class="review-toolbar">
+            <span id="selected-count" role="status">0 selected</span>
+            <button id="quick-tag" disabled title="Tag selected events (T)">
+              Quick tag ▾
+            </button>
+            <button id="add-to-note" disabled>Add to note ▾</button>
+            <button id="clear-selection" class="text-button">
+              Clear selection
+            </button>
+            <span id="stale" hidden
+              >Tags or notes changed since this query ran ·
+              <button id="refresh-stale" class="text-button">
+                Refresh results
+              </button></span
+            >
+            <span class="spacer"></span>
+            <h2 id="result-count" aria-live="polite">Loading events…</h2>
+            <span id="load-status" role="status">Loading events…</span>
+            <span id="query-time"></span>
+            <label class="check"
+              ><input id="show-keys" type="checkbox" />Access key IDs</label
+            >
+          </div>
+        </div>
+        <div id="error" role="alert" hidden></div>
+        <span id="cell-feedback" class="sr-only" role="status"></span>
+        <section class="results" aria-label="Event results">
+          <div id="events"></div>
+        </section>
+
+        <section id="commands-panel" hidden aria-label="SSM command browser">
+          <form id="command-search-form" class="query-row">
+            <div role="group" aria-label="Command layout" class="segmented">
+              <button
+                type="button"
+                id="command-detail-layout"
+                aria-pressed="true"
+              >
+                Command browser</button
+              ><button
+                type="button"
+                id="command-sheet-layout"
+                aria-pressed="false"
+              >
+                Spreadsheet
+              </button>
+            </div>
+            <input
+              id="command-search"
+              type="search"
+              aria-label="Search commands, decoded payloads, system IDs and output"
+              placeholder="Search commands, decoded payloads, system IDs, output, identity…"
+            />
+            <select id="command-sort" aria-label="Sort commands">
+              <option value="requested_ms">Requested time</option>
+              <option value="command_id">Command ID</option>
+              <option value="region">Region</option>
+              <option value="document">Document</option>
+              <option value="status">Status</option>
+            </select>
+            <select id="command-direction" aria-label="Sort order">
+              <option value="desc">Descending</option>
+              <option value="asc">Ascending</option>
+            </select>
+            <label id="sheet-density-label" hidden
+              >Rows
+              <select id="sheet-density">
+                <option value="compact">Compact</option>
+                <option value="expanded">Expanded</option>
+              </select>
+            </label>
+            <button type="submit" class="primary">Search commands</button>
+          </form>
+          <div class="command-status-row">
+            <span id="command-status" role="status"></span>
+            <details>
+              <summary>Coverage and limitations</summary>
+              <p class="hint">
+                The time range above filters command requested time (WIB).
+                CloudTrail field/tag filters do not apply here. Output is
+                collected evidence, may be truncated, and is never executed.
+                Spreadsheet: one row per system/plugin output record; commands
+                repeat for each system and search keeps a command's systems
+                together. Click a cell to read/copy its full value.
+              </p>
+              <ul id="command-limitations"></ul>
+            </details>
+          </div>
+          <section
+            id="command-sheet-panel"
+            hidden
+            aria-label="Command output spreadsheet"
+          >
+            <div id="command-sheet"></div>
+            <div class="sheet-footer">
+              <span id="sheet-load-status" role="status"></span>
+              <button id="more-sheet" hidden>Load more rows</button>
+            </div>
+          </section>
+          <div id="command-browser-panel" class="command-workspace">
+            <section aria-label="Matching commands">
+              <div id="command-list"></div>
+              <button id="more-commands" hidden>Load more commands</button>
+            </section>
+            <section
+              id="command-view"
+              aria-label="Command and per-system output"
+            >
+              <p class="hint">
+                Select a command to see its parameters, enrichment, system
+                results and linked CloudTrail events together.
+              </p>
+            </section>
+          </div>
+        </section>
+
+        <details id="sql-panel">
+          <summary>
+            Generated SQL
+            <span>Bound parameters · executed against the full dataset</span>
+          </summary>
+          <button id="copy-sql">Copy SQL</button>
+          <pre id="sql"></pre>
+          <h3>Frequency histogram SQL</h3>
+          <pre id="histogram-sql"></pre>
+        </details>
+        <footer>
+          Country, network and IP attributes are offline lookups from
+          <code>kamotrace enrich</code>, not verified operator location. Proxy
+          geography can be misleading. First and last days are partial. Raw
+          events may contain secrets.
+        </footer>
+      </main>
+    </div>
+
+    <div id="cell-filter-menu" popover="auto" aria-label="Filter by cell value">
+      <p id="filter-cell-value"></p>
+      <button id="cell-filter-is">is</button>
+      <button id="cell-filter-is-not">is not</button>
+    </div>
+    <div id="tag-popover" popover="auto" aria-label="Tags on this event"></div>
+    <div
+      id="quick-tag-menu"
+      popover="auto"
+      aria-label="Quick tag selected events"
+    >
+      <p id="quick-tag-title" class="menu-title"></p>
+      <ul id="quick-tag-list"></ul>
+      <div class="menu-create">
+        <input
+          id="tag-slug"
+          maxlength="256"
+          placeholder="Search or create tag…"
+          aria-label="Search or create tag"
+          autocomplete="off"
+        />
+        <input
+          id="tag-color"
+          type="color"
+          value="#c45436"
+          aria-label="Color for a new tag"
+        />
+        <button id="create-tag" class="primary">Create &amp; apply</button>
+      </div>
+      <p id="quick-tag-error" class="hint error-text" role="alert"></p>
+    </div>
+    <div
+      id="note-menu"
+      popover="auto"
+      aria-label="Add selected events to a note"
+    >
+      <p id="note-menu-title" class="menu-title"></p>
+      <button id="new-note" class="primary">New note…</button>
+      <input
+        id="note-menu-search"
+        type="search"
+        placeholder="Or link to an existing note…"
+        aria-label="Search existing notes"
+      />
+      <ul id="note-menu-list"></ul>
+    </div>
+    <input
+      id="recolor"
+      type="color"
+      class="sr-only"
+      tabindex="-1"
+      aria-hidden="true"
+    />
+
+    <dialog id="column-summary" aria-labelledby="column-summary-title">
+      <div class="dialog-heading">
+        <h2 id="column-summary-title">Column values</h2>
+        <button id="close-summary" aria-label="Close column summary">
+          Close
+        </button>
+      </div>
+      <p id="cell-summary-value" hidden></p>
+      <p id="column-summary-status" class="hint" role="status"></p>
+      <div class="value-rankings">
+        <section aria-labelledby="top-values-heading">
+          <h3 id="top-values-heading">Top 5 · most common</h3>
+          <ol id="top-values"></ol>
+        </section>
+        <section aria-labelledby="bottom-values-heading">
+          <h3 id="bottom-values-heading">Bottom 5 · least common</h3>
+          <ol id="bottom-values"></ol>
+        </section>
+      </div>
+      <p id="summary-note" class="hint">
+        Full applied time range and filters, not just this page. Ties use value
+        order. Missing and empty values are included. Lists can overlap when
+        fewer than 10 values exist. Use = / ≠ to add a filter.
+      </p>
+    </dialog>
+    <dialog id="review-dialog" aria-labelledby="review-title">
+      <div class="dialog-heading">
+        <h2 id="review-title">Note</h2>
+        <button id="close-review">Close</button>
+      </div>
+      <p id="review-error" role="alert" hidden></p>
+      <p id="review-context" class="hint"></p>
+      <label for="note-body"
+        >Note (Markdown; the first line is its title)</label
+      >
+      <textarea
+        id="note-body"
+        maxlength="30000"
+        rows="7"
+        placeholder="What did you find? Use **bold**, lists, links or code."
+      ></textarea>
+      <h3>Preview</h3>
+      <div id="note-preview" class="markdown"></div>
+      <button id="save-note" class="primary">Save note</button>
+    </dialog>
+    <dialog id="detail" aria-labelledby="detail-title">
+      <div class="dialog-heading">
+        <div>
+          <h2 id="detail-title">Original CloudTrail event</h2>
+          <span id="detail-id"></span>
+        </div>
+        <span>
+          <button id="detail-prev" title="Previous loaded event (K)">
+            ‹ Prev
+          </button>
+          <button id="detail-next" title="Next loaded event (J)">Next ›</button>
+          <button id="close-detail" aria-label="Close event details">
+            Close
+          </button>
+        </span>
+      </div>
+      <p id="detail-provenance" class="hint">
+        Original JSON preserves numeric precision. Treat request/response
+        contents as sensitive.
+      </p>
+      <div id="detail-findings"></div>
+      <div id="event-command-links" class="command-links"></div>
+      <pre id="raw-event"></pre>
+      <div id="record-hash"></div>
+    </dialog>
+    <dialog id="sheet-cell-dialog" aria-labelledby="sheet-cell-title">
+      <div class="dialog-heading">
+        <h2 id="sheet-cell-title">Cell value</h2>
+        <button id="close-sheet-cell">Close</button>
+      </div>
+      <p id="sheet-cell-context" class="hint"></p>
+      <pre id="sheet-cell-value" tabindex="0"></pre>
+      <div class="command-view-toolbar">
+        <button id="copy-sheet-cell">Copy full value</button>
+        <button id="sheet-cell-command">
+          Open command and CloudTrail links
+        </button>
+        <span id="sheet-copy-status" role="status"></span>
+      </div>
+    </dialog>
+  </body>
+</html>

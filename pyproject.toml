@@ -1,0 +1,31 @@
+[project]
+name = "kamotrace"
+version = "0.1.0"
+description = "Local, read-only CloudTrail investigation browser with tags, notes, SSM views, Suzaku detections and an MCP adapter"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=2.0,<2.1",
+    "ijson>=3.3,<4",
+    "simplejson>=3.20,<4",
+    "mcp>=2.3,<3",
+    "maxminddb>=2.6,<4",
+]
+
+[dependency-groups]
+dev = ["mmdb-writer>=0.2"]  # Builds synthetic GeoLite2-format test databases
+
+[project.scripts]
+kamotrace = "kamotrace.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kamotrace"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/kamotrace", "tests", "README.md", "AGENTS.md", "LICENSE"]
