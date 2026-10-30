@@ -521,7 +521,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(detail or {"error": "Event not found"}, 200 if detail else 404)
         elif path.startswith("/api/"):
             self.respond({"error": "Not found"}, 404)
-        elif path in ("/", "/index.html", "/app.js", "/app.css", "/favicon.png") or path.startswith("/vendor/"):
+        elif path in ("/", "/index.html", "/app.js", "/app.css", "/favicon.png", "/konami-duck.png") or path.startswith("/vendor/"):
             super().do_GET()
         else:
             self.respond({"error": "Not found"}, 404)

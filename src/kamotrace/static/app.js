@@ -2882,4 +2882,84 @@ async function init() {
   syncInputs();
   renderScopes();
 }
+
+// A little visitor from the hero artwork: ↑ ↑ ↓ ↓ ← → ← → B A.
+(() => {
+  const code = [
+    "arrowup",
+    "arrowup",
+    "arrowdown",
+    "arrowdown",
+    "arrowleft",
+    "arrowright",
+    "arrowleft",
+    "arrowright",
+    "b",
+    "a",
+  ];
+  let keys = [],
+    visiting = false;
+  const duck = new Image();
+  duck.src = "/konami-duck.png";
+  duck.alt = "";
+  duck.className = "konami-duck";
+  duck.setAttribute("aria-hidden", "true");
+
+  async function quack() {
+    // A short, nasal falling squawk, generated locally without an audio download.
+    let audio;
+    try {
+      audio = new AudioContext();
+      await audio.resume();
+      const voice = audio.createOscillator();
+      const filter = audio.createBiquadFilter();
+      const volume = audio.createGain();
+      const now = audio.currentTime;
+      voice.type = "sawtooth";
+      voice.frequency.setValueAtTime(320, now);
+      voice.frequency.exponentialRampToValueAtTime(110, now + 0.32);
+      filter.type = "bandpass";
+      filter.frequency.setValueAtTime(1400, now);
+      filter.frequency.exponentialRampToValueAtTime(650, now + 0.32);
+      filter.Q.value = 2.5;
+      volume.gain.setValueAtTime(0, now);
+      volume.gain.linearRampToValueAtTime(0.35, now + 0.025);
+      volume.gain.exponentialRampToValueAtTime(0.001, now + 0.36);
+      voice.connect(filter).connect(volume).connect(audio.destination);
+      voice.onended = () => audio.close().catch(() => {});
+      voice.start(now);
+      voice.stop(now + 0.38);
+    } catch {
+      // A browser without audio support should still get the duck.
+      if (audio) audio.close().catch(() => {});
+    }
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (
+      event.ctrlKey ||
+      event.metaKey ||
+      event.altKey ||
+      event.isComposing ||
+      event.target.isContentEditable ||
+      event.target.closest("input, textarea, select")
+    ) {
+      keys = [];
+      return;
+    }
+    if (event.repeat) return;
+    keys = [...keys, event.key.toLowerCase()].slice(-code.length);
+    if (!code.every((key, index) => keys[index] === key)) return;
+    keys = [];
+    if (visiting) return;
+    visiting = true;
+    document.body.append(duck);
+    quack();
+    setTimeout(() => {
+      duck.remove();
+      visiting = false;
+    }, 4200);
+  });
+})();
+
 init().catch((e) => error(e.message));

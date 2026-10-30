@@ -582,6 +582,14 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(self.call("/api/meta", headers={"Origin": "https://attacker.invalid"})[0], 403)
         self.assertEqual(self.call("/api/meta", headers={"Host": "attacker.invalid"})[0], 403)
 
+    def test_duck_sprite_is_served_without_opening_arbitrary_paths(self):
+        with urlopen(self.url + "/konami-duck.png", timeout=15) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers.get_content_type(), "image/png")
+            self.assertTrue(response.read().startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(self.call("/server.py")[0], 404)
+        self.assertEqual(self.call("/konami-duck.png", headers={"Origin": "https://attacker.invalid"})[0], 403)
+
     def test_raw_event_retains_large_integer_and_record_hash(self):
         _, data = self.call("/api/events", {"search": "event-2"})
         record = data["data"][0]

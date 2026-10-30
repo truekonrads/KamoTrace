@@ -1251,3 +1251,33 @@ dialog::backdrop {
   line-height: 1.5;
   font-weight: 400;
 }
+
+.konami-duck {
+  position: fixed;
+  right: 24px;
+  bottom: 16px;
+  width: 320px;
+  z-index: 10000;
+  pointer-events: none;
+  filter: drop-shadow(0 8px 8px #0004);
+  animation: duck-visit 4.2s ease-in-out both;
+}
+@keyframes duck-visit {
+  0%,
+  100% {
+    transform: translate(110%, 110%) rotate(-12deg);
+  }
+  18%,
+  78% {
+    transform: translate(0, 0) rotate(0);
+  }
+  40%,
+  60% {
+    transform: translate(0, -8px) rotate(-3deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .konami-duck {
+    animation: none;
+  }
+}
