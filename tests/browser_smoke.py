@@ -1,4 +1,4 @@
-"""CI-only browser check; run with `uv run --with playwright==1.58.0 python tests/browser_smoke.py`."""
+"""CI-only browser check; run with `uv run --with playwright==1.64.1 python tests/browser_smoke.py`."""
 from pathlib import Path
 
 from playwright.sync_api import expect, sync_playwright

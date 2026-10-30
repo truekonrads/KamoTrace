@@ -1,6 +1,7 @@
 """HTTP, MCP and Suzaku contract tests with a disposable, real CloudTrail DuckDB database."""
 from datetime import datetime, timezone
 from functools import partial
+import gc
 import hashlib
 from http.server import ThreadingHTTPServer
 import json
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -102,7 +104,8 @@ class BrowserContract(unittest.TestCase):
             with urlopen(request, timeout=15) as response:
                 return response.status, json.load(response)
         except HTTPError as error:
-            return error.code, json.load(error)
+            with error:
+                return error.code, json.load(error)
 
     def test_annotations_tags_persistence_and_selection(self):
         rows = self.call("/api/events", {"sorters": [{"field": "time_local", "dir": "asc"}]})[1]["data"]
@@ -379,8 +382,12 @@ class BrowserContract(unittest.TestCase):
             store.connection.close()
             store.reviews.close()
         # A sidecar is bound to its evidence database.
-        with self.assertRaisesRegex(ValueError, "different evidence database"):
-            Store(self.database, output)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaisesRegex(ValueError, "different evidence database"):
+                Store(self.database, output)
+            gc.collect()
+        self.assertEqual([str(w.message) for w in caught if issubclass(w.category, ResourceWarning)], [])
 
     def test_get_suzaku_installs_only_verified_safe_archives(self):
         import zipfile

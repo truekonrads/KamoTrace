@@ -799,7 +799,7 @@ Markdown uses vendored `marked@15.0.12` (MIT) and `dompurify@3.2.7`
 
 GitHub Actions runs the HTTP/MCP contract suite on Python 3.14 (matching the
 Dockerfile) for pushes and pull requests, plus JavaScript syntax, package-build
-and Docker image-build checks.
+and Docker image-build checks. Jobs use the pinned Ubuntu 24.04 runner.
 A Chromium smoke test opens the real app with disposable synthetic evidence,
 verifies all five events render, then searches and checks the three matching
 `SendCommand` rows. Each run uploads `browser-test-results` (screenshots, log
@@ -810,8 +810,8 @@ the workflow run's summary for the download link; browser failures also capture
 To reproduce the browser check locally (Playwright is test-only, not an app dependency):
 
 ```powershell
-uv run --locked --with playwright==1.58.0 python -m playwright install chromium
-uv run --locked --with playwright==1.58.0 python tests/browser_smoke.py
+uv run --locked --with playwright==1.64.1 python -m playwright install chromium
+uv run --locked --with playwright==1.64.1 python tests/browser_smoke.py
 ```
 
 Results are written to the ignored `test-results/` directory. On Linux, add

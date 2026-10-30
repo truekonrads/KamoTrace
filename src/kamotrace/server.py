@@ -1,5 +1,6 @@
 """Local, read-only CloudTrail browser. Run with: kamotrace serve --database events.duckdb"""
 import argparse
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -151,67 +152,71 @@ def build_query(body):
 
 class Store:
     def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None):
-        self.connection = duckdb.connect(str(database), read_only=True)
-        self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
-        self.lock = threading.Lock()
-        self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
-        self.reviews.row_factory = sqlite3.Row
-        self.reviews.executescript("""
-            PRAGMA foreign_keys=ON;
-            CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL,
-                updated TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS annotation_events(annotation_id INTEGER REFERENCES annotations(id) ON DELETE CASCADE,
-                hash TEXT NOT NULL, PRIMARY KEY(annotation_id, hash));
-            CREATE TABLE IF NOT EXISTS tags(slug TEXT PRIMARY KEY, color TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS event_tags(hash TEXT NOT NULL, slug TEXT REFERENCES tags(slug), PRIMARY KEY(hash, slug));
-            CREATE TABLE IF NOT EXISTS sidecar_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        """)
-        # Bind the sidecar to its evidence on first use (older sidecars too), so another case's notes
-        # can't be mixed in silently, as detections and enrichment sidecars already refuse.
-        from .suzaku import evidence_identity
-        identity = json.dumps(list(evidence_identity(self.connection)))
-        self.reviews.execute("INSERT OR IGNORE INTO sidecar_meta VALUES ('evidence', ?)", (identity,))
-        self.reviews.commit()
-        if self.reviews.execute("SELECT value FROM sidecar_meta WHERE key='evidence'").fetchone()[0] != identity:
-            self.reviews.close()
-            raise ValueError("This notes/tags sidecar belongs to a different evidence database; "
-                             "pass the right --annotations file or a new path")
-        # Additive migration: older sidecars lack the query a note was written from.
-        if "context" not in {r["name"] for r in self.reviews.execute("PRAGMA table_info(annotations)")}:
-            self.reviews.execute("ALTER TABLE annotations ADD COLUMN context TEXT")
+        with ExitStack() as startup:
+            self.connection = duckdb.connect(str(database), read_only=True)
+            startup.callback(self.connection.close)
+            self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
+            self.lock = threading.Lock()
+            self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
+            startup.callback(self.reviews.close)
+            self.reviews.row_factory = sqlite3.Row
+            self.reviews.executescript("""
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL,
+                    updated TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS annotation_events(annotation_id INTEGER REFERENCES annotations(id) ON DELETE CASCADE,
+                    hash TEXT NOT NULL, PRIMARY KEY(annotation_id, hash));
+                CREATE TABLE IF NOT EXISTS tags(slug TEXT PRIMARY KEY, color TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS event_tags(hash TEXT NOT NULL, slug TEXT REFERENCES tags(slug), PRIMARY KEY(hash, slug));
+                CREATE TABLE IF NOT EXISTS sidecar_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            """)
+            # Bind the sidecar to its evidence on first use (older sidecars too), so another case's notes
+            # can't be mixed in silently, as detections and enrichment sidecars already refuse.
+            from .suzaku import evidence_identity
+            identity = json.dumps(list(evidence_identity(self.connection)))
+            self.reviews.execute("INSERT OR IGNORE INTO sidecar_meta VALUES ('evidence', ?)", (identity,))
             self.reviews.commit()
-        self.connection.execute("CREATE TEMP TABLE review_tags(hash VARCHAR, slug VARCHAR)")
-        self.connection.execute("CREATE TEMP TABLE review_notes(hash VARCHAR, annotation_id BIGINT)")
-        self.refresh_reviews()
-        from .enrich import load_enrichment
-        # IP enrichment comes from a sidecar written by `kamotrace enrich` (GeoLite2 and/or neutral JSONL).
-        default = database.with_suffix(".enrichment.duckdb")
-        self.enrichment_run = load_enrichment(self.connection, enrichment or (default if default.exists() else None))
-        self.connection.execute("""
-            CREATE TEMP VIEW browse_events AS
-            SELECT e.source_record AS id, e.record_sha256, e.event_id, e.event_time,
-                strftime(e.event_time AT TIME ZONE 'UTC', '%Y-%m-%d %H:%M:%S') AS time_local,
-                e.event_source, e.event_name, e.source_ip, e.identity_type,
-                coalesce(e.identity_arn, e.user_identity->>'$.userName',
-                    e.user_identity->>'$.principalId', e.user_identity->>'$.invokedBy', '(unattributed)') AS identity,
-                e.user_identity->>'$.accessKeyId' AS key_id,
-                coalesce(e.request_parameters->>'$.target', e.request_parameters->>'$.instanceIds',
-                    e.request_parameters->>'$.instanceId') AS target,
-                e.request_parameters->>'$.documentName' AS document_name,
-                e.error_code, e.aws_region AS region, e.user_agent, e.raw_event,
-                coalesce(g.country, '(unmapped / service / private)') AS country, g.isp, g.city, g.asn, g.ip_info
-            FROM events e LEFT JOIN ip_enrichment g ON e.source_ip = g.ip
-        """)
-        from .ssm import Commands
-        from .suzaku import load_detections
-        self.commands = Commands(ssm_export, self.connection)
-        # Suzaku detections come from a derived sidecar written by `kamotrace suzaku`; only rows the
-        # CLI linked to exactly one evidence record are queryable. Missing sidecar = no detections.
-        default = database.with_suffix(".detections.duckdb")
-        self.suzaku_run = load_detections(self.connection, detections or (default if default.exists() else None))
-        # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
-        self.connection.execute("SET enable_external_access=false")
-        self.meta = self.metadata()
+            if self.reviews.execute("SELECT value FROM sidecar_meta WHERE key='evidence'").fetchone()[0] != identity:
+                raise ValueError("This notes/tags sidecar belongs to a different evidence database; "
+                                 "pass the right --annotations file or a new path")
+            # Additive migration: older sidecars lack the query a note was written from.
+            if "context" not in {r["name"] for r in self.reviews.execute("PRAGMA table_info(annotations)")}:
+                self.reviews.execute("ALTER TABLE annotations ADD COLUMN context TEXT")
+                self.reviews.commit()
+            self.connection.execute("CREATE TEMP TABLE review_tags(hash VARCHAR, slug VARCHAR)")
+            self.connection.execute("CREATE TEMP TABLE review_notes(hash VARCHAR, annotation_id BIGINT)")
+            self.refresh_reviews()
+            from .enrich import load_enrichment
+            # IP enrichment comes from a sidecar written by `kamotrace enrich` (GeoLite2 and/or neutral JSONL).
+            default = database.with_suffix(".enrichment.duckdb")
+            self.enrichment_run = load_enrichment(self.connection, enrichment or (default if default.exists() else None))
+            self.connection.execute("""
+                CREATE TEMP VIEW browse_events AS
+                SELECT e.source_record AS id, e.record_sha256, e.event_id, e.event_time,
+                    strftime(e.event_time AT TIME ZONE 'UTC', '%Y-%m-%d %H:%M:%S') AS time_local,
+                    e.event_source, e.event_name, e.source_ip, e.identity_type,
+                    coalesce(e.identity_arn, e.user_identity->>'$.userName',
+                        e.user_identity->>'$.principalId', e.user_identity->>'$.invokedBy', '(unattributed)') AS identity,
+                    e.user_identity->>'$.accessKeyId' AS key_id,
+                    coalesce(e.request_parameters->>'$.target', e.request_parameters->>'$.instanceIds',
+                        e.request_parameters->>'$.instanceId') AS target,
+                    e.request_parameters->>'$.documentName' AS document_name,
+                    e.error_code, e.aws_region AS region, e.user_agent, e.raw_event,
+                    coalesce(g.country, '(unmapped / service / private)') AS country, g.isp, g.city, g.asn, g.ip_info
+                FROM events e LEFT JOIN ip_enrichment g ON e.source_ip = g.ip
+            """)
+            from .ssm import Commands
+            from .suzaku import load_detections
+            self.commands = Commands(ssm_export, self.connection)
+            # Suzaku detections come from a derived sidecar written by `kamotrace suzaku`; only rows the
+            # CLI linked to exactly one evidence record are queryable. Missing sidecar = no detections.
+            default = database.with_suffix(".detections.duckdb")
+            self.suzaku_run = load_detections(self.connection, detections or (default if default.exists() else None))
+            # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
+            self.connection.execute("SET enable_external_access=false")
+            self.meta = self.metadata()
+            # The Store owns both connections after initialization succeeds.
+            startup.pop_all()
 
     def refresh_reviews(self):
         for table, source in (("review_tags", "SELECT hash,slug FROM event_tags"),
