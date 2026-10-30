@@ -1,5 +1,6 @@
 """Resumable, read-only AWS collection using the SDK's existing credential chain."""
 import argparse
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from contextlib import contextmanager, ExitStack
 from datetime import date, datetime, time, timedelta, timezone
 import gzip
@@ -10,6 +11,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import threading
 import time as clock
 from urllib.parse import urlsplit
 
@@ -29,6 +31,14 @@ LIMITATIONS = [
     "Collection is a resumable snapshot, not a live sync; completed requests are not refreshed on resume.",
     "Session records/transcripts are saved but are not displayed by the Run Command viewer.",
 ]
+# LookupEvents permits two calls/second/account/Region. Each Region's daily windows share one pace,
+# so two workers keep a slow (high-latency) connection near that limit without exceeding it.
+LOOKUP_INTERVAL = 0.55
+WINDOW_WORKERS = 2
+
+
+class Stopped(RuntimeError):
+    """Another worker failed or the user interrupted; no further AWS calls are started."""
 
 
 def timestamp(value, end=False):
@@ -79,40 +89,49 @@ class Progress:
         self.done, self.total, self.pages, self.cached = 0, 0, 0, 0
         self.last_bytes_tick = 0
         self.bar_drawn = False
+        self.lock = threading.RLock()  # Region workers share counters and the terminal.
 
-    def tick(self, message):
-        if self.mode == "off":
-            return
-        counts = f"{self.done}/{self.total} region/services | {self.pages} pages ({self.cached} cached)"
-        if self.mode == "log":
-            print(f"{iso(datetime.now(timezone.utc))} {counts} | {message}", file=sys.stderr, flush=True)
-        else:
-            width = 20
-            filled = width * self.done // self.total if self.total else 0
-            if self.emoji:
-                ducks = max(1, filled // 2)
-                track = "🦆" * ducks + "-" * (width - 2 * ducks)
+    def tick(self, message, done=0, page=None):
+        """Report message; done counts finished region/services, page is a page's cached flag."""
+        with self.lock:
+            self.done += done
+            if page is not None:
+                self.pages += 1
+                self.cached += page
+            if self.mode == "off":
+                return
+            counts = f"{self.done}/{self.total} region/services | {self.pages} pages ({self.cached} cached)"
+            if self.mode == "log":
+                print(f"{iso(datetime.now(timezone.utc))} {counts} | {message}", file=sys.stderr, flush=True)
             else:
-                track = "#" * filled + "-" * (width - filled)
-            counts = f"{self.done}/{self.total} jobs {self.pages} pages ({self.cached} cached)"
-            columns = max(1, shutil.get_terminal_size().columns - 1)
-            summary = f"[{track}] {counts}"
-            summary_columns = max(1, columns - (ducks if self.emoji else 0))
-            prefix = "\r\033[1A" if self.bar_drawn else "\r"
-            print(prefix + "\033[2K" + summary[:summary_columns] + "\n\r\033[2K" + message[:columns],
-                  end="", file=sys.stderr, flush=True)
-            self.bar_drawn = True
+                width = 20
+                filled = width * self.done // self.total if self.total else 0
+                if self.emoji:
+                    ducks = max(1, filled // 2)
+                    track = "🦆" * ducks + "-" * (width - 2 * ducks)
+                else:
+                    track = "#" * filled + "-" * (width - filled)
+                counts = f"{self.done}/{self.total} jobs {self.pages} pages ({self.cached} cached)"
+                columns = max(1, shutil.get_terminal_size().columns - 1)
+                summary = f"[{track}] {counts}"
+                summary_columns = max(1, columns - (ducks if self.emoji else 0))
+                prefix = "\r\033[1A" if self.bar_drawn else "\r"
+                print(prefix + "\033[2K" + summary[:summary_columns] + "\n\r\033[2K" + message[:columns],
+                      end="", file=sys.stderr, flush=True)
+                self.bar_drawn = True
 
     def transferred(self, size):
-        now = clock.monotonic()
-        if now - self.last_bytes_tick >= 1:
-            self.tick(f"S3 object: {size} bytes downloaded")
-            self.last_bytes_tick = now
+        with self.lock:
+            now = clock.monotonic()
+            if now - self.last_bytes_tick >= 1:
+                self.tick(f"S3 object: {size} bytes downloaded")
+                self.last_bytes_tick = now
 
     def close(self):
-        if self.mode == "bar" and self.bar_drawn:
-            print(file=sys.stderr)
-        self.mode = "off"
+        with self.lock:
+            if self.mode == "bar" and self.bar_drawn:
+                print(file=sys.stderr)
+            self.mode = "off"
 
 
 class Collector:
@@ -121,7 +140,11 @@ class Collector:
         self.progress = progress
         self.compress = compress
         self.clients = {}
-        self.db = sqlite3.connect(folder / "checkpoint.sqlite", timeout=1)
+        # Region and window workers share this one connection; self.lock serializes every use of it.
+        self.db = sqlite3.connect(folder / "checkpoint.sqlite", timeout=1, check_same_thread=False)
+        self.lock = threading.RLock()
+        self.stopped = threading.Event()
+        self.next_lookup = {}
         # Retain the SQLite lock across page commits; two collectors must not share a destination.
         self.db.execute("PRAGMA locking_mode=EXCLUSIVE")
         self.db.executescript("""
@@ -139,11 +162,43 @@ class Collector:
 
     def client(self, service, region):
         key = service, region
-        if key not in self.clients:
-            self.clients[key] = self.session.client(service, region_name=region,
-                config=Config(retries={"mode": "adaptive", "max_attempts": 10},
-                              connect_timeout=15, read_timeout=60))
-        return self.clients[key]
+        with self.lock:  # Sessions are not thread-safe; the clients they create are.
+            if key not in self.clients:
+                self.clients[key] = self.session.client(service, region_name=region,
+                    config=Config(retries={"mode": "adaptive", "max_attempts": 10},
+                                  connect_timeout=15, read_timeout=60))
+            return self.clients[key]
+
+    def parallel(self, function, items, workers):
+        """Run function(item) concurrently; the first failure or Ctrl+C stops every worker and is raised."""
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(function, item) for item in items]
+            try:
+                pending = futures
+                while pending and not self.stopped.is_set():
+                    # A timed wait keeps Ctrl+C responsive, including on Windows.
+                    done, pending = wait(pending, timeout=0.5, return_when=FIRST_EXCEPTION)
+                    if any(future.exception() for future in done):
+                        self.stopped.set()
+            except BaseException:
+                self.stopped.set()
+                raise
+            finally:
+                if self.stopped.is_set():
+                    pool.shutdown(cancel_futures=True)  # Workers finish only their in-flight call.
+        for future in futures:
+            if not future.cancelled() and future.exception() and not isinstance(future.exception(), Stopped):
+                raise future.exception()  # The real failure, not a worker it stopped.
+        if self.stopped.is_set():
+            raise Stopped("collection stopped by another worker")
+
+    def pace(self, region):
+        """Space LookupEvents call starts in a Region, shared by all of that Region's workers."""
+        with self.lock:
+            now = clock.monotonic()
+            start = max(now, self.next_lookup.get(region, now))
+            self.next_lookup[region] = start + LOOKUP_INTERVAL
+        clock.sleep(start - now)
 
     def pages(self, service, region, operation, parameters, token="NextToken", result_token=None):
         """Commit each response and cursor together, including empty pages with a next token."""
@@ -155,7 +210,8 @@ class Collector:
         if service == "cloudtrail":
             context += f" {iso(parameters['StartTime'])} to {iso(parameters['EndTime'])}"
         while True:
-            cached = self.db.execute("SELECT response FROM pages WHERE job=? AND page=?", (job, index)).fetchone()
+            with self.lock:
+                cached = self.db.execute("SELECT response FROM pages WHERE job=? AND page=?", (job, index)).fetchone()
             if cached:
                 response = json.loads(cached[0], use_decimal=True)
             else:
@@ -163,7 +219,9 @@ class Collector:
                 if cursor:
                     request[token] = cursor
                 if service == "cloudtrail":
-                    clock.sleep(0.55)  # LookupEvents permits two calls/second/account/region.
+                    self.pace(region)
+                if self.stopped.is_set():
+                    raise Stopped("collection stopped by another worker")
                 try:
                     response = getattr(self.client(service, region), operation)(**request)
                 except ClientError as error:
@@ -174,7 +232,7 @@ class Collector:
                             ("logs", "InvalidParameterException"), ("s3", "InvalidArgument")))
                     if cursor and not restarted and invalid_cursor:
                         # AWS cursors can expire while credentials are renewed. Rewalk and deduplicate.
-                        with self.db:
+                        with self.lock, self.db:
                             self.db.execute("DELETE FROM pages WHERE job=?", (job,))
                         index, cursor, restarted = 0, None, True
                         seen.clear()
@@ -182,11 +240,9 @@ class Collector:
                         continue
                     raise
                 response.pop("ResponseMetadata", None)
-                with self.db:
+                with self.lock, self.db:
                     self.db.execute("INSERT INTO pages VALUES (?,?,?)", (job, index, encode(response)))
-            self.progress.pages += 1
-            self.progress.cached += bool(cached)
-            self.progress.tick(f"{context} page {index + 1} {'cached' if cached else 'saved'}")
+            self.progress.tick(f"{context} page {index + 1} {'cached' if cached else 'saved'}", page=bool(cached))
             yield response
             following = response.get(result_token)
             if not following:
@@ -203,20 +259,26 @@ class Collector:
 
     def cloudtrail(self, region):
         lower = self.start if self.start is not None else self.end - timedelta(days=90)
+        windows = []
         while True:
             upper = min(lower + timedelta(days=1), self.end)
-            self.progress.tick(f"{region}: CloudTrail batch {iso(lower)} to {iso(upper)}")
-            for page in self.pages("cloudtrail", region, "lookup_events", {
-                    "StartTime": lower, "EndTime": upper, "MaxResults": 50}):
-                with self.db:
-                    for event in page.get("Events", []):
-                        if self.selected(event, "EventTime"):
-                            # Keep original JSON; shared inclusive batch boundaries deduplicate by ID.
-                            self.db.execute("INSERT OR IGNORE INTO events VALUES (?,?,?)",
-                                            (region, event["EventId"], event["CloudTrailEvent"]))
+            windows.append((lower, upper))
             if upper == self.end:
                 break
             lower = upper
+        # Oldest first: with default bounds the oldest window is the next to expire from Event History.
+        self.parallel(lambda window: self.window(region, *window), windows, WINDOW_WORKERS)
+
+    def window(self, region, lower, upper):
+        self.progress.tick(f"{region}: CloudTrail batch {iso(lower)} to {iso(upper)}")
+        for page in self.pages("cloudtrail", region, "lookup_events", {
+                "StartTime": lower, "EndTime": upper, "MaxResults": 50}):
+            with self.lock, self.db:
+                for event in page.get("Events", []):
+                    if self.selected(event, "EventTime"):
+                        # Keep original JSON; shared inclusive batch boundaries deduplicate by ID.
+                        self.db.execute("INSERT OR IGNORE INTO events VALUES (?,?,?)",
+                                        (region, event["EventId"], event["CloudTrailEvent"]))
 
     def cloudwatch(self, region, group, prefix, logs):
         events = {}
@@ -243,7 +305,8 @@ class Collector:
                 name = hashlib.sha256(identity.encode()).hexdigest() + ".bin"
                 target = self.folder / "logs" / name
                 expected = item["Size"]
-                saved = self.db.execute("SELECT sha256, etag FROM objects WHERE name=?", (name,)).fetchone()
+                with self.lock:
+                    saved = self.db.execute("SELECT sha256, etag FROM objects WHERE name=?", (name,)).fetchone()
                 if saved and saved[1] is not None and saved[1] != item["ETag"]:
                     raise RuntimeError(f"S3 object version conflict for s3://{bucket}/{key}: listings disagree; "
                                        "use a new destination for a fresh snapshot")
@@ -266,7 +329,7 @@ class Collector:
                         raise RuntimeError(f"Incomplete S3 object: s3://{bucket}/{key}")
                     temporary.replace(target)
                     digest = checksum.hexdigest()
-                    with self.db:
+                    with self.lock, self.db:
                         self.db.execute("INSERT OR REPLACE INTO objects (name, sha256, etag) VALUES (?,?,?)",
                                         (name, digest, item["ETag"]))
                 logs[identity] = {"bucket": bucket, "key": key, "etag": item["ETag"],
@@ -402,15 +465,23 @@ def main(argv=None):
         document = {"account_id": identity["Account"], "commands": [], "invocations": [],
                     "invocation_details": [], "sessions": [], "coverage": manifest}
         logs = {}
-        for selected_region in regions:
+        # Regions have separate API quotas, so they run concurrently; each collects into its own part.
+        parts = {name: ({key: [] for key in ("commands", "invocations", "invocation_details", "sessions")}, {})
+                 for name in regions}
+
+        def collect(selected_region):
             if "cloudtrail" in args.services:
                 collector.cloudtrail(selected_region)
-                progress.done += 1
-                progress.tick(f"{selected_region}: CloudTrail complete")
+                progress.tick(f"{selected_region}: CloudTrail complete", done=1)
             if "ssm" in args.services:
-                collector.ssm(selected_region, document, logs, args.session_s3, args.session_log_group)
-                progress.done += 1
-                progress.tick(f"{selected_region}: SSM complete")
+                collector.ssm(selected_region, *parts[selected_region], args.session_s3, args.session_log_group)
+                progress.tick(f"{selected_region}: SSM complete", done=1)
+        collector.parallel(collect, regions, len(regions))
+        for selected_region in regions:  # Merge in region order so exports do not depend on timing.
+            region_document, region_logs = parts[selected_region]
+            for key, records in region_document.items():
+                document[key].extend(records)
+            logs.update(region_logs)
         if "cloudtrail" in args.services:
             collector.export_events()
         manifest.update(complete=True, completed_at=iso(datetime.now(timezone.utc)), logs=list(logs.values()))

@@ -132,6 +132,7 @@ class AutoContract(unittest.TestCase):
         session.client.side_effect = lambda service, region_name, **kw: clients[service]
         self.stack.enter_context(patch("kamotrace.download.boto3.Session", return_value=session))
         self.stack.enter_context(patch("kamotrace.download.clock.sleep"))
+        self.stack.enter_context(patch("kamotrace.download.WINDOW_WORKERS", 1))  # Stubber answers in FIFO order.
         end = datetime.fromisoformat("2026-10-30T06:00:00+00:00")
         now = [end]
 

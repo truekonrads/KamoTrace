@@ -10,10 +10,12 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
 from boto3.session import Session
+from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
 import simplejson
@@ -47,6 +49,8 @@ class DownloadContract(unittest.TestCase):
         session.client.side_effect = lambda service, region_name, **kw: self.clients[service, region_name]
         self.stack.enter_context(patch("kamotrace.download.boto3.Session", return_value=session))
         self.stack.enter_context(patch("kamotrace.download.clock.sleep"))
+        # Stubber answers in strict FIFO order; concurrent daily windows have their own test.
+        self.stack.enter_context(patch("kamotrace.download.WINDOW_WORKERS", 1))
         self.start = dt("2026-10-01T00:00:00Z")
         self.end = dt("2026-10-01T23:59:59.999999Z")
         self.filters = [{"key": "InvokedAfter", "value": "2026-09-30T23:59:59Z"},
@@ -421,6 +425,56 @@ class DownloadContract(unittest.TestCase):
         _, error = self.run_cli("--services", "cloudtrail", status=1)
         self.assertIn("same AWS account", error)
         self.assertEqual((self.folder / "manifest.json").read_bytes(), before)
+
+    def test_regions_and_daily_windows_run_concurrently_with_regional_pace(self):
+        regions = ("ap-southeast-1", "us-east-1")
+        # Every first page waits until all four windows (two Regions x two days) are in flight at once.
+        barrier = threading.Barrier(4, timeout=10)
+        failing = []
+
+        class CloudTrail:  # Thread-safe stand-in: Stubber's FIFO responses cannot be answered concurrently.
+            def __init__(fake, region):
+                fake.region = region
+
+            def lookup_events(fake, StartTime, EndTime, MaxResults, NextToken=None):
+                day = StartTime.date().isoformat()
+                if NextToken is None:
+                    barrier.wait()
+                    return {"Events": [self.event(f"{fake.region}-{day}", day + "T12:00:00Z")], "NextToken": "more"}
+                if (fake.region, day) in failing:
+                    raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "synthetic"}}, "LookupEvents")
+                # Shared inclusive window boundary: returned by both days, kept once per Region.
+                return {"Events": [self.event("boundary", "2026-10-02T00:00:00Z")]}
+
+        for region in regions:
+            self.clients["cloudtrail", region] = CloudTrail(region)
+        options = ("--regions", *regions, "--start", "2026-10-01", "--end", "2026-10-02", "--services", "cloudtrail")
+        self.stack.enter_context(patch("kamotrace.download.WINDOW_WORKERS", 2))
+        with patch("kamotrace.download.clock.sleep") as sleep, \
+                patch("kamotrace.download.clock.monotonic", return_value=100.0):
+            self.identity()
+            self.run_cli(*options, "--progress", "off", bounds=False)
+        records = json.loads((self.folder / "cloudtrail.json").read_text())["Records"]
+        self.assertEqual([record["eventID"] for record in records], [
+            "ap-southeast-1-2026-10-01", "ap-southeast-1-2026-10-02", "boundary",
+            "boundary", "us-east-1-2026-10-01", "us-east-1-2026-10-02"])
+        # Both windows of a Region share one pace (not one per worker, not one for all Regions).
+        self.assertEqual(sorted(round(call.args[0], 6) for call in sleep.call_args_list),
+                         [0, 0, 0.55, 0.55, 1.1, 1.1, 1.65, 1.65])
+        expected = (self.folder / "cloudtrail.json").read_bytes()
+
+        # One window's failure stops the other workers, is reported itself, and resumes to identical output.
+        self.folder = self.folder.parent / "failed-then-resumed"
+        failing.append(("us-east-1", "2026-10-02"))
+        self.identity()
+        _, error = self.run_cli(*options, "--progress", "off", bounds=False, status=1)
+        self.assertIn("AccessDeniedException", error)
+        self.assertNotIn("stopped by another worker", error)
+        self.assertFalse(json.loads((self.folder / "manifest.json").read_text())["complete"])
+        failing.clear()
+        self.identity()
+        self.run_cli(*options, "--progress", "off", bounds=False)
+        self.assertEqual((self.folder / "cloudtrail.json").read_bytes(), expected)
 
     def test_invalid_range_is_rejected_before_aws_access(self):
         for options in [("--start", "2026-10-02"), ("--start", "2026-10-01T12:00:00"),
