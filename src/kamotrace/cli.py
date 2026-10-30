@@ -1,5 +1,6 @@
 """KamoTrace command line: load evidence and enrichment, then browse it.
 
+  kamotrace auto     CASE_FOLDER [--profile NAME] [--start ...] [--no-serve] ...
   kamotrace import   --source event_history.json --database case.duckdb
   kamotrace download --dest CASE --regions all --start 2026-10-01 --end 2026-10-02
   kamotrace get-suzaku [--version 3.0.0]
@@ -12,6 +13,7 @@
 import sys
 
 COMMANDS = {
+    "auto": ("kamotrace.auto", "Full-auto, resumable: tools, AWS download, import, enrichment, detections, then the UI"),
     "import": ("kamotrace.importer", "Load CloudTrail JSON/gzip files, folders or stdin into a new, read-only evidence DuckDB"),
     "download": ("kamotrace.download", "Resume CloudTrail and SSM collection using an existing AWS login"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),

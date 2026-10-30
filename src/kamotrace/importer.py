@@ -52,8 +52,8 @@ def records(stream):
     raise ValueError("Expected a JSON object with a Records array")
 
 
-def build(source, database):
-    # Paths remain rereadable; binary streams are spooled privately for independent verification.
+def expand(source):
+    """Import order: streams as given, paths resolved, folders as their sorted .json/.json.gz members."""
     inputs = [source] if isinstance(source, (str, Path)) or hasattr(source, "read") else list(source)
     sources = []
     for item in inputs:
@@ -69,6 +69,12 @@ def build(source, database):
                 sources.extend(members)
             else:
                 sources.append(path)
+    return sources
+
+
+def build(source, database):
+    # Paths remain rereadable; binary streams are spooled privately for independent verification.
+    sources = expand(source)
     if not sources:
         raise ValueError("At least one source is required")
     database = database.resolve()

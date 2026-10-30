@@ -9,6 +9,7 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 
 - [Follow a worked investigation](#end-to-end-example)
 - [Look up commands and server options](#commands)
+- [Prepare a case with one command](#full-auto-preparation)
 - [Run KamoTrace in Docker](#docker)
 - [Add Suzaku detections](#suzaku-detections)
 - [Add offline IP enrichment](#ip-enrichment)
@@ -149,6 +150,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 
 | Command | Purpose |
 | --- | --- |
+| `kamotrace auto CASE_FOLDER [options]` | [Full-auto](#full-auto-preparation): tools, AWS download, import, enrichment, detections, then `serve`; rerun to resume |
 | `kamotrace import --source FILE_OR_FOLDER... --database NEW.duckdb` | Combine CloudTrail JSON/gzip exports; repeat `--source`, or use `-` for binary stdin |
 | `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume CloudTrail/SSM collection with an existing AWS login; optional gzip output |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
@@ -190,6 +192,59 @@ or the SSM export requires restarting the server.
 Only code, synthetic tests and third-party browser assets belong in this
 repository. Databases, `event_history*.json`, enrichment JSONL, `.mmdb` files and
 the `data/` directory are gitignored; keep evidence outside the repository.
+
+## Full-auto preparation
+
+`kamotrace auto CASE_FOLDER` prepares a whole case with one command. It runs the
+other commands' code in dependency order, printing `[N/7 stage]` progress to stderr:
+
+| Stage | Default | Override or skip |
+| --- | --- | --- |
+| 1. `get-suzaku` | Newest Suzaku installed in the tools folder; otherwise download and verify the latest 3.x | `--suzaku EXE`, `--suzaku-version X.Y.Z`, `--timeline FILE`, `--skip-suzaku` |
+| 2. `get-dbip` | Newest complete DB-IP Lite folder in the tools folder; otherwise download and verify | `--geolite2 FOLDER` and/or `--jsonl FILE` (earlier wins), `--skip-enrich` |
+| 3. `download` | `CASE_FOLDER/download`, all enabled regions, CloudTrail and SSM, maximum available history | `--download-dir`, `--profile`, `--regions`, `--start`, `--end`, `--services`, `--compress`, `--progress`, `--session-s3`, `--session-log-group`; `--source FILE...` or `--skip-download` to use existing data |
+| 4. `import` | `CASE_FOLDER/case.duckdb` from `cloudtrail.json[.gz]` | `--database` |
+| 5. `enrich` | `<database stem>.enrichment.duckdb` from DB-IP Lite | as stage 2 |
+| 6. `suzaku` | `<database stem>.detections.duckdb`, running Suzaku on the imported CloudTrail file | `--rules`, `--min-level` |
+| 7. `serve` | `127.0.0.1:8765`, with the downloaded SSM export | `--port`, `--ssm-export FILE` (with existing data), `--no-serve` |
+
+The tools folder defaults to `$KAMOTRACE_TOOLS` or `~/.kamotrace/tools`
+(`--tools`), so installed tools are shared between cases. Tools are set up
+before collection, so a tool problem appears before a long download. Suzaku
+and DB-IP Lite are still downloaded only from their official sources and
+verified as described for [`get-suzaku`](#download-and-run-suzaku) and
+[IP enrichment](#ip-enrichment). Credit DB-IP Lite data (CC BY 4.0).
+
+AWS access uses your existing login, exactly as [`download`](../README.md#download-from-an-existing-aws-login)
+does; there is no login prompt, so it is safe for unattended use with `--no-serve`
+and `--progress log`. `--services` must include `cloudtrail`. Running Suzaku needs a
+single CloudTrail file or folder; with several `--source` files, pass `--timeline`
+or `--skip-suzaku`.
+
+### Retry and recovery
+
+If a stage fails or you press Ctrl+C, the command stops with a nonzero status
+and names the stage. Fix the cause, such as an expired AWS login, and **rerun the same
+command**. Each stage checks what already exists:
+
+- **Tools** are reused only when complete: Suzaku installs are published
+  atomically, and a DB-IP folder counts only once its download record lists
+  both verified files.
+- **Collection** resumes from the downloader's checkpoint. Its default end time
+  is frozen at the first run, so later reruns finish the same snapshot instead
+  of moving the range. A completed collection with the same options is reused
+  without contacting AWS. Different options are refused; use a new case folder
+  for a fresh snapshot.
+- **Evidence** is imported only after the collection is marked complete. An existing
+  database is reused only if its recorded source files and SHA-256 hashes match
+  the current inputs; otherwise the run stops and the database is never overwritten. An unfinished
+  `case.duckdb.building` file left by a killed import is deleted and the import is redone.
+- **Enrichment and detections** are derived sidecars, written atomically.
+  They are reused only if they are bound to this evidence database. Enrichment
+  must also have the same source files and hashes. Detections must come from the
+  same CloudTrail input or timeline hash. Otherwise they are rebuilt.
+  To refresh them after updating Suzaku or DB-IP, pass `--rebuild-sidecars`.
+- Only one `auto` run can use a case folder at a time (`CASE_FOLDER/.kamotrace-auto.lock`).
 
 ## Docker
 
@@ -923,6 +978,9 @@ invalid input, raw-hash check) whose writes are checked through the browser API,
 and Suzaku import (exact eventID/region/time linkage, correlation rows linked to
 every member or not at all, unmatched rows kept but not shown, rule AND filters,
 minimum level, refusal to overwrite) against the
-DuckDB schema Suzaku 3.0.0 writes.
+DuckDB schema Suzaku 3.0.0 writes. Full-auto tests run every stage on stubbed AWS
+and tool downloads: a target-only run that fails mid-collection, resumes with the
+same frozen range, then reruns as a no-op; stage failures, refreshed sidecars,
+refusal of different evidence and of concurrent runs.
 They never modify the real CloudTrail evidence database. For contributor
 architecture and evidence-handling rules, see [AGENTS.md](../AGENTS.md).

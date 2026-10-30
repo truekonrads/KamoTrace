@@ -13,7 +13,10 @@ Package layout: `src/kamotrace/`, installed as the `kamotrace` command
 (`pyproject.toml`). Loading data and enrichment are CLI steps; the browser UI
 only reads them.
 
-- `cli.py`: `kamotrace import | get-suzaku | suzaku | get-dbip | enrich | serve | mcp` dispatcher.
+- `cli.py`: `kamotrace auto | import | download | get-suzaku | suzaku | get-dbip | enrich | serve | mcp` dispatcher.
+- `auto.py`: full-auto, rerunnable pipeline over the other modules (tools, download, import, enrich,
+  suzaku, serve). It holds no logic of its own beyond deciding per stage whether verified
+  completed work can be reused; never let it overwrite evidence or trust unpublished partials.
 - `get_suzaku.py`: downloads the official Suzaku 3.x release for the platform,
   verifies GitHub's published SHA-256, refuses unsafe archive paths, and installs
   into `$KAMOTRACE_TOOLS` (default `~/.kamotrace/tools`), where `kamotrace suzaku`

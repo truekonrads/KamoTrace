@@ -51,6 +51,26 @@ uv tool install C:\path\to\KamoTrace
 If you are working from the checkout without installing the command, use
 `uv run kamotrace` instead of `kamotrace` in the steps below.
 
+#### Full-auto: one command from AWS login to browser
+
+After logging in with your normal AWS tooling, `kamotrace auto` runs steps 2–5
+for you, in dependency order, and then opens the server:
+
+```powershell
+kamotrace auto C:\cases\example
+```
+
+It installs and verifies Suzaku and DB-IP Lite (unless already installed),
+downloads CloudTrail and SSM from all enabled regions (maximum available history),
+imports `case.duckdb`, adds IP enrichment and Suzaku detections, and starts the
+UI on http://127.0.0.1:8765. Every default can be overridden, for example
+`--profile investigation --start 2026-10-01 --end 2026-10-02`, `--source FILE`
+to skip AWS, `--skip-suzaku`, or `--no-serve` for unattended use. If anything
+fails or you interrupt it, **rerun the same command**: completed work is kept,
+including the collection's frozen time range. See
+[full-auto preparation](docs/user-guide.md#full-auto-preparation) for all
+options and recovery rules.
+
 ### 2. Get your CloudTrail export
 
 In the AWS console:
