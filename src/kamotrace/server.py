@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from zoneinfo import ZoneInfo, available_timezones
 import duckdb
 
 
+logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
 FIELDS = {
     "time_local": "Local time",
@@ -153,10 +155,12 @@ def build_query(body):
 class Store:
     def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None):
         with ExitStack() as startup:
+            logger.info("Opening evidence database (read-only): %s", database)
             self.connection = duckdb.connect(str(database), read_only=True)
             startup.callback(self.connection.close)
             self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
             self.lock = threading.Lock()
+            logger.info("Opening findings/tags sidecar: %s", annotations or database.with_suffix(".annotations.sqlite3"))
             self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
             startup.callback(self.reviews.close)
             self.reviews.row_factory = sqlite3.Row
@@ -173,6 +177,7 @@ class Store:
             # Bind the sidecar to its evidence on first use (older sidecars too), so another case's notes
             # can't be mixed in silently, as detections and enrichment sidecars already refuse.
             from .suzaku import evidence_identity
+            logger.info("Validating findings/tags evidence identity")
             identity = json.dumps(list(evidence_identity(self.connection)))
             self.reviews.execute("INSERT OR IGNORE INTO sidecar_meta VALUES ('evidence', ?)", (identity,))
             self.reviews.commit()
@@ -185,11 +190,15 @@ class Store:
                 self.reviews.commit()
             self.connection.execute("CREATE TEMP TABLE review_tags(hash VARCHAR, slug VARCHAR)")
             self.connection.execute("CREATE TEMP TABLE review_notes(hash VARCHAR, annotation_id BIGINT)")
+            logger.info("Loading findings and event tags")
             self.refresh_reviews()
             from .enrich import load_enrichment
             # IP enrichment comes from a sidecar written by `kamotrace enrich` (GeoLite2 and/or neutral JSONL).
             default = database.with_suffix(".enrichment.duckdb")
-            self.enrichment_run = load_enrichment(self.connection, enrichment or (default if default.exists() else None))
+            enrichment = enrichment or (default if default.exists() else None)
+            logger.info("Loading IP enrichment: %s", enrichment or "none (no sidecar found)")
+            self.enrichment_run = load_enrichment(self.connection, enrichment)
+            logger.info("Preparing event browser view")
             self.connection.execute("""
                 CREATE TEMP VIEW browse_events AS
                 SELECT e.source_record AS id, e.record_sha256, e.event_id, e.event_time,
@@ -207,13 +216,17 @@ class Store:
             """)
             from .ssm import Commands
             from .suzaku import load_detections
+            logger.info("Loading and linking SSM commands: %s", ssm_export or "none (no export supplied)")
             self.commands = Commands(ssm_export, self.connection)
             # Suzaku detections come from a derived sidecar written by `kamotrace suzaku`; only rows the
             # CLI linked to exactly one evidence record are queryable. Missing sidecar = no detections.
             default = database.with_suffix(".detections.duckdb")
-            self.suzaku_run = load_detections(self.connection, detections or (default if default.exists() else None))
+            detections = detections or (default if default.exists() else None)
+            logger.info("Loading Suzaku detections: %s", detections or "none (no sidecar found)")
+            self.suzaku_run = load_detections(self.connection, detections)
             # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
             self.connection.execute("SET enable_external_access=false")
+            logger.info("Calculating event counts, time range and filter metadata")
             self.meta = self.metadata()
             # The Store owns both connections after initialization succeeds.
             startup.pop_all()
@@ -566,6 +579,10 @@ def main(argv=None):
     parser.add_argument("--detections", type=Path,
                         help="Suzaku detections from `kamotrace suzaku` (default: <database>.detections.duckdb if present)")
     args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S%z")
+    started = time.monotonic()
+    logger.info("Starting KamoTrace; loading local data before accepting requests")
     for name in ("database", "enrichment", "ssm_export", "detections"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
@@ -575,12 +592,14 @@ def main(argv=None):
                       args.ssm_export, args.detections and args.detections.resolve())
     except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
         parser.error(str(error))
+    logger.info("Binding HTTP server to %s:%s", args.bind, args.port)
     server = ThreadingHTTPServer((args.bind, args.port), partial(Handler, store=store))
     if args.bind != "127.0.0.1":
         print(f"Listening on {args.bind}:{args.port}: anyone who can reach this port gets unauthenticated "
               f"access. Publish it only as 127.0.0.1:{args.port}:{args.port}.", flush=True)
     detections = (f" | {store.suzaku_run['linked_rows']:,} Suzaku detections" if store.suzaku_run else "")
-    print(f"KamoTrace: http://127.0.0.1:{args.port} | {store.meta['total']:,} events{detections} | read-only", flush=True)
+    logger.info("Startup complete in %.1fs", time.monotonic() - started)
+    print(f"KamoTrace: http://127.0.0.1:{server.server_port} | {store.meta['total']:,} events{detections} | read-only", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

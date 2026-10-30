@@ -9,14 +9,17 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 import duckdb
 
 from .importer import discard_abandoned, lock_path, publish, staging, write_lock
 
+logger = logging.getLogger(__name__)
 LEVELS = ("informational", "low", "medium", "high", "critical")
 SCHEMA = 1  # KamoTrace detections sidecar layout
 
@@ -201,6 +204,8 @@ def load_detections(connection, path):
         return None
     # A separate read-only connection, not ATTACH: DuckDB shares one instance per database file in a
     # process, and the evidence instance may already have external file access disabled.
+    started = time.monotonic()
+    logger.info("Opening and validating Suzaku sidecar: %s", path)
     sidecar = duckdb.connect(str(path), read_only=True)
     try:
         run = json.loads(sidecar.execute("SELECT metadata FROM suzaku_run").fetchone()[0])
@@ -208,12 +213,15 @@ def load_detections(connection, path):
             raise ValueError(f"{path}: unsupported detections sidecar; rebuild it with `kamotrace suzaku --replace`")
         if (run["evidence_source_sha256"], run["evidence_records"]) != evidence_identity(connection):
             raise ValueError(f"{path} was built for a different evidence database; rebuild it with `kamotrace suzaku`")
+        logger.info("Reading linked Suzaku detection rows")
         rows = sidecar.execute("""SELECT source_record, rule_id, rule_title, level, level_rank, tactics, technique_ids
             FROM detections WHERE link_status = 'linked'""").fetchall()
     finally:
         sidecar.close()
+    logger.info("Copying %s linked Suzaku detections into the in-memory table", format(len(rows), ","))
     if rows:
         connection.executemany("INSERT INTO detections VALUES (?,?,?,?,?,?,?)", rows)
+    logger.info("Loaded %s linked Suzaku detections in %.1fs", format(len(rows), ","), time.monotonic() - started)
     return run
 
 

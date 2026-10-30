@@ -287,6 +287,9 @@ kamotrace serve --database case.duckdb
 Open **http://127.0.0.1:8765** on the computer running KamoTrace. Leave the
 server running while you investigate. It loads the IP enrichment and Suzaku
 detection files beside `case.duckdb` automatically when they are present.
+Startup logs on stderr show timestamped loading stages and sidecar paths before
+the server accepts requests, followed by the total startup time and ready URL.
+If startup is slow, the last stage message identifies the work still in progress.
 
 ### 6. Find events and save findings
 

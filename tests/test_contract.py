@@ -7,6 +7,7 @@ import hashlib
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+from queue import Empty, Queue
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,49 @@ class BrowserContract(unittest.TestCase):
         except HTTPError as error:
             with error:
                 return error.code, json.load(error)
+
+    def test_serve_reports_startup_progress_and_ready_url(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            process = subprocess.Popen([sys.executable, "-m", "kamotrace", "serve",
+                "--database", str(self.database), "--ssm-export", str(self.ssm_export),
+                "--annotations", str(Path(temporary) / "reviews.sqlite3"), "--bind", "127.0.0.1", "--port", "0"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            lines = Queue()
+
+            def read_output():
+                for line in process.stdout:
+                    lines.put(line)
+                lines.put(None)
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            output = ""
+            try:
+                while True:
+                    try:
+                        line = lines.get(timeout=30)
+                    except Empty:
+                        self.fail("No startup progress for 30 seconds:\n" + output)
+                    self.assertIsNotNone(line, "Server exited before becoming ready:\n" + output)
+                    output += line
+                    if line.startswith("KamoTrace: http://"):
+                        url = line.split()[1]
+                        break
+                for stage in ("Opening evidence database (read-only)", "Validating findings/tags evidence identity",
+                              "Loading IP enrichment", "Loading and linking SSM commands", "Loading Suzaku detections",
+                              "Calculating event counts", "Binding HTTP server", "Startup complete in"):
+                    self.assertIn(stage, output)
+                self.assertIn(str(self.database), output)
+                self.assertIn(str(self.database.with_suffix(".enrichment.duckdb")), output)
+                self.assertIn(str(self.ssm_export), output)
+                self.assertRegex(output, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4} INFO")
+                with urlopen(url + "/api/meta", timeout=15) as response:
+                    self.assertEqual(json.load(response)["total"], 5)
+            finally:
+                process.terminate()
+                process.wait(timeout=15)
+                reader.join(timeout=15)
+                process.stdout.close()
 
     def test_import_multiple_regions_gzip_streams_and_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -394,8 +438,12 @@ class BrowserContract(unittest.TestCase):
                          (4, 4, 0, "3.0.0"))
         with self.assertRaises(FileExistsError):
             import_timeline(self.database, timeline, sidecar)
-        store = Store(self.database, detections=sidecar)
+        with self.assertLogs("kamotrace.suzaku", level="INFO") as startup:
+            store = Store(self.database, detections=sidecar)
         try:
+            # The linked correlation row expands to two evidence matches: five rows to copy, not four.
+            self.assertIn("Copying 5 linked Suzaku detections", "\n".join(startup.output))
+            self.assertIn("Loaded 5 linked Suzaku detections", "\n".join(startup.output))
             ids = lambda body: [r["event_id"] for r in store.query({**body, "sorters": [{"field": "time_local", "dir": "asc"}]})["data"]]
             self.assertEqual(ids({"rules": ["rule-low"]}), ["event-0", "event-2"])
             self.assertEqual(ids({"rules": ["rule-low", "rule-high"]}), ["event-0"])  # every rule must match
