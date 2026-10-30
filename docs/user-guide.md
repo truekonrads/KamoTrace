@@ -62,9 +62,13 @@ kamotrace import --source event_history.json --database case.duckdb
 ```
 
 The importer preserves nested JSON and numeric precision, hashes every record,
-records the source file's hash, and refuses to overwrite an existing database.
-A UTF-8 byte-order mark is fine. One database holds one export file; for several
-regions or S3 trail logs (`.json.gz`) see the [known limitations](BUGS.md).
+records every source file's hash, and refuses to overwrite an existing database.
+A UTF-8 byte-order mark is fine. Combine regions using repeatable `--source`
+arguments or pass a CloudTrail-only folder; `.json.gz` files and binary stdin
+(`--source -`) work too. See the [multi-file and stream examples](../README.md#multiple-files-gzip-and-stdin).
+Existing databases are never appended to; select the whole set for a new import.
+The downloader's `--compress` option produces gzip CloudTrail and SSM exports
+that `import` and `serve --ssm-export` can read directly.
 
 ### 4. Add Sigma detections (optional)
 
@@ -145,7 +149,8 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 
 | Command | Purpose |
 | --- | --- |
-| `kamotrace import --source FILE --database NEW.duckdb` | Build a new evidence database from a CloudTrail `Records` JSON export |
+| `kamotrace import --source FILE_OR_FOLDER... --database NEW.duckdb` | Combine CloudTrail JSON/gzip exports; repeat `--source`, or use `-` for binary stdin |
+| `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume CloudTrail/SSM collection with an existing AWS login; optional gzip output |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
 | `kamotrace suzaku --database DB (--source FILE [--suzaku EXE] \| --timeline FILE)` | Run or import Suzaku detections into `<database>.detections.duckdb` |
 | `kamotrace get-dbip [--dest FOLDER]` | Download and verify the free DB-IP Lite City and ASN databases (CC BY 4.0, no account) |
@@ -596,6 +601,11 @@ stay pinned and the grid fills the rest of the window.
   screenshots or exports without reviewing them.
 
 ## SSM command browser (desktop)
+
+To collect a compatible export using an existing AWS login, use
+[`kamotrace download`](../README.md#download-from-an-existing-aws-login).
+Its `ssm.json` can be passed directly to `--ssm-export`. Session records and
+downloaded transcripts remain separate from the Run Command viewer.
 
 Load the local consolidated SSM export, preferably the base64-enriched version:
 

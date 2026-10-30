@@ -1,7 +1,9 @@
 """Read local SSM evidence and join commands, system invocations and plugin outputs."""
 import hashlib
+import io
 import json
 
+from .importer import open_json
 from .server import parse_time
 
 
@@ -9,7 +11,10 @@ class Commands:
     def __init__(self, path, connection):
         self.commands, self.events = {}, {}
         self.path = path
-        document = json.loads(path.read_text(encoding="utf-8-sig")) if path else {}
+        document = {}
+        if path:
+            with open_json(path) as stream, io.TextIOWrapper(stream, encoding="utf-8-sig") as text:
+                document = json.load(text)
         if path and (not isinstance(document, dict) or not isinstance(document.get("account_id"), str)
                      or any(not isinstance(document.get(k), list) for k in ("commands", "invocations", "invocation_details"))):
             raise ValueError("Expected an SSM command/session activity export with account_id, commands, invocations and invocation_details")

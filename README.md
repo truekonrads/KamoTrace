@@ -63,9 +63,89 @@ A download contains management events from one region, from the last 90 days,
 with up to 200,000 events. Keep it on a private local disk: events can contain
 credentials and personal information.
 
-KamoTrace imports one plain JSON file per evidence database. For multiple
-regions or compressed S3 trail logs, read the
-[input limitations and workarounds](docs/BUGS.md#1-one-evidence-database-holds-exactly-one-plain-json-file).
+Alternatively, use the resumable CLI downloader below to combine regions.
+The importer also accepts multiple regional exports, folders of S3 trail logs,
+gzip files and stdin; see [importing multiple files or a stream](#multiple-files-gzip-and-stdin).
+
+#### Download from an existing AWS login
+
+Log in first using your normal AWS tooling (for example, `aws sso login --profile investigation`).
+KamoTrace uses boto3's existing credential chain, optionally selected with `--profile`;
+it does not perform an interactive login or save credentials. All AWS calls are read-only.
+
+```powershell
+kamotrace download --profile investigation --dest C:\cases\example\download --regions all --start 2026-10-01 --end 2026-10-02
+```
+
+- `--regions all` selects enabled regions in the current account/partition
+  (requires `ec2:DescribeRegions`). Or choose explicit regions, e.g.
+  `--regions ap-southeast-1 us-east-1`. Set your AWS default region for the
+  partition you use; if unset, the bootstrap region is `us-east-1`.
+- Both endpoints are **inclusive**. Dates mean UTC: the example includes
+  October 1 and 2 in full, through `2026-10-02T23:59:59.999999Z`.
+  ISO timestamps must have `Z` or an offset, e.g. `2026-10-01T08:00:00+08:00`.
+  This collection convention is separate from the viewer's end-exclusive filters.
+- Both CloudTrail and SSM are selected by default. Use `--services cloudtrail`
+  or `--services ssm` to collect only one. The range selects event time,
+  command request time or session start time, not sessions merely overlapping it.
+- Add `--compress` to gzip generated CloudTrail, SSM and CloudWatch JSON exports.
+  Output names become `cloudtrail.json.gz`, `ssm.json.gz` and `logs/*.json.gz`;
+  original S3 object bytes are preserved; the manifest and checkpoint are not compressed.
+  Both `import` and `serve --ssm-export` read gzip directly.
+- `--progress auto` (default) shows a moving 🦆 bar in terminals and UTC timestamped
+  tick logs when redirected. Force `bar`, `log` (batch/headless), or `off`.
+  Progress goes to stderr; the bar measures completed region/service work, not
+  a guessed event total. Page/cache counts and S3 transfer ticks show activity.
+  Set `$env:KAMOTRACE_NO_EMOJI = "1"` in PowerShell, or
+  `KAMOTRACE_NO_EMOJI=1` in your shell environment, for an ASCII-only bar.
+  Any nonempty value disables emoji; logs always use plain text.
+
+Rerun the **same command and destination** after interruption or renewing your
+login. SQLite checkpoints commit every API page and cursor, including empty
+pages. CloudTrail is split into daily batches; expired cursors restart only
+their batch and duplicate event IDs are removed within each region. SDK retries
+handle transient failures/throttling. Interrupted S3 objects restart, while
+completed objects are reused only when both their saved ETag and local SHA-256
+match. Conflicting ETags across listings stop collection without replacing the
+collected bytes; use a new destination for a fresh snapshot. Older checkpoints
+without ETag bindings re-download those objects using `IfMatch` before trusting them.
+Resume refuses a different
+account/partition, range, regions, services, compression or log locations. Use a new destination
+for a fresh snapshot: completed requests are not refreshed, including active
+commands/sessions or logs delivered later. Do not run two collectors in one directory.
+
+The destination contains `cloudtrail.json` (one importable `Records` array, with
+original event JSON preserved), `ssm.json` (commands, per-system/plugin outputs,
+active and historical session records), `logs/`, `manifest.json` (coverage and log
+source/file mapping), and `checkpoint.sqlite`. Keep the whole directory private
+and outside Git (or under ignored `data/`). Import and browse with:
+
+```powershell
+kamotrace import --source C:\cases\example\download\cloudtrail.json --database C:\cases\example\case.duckdb
+kamotrace serve --database C:\cases\example\case.duckdb --ssm-export C:\cases\example\download\ssm.json
+```
+
+CloudTrail Event History provides available **management events from the last
+90 days**, not data events, S3 trails or Lake. SSM Run Command and terminated
+session history generally retain **30 days**. Commands include inline outputs
+(which AWS may truncate) plus output from their configured S3/CloudWatch destinations.
+For existing interactive session transcripts, add repeatable
+`--session-s3 s3://BUCKET/PREFIX/` and/or `--session-log-group GROUP` options.
+S3 objects must contain an exact selected session ID as a path component or
+`SESSION-ID.log` filename; CloudWatch streams use the session ID prefix.
+Only transcripts for sessions still returned by SSM are collected. Choose
+prefixes/groups appropriate to the selected regions; custom layouts are not inferred.
+Session transcripts are saved separately, **not displayed in the command viewer**.
+Logging must already have been enabled; SSH/port-forwarding sessions have no
+transcripts. Empty results do not prove no activity occurred.
+
+Permissions depend on collection: `sts:GetCallerIdentity`, `cloudtrail:LookupEvents`,
+`ssm:ListCommands`, `ssm:ListCommandInvocations`, `ssm:GetCommandInvocation`,
+`ssm:DescribeSessions`, plus `s3:ListBucket`/`s3:GetObject`,
+`logs:FilterLogEvents` and `kms:Decrypt` where the log destinations require them.
+Permission failures stop with a nonzero status and leave resumable checkpoints;
+`manifest.json` is marked complete only after all selected collection succeeds.
+Missing, expired or not-yet-delivered logs cannot be recovered by this command.
 
 ### 3. Import the events
 
@@ -79,6 +159,48 @@ kamotrace import --source event_history.json --database case.duckdb
 The importer preserves the original records and JSON numeric precision. It
 records the source file's SHA-256 hash and a canonical hash for each record.
 It refuses to overwrite an existing database.
+
+#### Multiple files, gzip and stdin
+
+Combine regional files into **one new database in one invocation**, without
+manually merging JSON. Mix plain JSON and gzip inputs; `--source` is repeatable
+and also accepts several paths after it:
+
+```powershell
+kamotrace import --source C:\cases\example\us-east-1.json --source C:\cases\example\ap-southeast-1.json.gz --database C:\cases\example\combined.duckdb
+```
+
+For many S3 trail files, pass a **CloudTrail-only folder**. It is searched
+recursively for `.json` and `.json.gz` files in sorted path order:
+
+```powershell
+kamotrace import --source C:\cases\example\trail-logs --database C:\cases\example\combined.duckdb
+```
+
+Or pipe one complete `{"Records": [...]}` document into `--source -` (POSIX shell):
+
+```sh
+gzip -dc cloudtrail.json.gz | kamotrace import --source - --database case.duckdb
+```
+
+Stdin also accepts gzip bytes directly, so decompression is optional. Use a
+binary-preserving pipe; older PowerShell text pipelines may change bytes.
+Concatenating several JSON documents is not a merge: pass them as separate sources.
+Do not pass a whole downloader directory containing SSM/manifest/log JSON as a
+CloudTrail folder; use its `cloudtrail.json` or `cloudtrail.json.gz` explicitly.
+
+Imports never append to or replace existing evidence. To keep regions separate,
+import each file into its own database; to combine them, select the entire file
+set when creating a new database. All records, including duplicates across
+overlapping files, are preserved with their original `awsRegion`. Each event has
+`source_file` and a one-based `source_ordinal`; `import_sources` and `build_info`
+retain each source's byte hash, size, record count and global record range.
+Single-source identity remains that source's SHA-256 (of compressed bytes for
+gzip); multi-source identity hashes the ordered source hashes, not local paths.
+Changing input order changes the identity because it changes global record IDs.
+Stdin is spooled to private temporary disk for hashing and independent record
+verification, then deleted. Keep your original inputs for reproducibility and
+Suzaku; a stdin import cannot recreate the incoming original file for you.
 
 ### 4. Add GeoIP information
 

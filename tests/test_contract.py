@@ -2,10 +2,12 @@
 from datetime import datetime, timezone
 from functools import partial
 import gc
+import gzip
 import hashlib
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -106,6 +108,98 @@ class BrowserContract(unittest.TestCase):
         except HTTPError as error:
             with error:
                 return error.code, json.load(error)
+
+    def test_import_multiple_regions_gzip_streams_and_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sources = root / "regions"
+            sources.mkdir()
+            first = (b'{"eventID":"regional-a","eventTime":"2026-10-01T00:00:00Z",'
+                     b'"eventSource":"ssm.amazonaws.com","awsRegion":"us-east-1",'
+                     b'"requestParameters":{"number":9007199254740993.123456789}}')
+            second = first.replace(b'regional-a', b'regional-b').replace(b'us-east-1', b'ap-southeast-1')
+            a, b = sources / "a.json", sources / "b.json.gz"
+            a.write_bytes(b'\xef\xbb\xbf{"Records":[' + first + b']}')
+            b.write_bytes(gzip.compress(b'{"Records":[' + second + b',' + first + b']}', mtime=0))
+            (sources / "ignore.txt").write_text("Not evidence")
+            database = root / "combined.duckdb"
+            command = [sys.executable, "-m", "kamotrace", "import"]
+            result = subprocess.run([*command, "--source", str(a), "--source", str(b),
+                                     "--database", str(database)], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual((report["records"], report["distinct_event_ids"]), (3, 2))
+            self.assertEqual([(s["source_sha256"], s["source_records"], s["first_record"], s["last_record"])
+                              for s in report["sources"]], [
+                (hashlib.sha256(a.read_bytes()).hexdigest(), 1, 1, 1),
+                (hashlib.sha256(b.read_bytes()).hexdigest(), 2, 2, 3)])
+            with duckdb.connect(str(database), read_only=True) as connection:
+                self.assertEqual(connection.execute("""SELECT source_record, source_file, source_ordinal,
+                    record_sha256 FROM events ORDER BY source_record""").fetchall(), [
+                    (1, str(a), 1, hashlib.sha256(first).hexdigest()),
+                    (2, str(b), 1, hashlib.sha256(second).hexdigest()),
+                    (3, str(b), 2, hashlib.sha256(first).hexdigest())])
+                self.assertIn("9007199254740993.123456789", connection.execute(
+                    "SELECT raw_event::VARCHAR FROM events WHERE source_record=1").fetchone()[0])
+            # Folder expansion is deterministic; input order matters to sidecar record IDs.
+            for inputs, same in [([str(sources)], True), ([str(b), str(a)], False)]:
+                result = subprocess.run([*command, "--source", *inputs, "--database", str(root / f"ordered-{same}.duckdb")],
+                                        capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["source_sha256"] == report["source_sha256"], same)
+            # A real pipe is nonseekable; gzip is recognized without a filename or suffix.
+            for source, count in [(a, 1), (b, 2)]:
+                streamed = subprocess.run([*command, "--source", "-", "--database", str(root / f"stdin-{count}.duckdb")],
+                                          input=source.read_bytes(), capture_output=True)
+                self.assertEqual(streamed.returncode, 0, streamed.stderr)
+                stdin_report = json.loads(streamed.stdout)
+                self.assertEqual(stdin_report["source_file"], "<stdin>")
+                self.assertEqual(stdin_report["source_sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+                self.assertTrue(stdin_report["all_record_hashes_verified"])
+                self.assertEqual(stdin_report["records"], count)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            refused = subprocess.run([*command, "--source", str(a), "--database", str(database)], capture_output=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+            compressed_ssm = root / "ssm.json.gz"
+            compressed_ssm.write_bytes(gzip.compress(self.ssm_export.read_bytes(), mtime=0))
+            store = Store(database, ssm_export=compressed_ssm)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}"
+                request = Request(url + "/api/events", data=json.dumps({"filters": [
+                    {"field": "region", "op": "eq", "value": "ap-southeast-1"}]}).encode(),
+                    headers={"Content-Type": "application/json"})
+                with urlopen(request) as response:
+                    self.assertEqual([e["event_id"] for e in json.load(response)["data"]], ["regional-b"])
+                with urlopen(Request(url + "/api/ssm", data=b"{}", headers={"Content-Type": "application/json"})) as response:
+                    self.assertEqual(json.load(response)["total"], 2)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                store.reviews.close()
+                store.connection.close()
+
+    def test_import_rejects_bad_members_without_publishing_database(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid = root / "valid.json"
+            valid.write_text('{"Records":[{"eventID":"ok"}]}')
+            invalid = root / "invalid.json.gz"
+            packed = gzip.compress(valid.read_bytes())
+            for content in [packed[:-5], b'{"commands":[]}', b'{"Records":{}}', b'{"Records":[42]}',
+                            b'{"Records":[{}]} {"Records":[]}']:
+                invalid.write_bytes(content)
+                database = root / "bad.duckdb"
+                result = subprocess.run([sys.executable, "-m", "kamotrace", "import", "--source", str(valid),
+                                         str(invalid), "--database", str(database)], capture_output=True)
+                self.assertNotEqual(result.returncode, 0, content)
+                self.assertNotIn(b"Traceback", result.stderr)
+                self.assertFalse(database.exists())
+                self.assertFalse(database.with_suffix(".duckdb.building").exists())
 
     def test_annotations_tags_persistence_and_selection(self):
         rows = self.call("/api/events", {"sorters": [{"field": "time_local", "dir": "asc"}]})[1]["data"]

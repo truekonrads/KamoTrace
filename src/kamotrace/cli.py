@@ -1,6 +1,7 @@
 """KamoTrace command line: load evidence and enrichment, then browse it.
 
   kamotrace import   --source event_history.json --database case.duckdb
+  kamotrace download --dest CASE --regions all --start 2026-10-01 --end 2026-10-02
   kamotrace get-suzaku [--version 3.0.0]
   kamotrace suzaku   --database case.duckdb (--source event_history.json [--suzaku suzaku.exe] | --timeline suzaku.duckdb)
   kamotrace get-dbip [--dest FOLDER]
@@ -11,7 +12,8 @@
 import sys
 
 COMMANDS = {
-    "import": ("kamotrace.importer", "Load a CloudTrail Records JSON export into a new, read-only evidence DuckDB"),
+    "import": ("kamotrace.importer", "Load CloudTrail JSON/gzip files, folders or stdin into a new, read-only evidence DuckDB"),
+    "download": ("kamotrace.download", "Resume CloudTrail and SSM collection using an existing AWS login"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),

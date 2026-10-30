@@ -6,25 +6,6 @@ at the end lists what has already been fixed.
 
 ## Open
 
-### 1. One evidence database holds exactly one plain JSON file
-
-`kamotrace import --source` takes a single `{"Records": [...]}` file
-(`importer.py`). The import's identity (`build_info.source_sha256`) is that one
-file's hash, and every sidecar binds to it.
-
-- **Affects:** multi-region incidents (a console Event history download covers
-  one region, and global IAM events land in us-east-1); S3 trail logs, which are
-  many `*.json.gz` files and the only source older than 90 days. A `.json.gz`
-  file fails with `IncompleteJSONError ... \x1f\x8b`.
-- **Workaround:** merge the `Records` arrays into one file yourself (the merged
-  file then becomes the hashed source), or keep one database per region. Tags and
-  notes are per database.
-- **Intended fix:** accept a repeatable `--source` and folders, open `.gz` with
-  `gzip`, record per-file `{path, sha256, records}` in `build_info` plus a
-  `source_file` column, make `evidence_identity` a digest of the sorted file
-  hashes, and run Suzaku on the same set (`-d` folder). Existing databases and
-  sidecars keep their single-file identity.
-
 ### 2. Free-text search does not cover enrichment fields
 
 `search` matches the raw event JSON only. Country, ASN, network and provider
@@ -72,6 +53,7 @@ shapes and critical usability bugs. Fixed, with regression tests where noted:
 
 | Issue | Fix |
 | --- | --- |
+| One database accepted only one plain CloudTrail JSON file | `import --source` now accepts multiple files, recursive folders, gzip and binary stdin, with per-source provenance and record hashes. Multi-source identity uses ordered file hashes so reordered record IDs cannot reuse a sidecar; single-source identities stay unchanged. See [import examples](../README.md#multiple-files-gzip-and-stdin). |
 | Search missed values containing `"` or `\` (Windows paths, command lines), because raw JSON stores them escaped | Search also matches the JSON-escaped form (test) |
 | Suzaku 3 correlation rules (several eventIDs joined by ` ¦ `) were always `no_match`, hiding critical multi-step detections | Each member eventID links exactly; partial chains stay unlinked (test, plus a real Suzaku 3.0.0 run) |
 | `get-suzaku` chose the gnu Linux build on glibc < 2.39, where it cannot run | gnu only on glibc 2.39+, otherwise musl; aarch64 on old glibc asks for a manual download |
