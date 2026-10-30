@@ -392,6 +392,47 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(installed(tools), tools / "suzaku-3.10.0" / "suzaku-3.10.0-lin-x64-gnu")
         self.assertEqual(sorted(p.name for p in tools.iterdir()), ["suzaku-3.0.0", "suzaku-3.10.0"])
 
+    def test_get_dbip_installs_only_verified_dbip_databases(self):
+        import gzip
+        from mmdb_writer import MMDBWriter
+        from netaddr import IPSet
+        from kamotrace.enrich import read_geolite2
+        from kamotrace.get_dbip import install, release
+        # Shaped like DB-IP's download page: the CSV block (with its own SHA-1) precedes the MMDB block.
+        page = """<dt>SHA1SUM</dt><dd class="small">""" + "c" * 40 + """</dd></dl>
+            <a href='https://download.db-ip.com/free/dbip-city-lite-2026-10.csv.gz'>CSV</a>
+            <dt>SHA1SUM</dt>\n<dd class="small">""" + "a" * 40 + """</dd>\n</dl>
+            <a href='https://download.db-ip.com/free/dbip-city-lite-2026-10.mmdb.gz' class='btn'>MMDB</a>"""
+        self.assertEqual(release(page, "city"),
+                         ("https://download.db-ip.com/free/dbip-city-lite-2026-10.mmdb.gz", "2026-10", "a" * 40))
+        with self.assertRaisesRegex(RuntimeError, "No MMDB download"):
+            release(page, "asn")
+        root = Path(self.temp.name) / "dbip"
+        folder = root / "dbip-lite-2026-10"
+        folder.mkdir(parents=True)
+        def compressed(kind, database_type, data):
+            plain = root / f"{kind}.mmdb"
+            writer = MMDBWriter(4, database_type)
+            writer.insert_network(IPSet(["192.0.2.0/24"]), data)
+            writer.to_db_file(str(plain))
+            packed = root / f"{kind}.mmdb.gz"
+            packed.write_bytes(gzip.compress(plain.read_bytes()))
+            return packed, hashlib.sha1(plain.read_bytes()).hexdigest()
+        city, city_sha1 = compressed("city", "DBIP-City-Lite", {"country": {"iso_code": "ID", "names": {"en": "Indonesia"}}})
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            install(city, "0" * 40, "city", "2026-10", folder)
+        other, other_sha1 = compressed("other", "GeoLite2-City", {})
+        with self.assertRaisesRegex(RuntimeError, "unexpected database type"):
+            install(other, other_sha1, "city", "2026-10", folder)
+        self.assertEqual(list(folder.iterdir()), [])  # Failed installs leave nothing behind
+        asn, asn_sha1 = compressed("asn", "DBIP-ASN-Lite (compat=GeoLite2-ASN)", {"autonomous_system_number": 64500})
+        install(city, city_sha1, "city", "2026-10", folder)
+        install(asn, asn_sha1, "asn", "2026-10", folder)
+        # enrich finds DB-IP's lower-case file names on case-sensitive file systems too.
+        rows, provenance = read_geolite2(folder, ["192.0.2.1"])
+        self.assertEqual(rows["192.0.2.1"][:4], ("Indonesia", "ID", None, 64500))
+        self.assertEqual([p["file"] for p in provenance], ["dbip-city-lite-2026-10.mmdb", "dbip-asn-lite-2026-10.mmdb"])
+
     def test_older_annotation_sidecar_is_migrated_additively(self):
         import sqlite3
         path = Path(self.temp.name) / "old.sqlite3"

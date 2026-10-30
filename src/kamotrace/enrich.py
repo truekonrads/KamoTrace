@@ -71,9 +71,13 @@ def read_geolite2(folder, ips):
     """Look up IPs offline in MaxMind GeoLite2/GeoIP2 City or Country plus ASN databases."""
     import maxminddb
 
+    if not folder.is_dir():
+        raise ValueError(f"--geolite2 needs a folder of .mmdb files, not {folder}")
     readers, provenance = {}, []
-    for kind, patterns in (("location", ("*City*.mmdb", "*Country*.mmdb")), ("asn", ("*ASN*.mmdb",))):
-        path = next((p for pattern in patterns for p in sorted(folder.glob(pattern))), None)
+    # Case-insensitive, so DB-IP's dbip-city-lite-*.mmdb is found on Linux too.
+    files = sorted(p for p in folder.iterdir() if p.suffix.lower() == ".mmdb")
+    for kind, words in (("location", ("city", "country")), ("asn", ("asn",))):
+        path = next((p for word in words for p in files if word in p.name.lower()), None)
         if path:
             reader = maxminddb.open_database(str(path))
             readers[kind] = reader
@@ -208,7 +212,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace enrich", description=__doc__.splitlines()[0])
     parser.add_argument("--database", type=Path, required=True, help="Evidence DuckDB built by `kamotrace import`")
     parser.add_argument("--geolite2", dest="sources", action=Source, metavar="FOLDER",
-                        help="Folder with MaxMind GeoLite2-City (or -Country) and/or GeoLite2-ASN .mmdb files")
+                        help="Folder with GeoLite2-format City (or Country) and/or ASN .mmdb files, "
+                             "e.g. MaxMind GeoLite2/GeoIP2 or DB-IP Lite from `kamotrace get-dbip`")
     parser.add_argument("--jsonl", dest="sources", action=Source, metavar="FILE",
                         help="Provider-neutral JSONL (see README); repeatable. Label = file name without extension")
     parser.add_argument("--output", type=Path, help="Enrichment sidecar (default: <database>.enrichment.duckdb)")

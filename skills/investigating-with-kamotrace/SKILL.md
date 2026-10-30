@@ -47,7 +47,7 @@ analyst asks you to). It never overwrites evidence:
 | --- | --- |
 | Import a CloudTrail `Records` export | `kamotrace import --source export.json --database case.duckdb` |
 | Suzaku Sigma detections | `kamotrace get-suzaku`, then `kamotrace suzaku --database case.duckdb --source export.json` |
-| IP enrichment | `kamotrace enrich --database case.duckdb --geolite2 FOLDER` and/or `--jsonl provider.jsonl` |
+| IP enrichment | `kamotrace get-dbip` (free DB-IP Lite, no account), then `kamotrace enrich --database case.duckdb --geolite2 FOLDER` and/or `--jsonl provider.jsonl` |
 
 The server must be restarted to pick up new detections or enrichment.
 
@@ -187,7 +187,7 @@ Available only when the analyst loaded an SSM export.
   linked event counts, plus provenance and unmatched/ambiguous counts. Search a
   rule's events with `query.rules: ["<rule_id>"]`, then verify them in the raw
   events before treating anything as a finding.
-- `country`, `city`, `asn` and `isp` are offline lookups (GeoLite2 and/or the
+- `country`, `city`, `asn` and `isp` are offline lookups (DB-IP Lite/GeoLite2 and/or the
   analyst's provider JSONL), not evidence. `(unmapped / service / private)`
   means no lookup applied (AWS service names, private ranges, missing data).
 - `ip_info` holds provider attributes as `source.key=value; ...`, e.g.

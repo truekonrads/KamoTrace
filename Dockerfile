@@ -1,5 +1,5 @@
-# KamoTrace with all Python dependencies. Suzaku (AGPL-3.0) and MaxMind GeoLite2 (EULA) are not
-# included: fetch Suzaku at run time with `kamotrace get-suzaku`, and mount your own GeoLite2 folder.
+# KamoTrace with all Python dependencies. Suzaku (AGPL-3.0) and IP geolocation data are not included:
+# fetch them at run time with `kamotrace get-suzaku` and `kamotrace get-dbip`, or mount your own GeoLite2 folder.
 FROM python:3.12-slim-trixie AS build
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/kamotrace UV_PYTHON_DOWNLOADS=never

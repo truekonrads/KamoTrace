@@ -37,7 +37,8 @@ are selected, ready for **Quick tag** or **Add to note**.*
 - Inspect top/bottom values and exact cell prevalence across the selected data.
 - Browse colored tags and shared Markdown notes as findings, with linked evidence.
 - Browse Suzaku (Sigma) detections by rule and severity, and pivot on them.
-- Enrich source IPs offline from GeoLite2 and/or your own provider's JSONL.
+- Enrich source IPs offline from free DB-IP Lite (one command, no account),
+  MaxMind GeoLite2 and/or your own provider's JSONL.
 - Browse SSM commands, decoded payloads and per-system/plugin output, either in
   a detailed browser or a dense spreadsheet, with links back to CloudTrail.
 - Let local AI agents search, tag/untag and write notes through an MCP adapter
@@ -100,12 +101,16 @@ kamotrace suzaku --database case.duckdb --source event_history.json
 "suzaku_version": "3.0.0",  "linked_rows": 300,  "no_match_rows": 0,  "ambiguous_rows": 0
 ```
 
-**5. Enrich source IPs (optional).** Use MaxMind GeoLite2 and/or your own
-provider's data as JSONL, highest priority first ([details](#ip-enrichment)):
+**5. Enrich source IPs (optional).** Download the free DB-IP Lite databases
+(no account needed), or use MaxMind GeoLite2 and/or your own provider's data as
+JSONL, highest priority first ([details](#ip-enrichment)):
 
 ```powershell
-kamotrace enrich --database case.duckdb --jsonl spur.jsonl --geolite2 C:\geoip
+kamotrace get-dbip
+kamotrace enrich --database case.duckdb --geolite2 $HOME\.kamotrace\tools\dbip-lite-2026-10
 ```
+
+`get-dbip` prints the folder it installed (named by DB-IP's monthly release).
 
 **6. Investigate in the browser.**
 
@@ -160,6 +165,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `kamotrace import --source FILE --database NEW.duckdb` | Build a new evidence database from a CloudTrail `Records` JSON export |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
 | `kamotrace suzaku --database DB (--source FILE [--suzaku EXE] \| --timeline FILE)` | Run or import Suzaku detections into `<database>.detections.duckdb` |
+| `kamotrace get-dbip [--dest FOLDER]` | Download and verify the free DB-IP Lite City and ASN databases (CC BY 4.0, no account) |
 | `kamotrace enrich --database DB (--geolite2 FOLDER \| --jsonl FILE)...` | Add offline IP enrichment into `<database>.enrichment.duckdb` |
 | `kamotrace serve --database DB [options]` | Start the browser UI on `127.0.0.1` |
 | `kamotrace mcp --url http://127.0.0.1:8765` | Stdio MCP adapter for agents, backed by a running `serve` |
@@ -197,9 +203,9 @@ the `data/` directory are gitignored; keep evidence outside the repository.
 ## Docker
 
 The image contains KamoTrace and all its Python dependencies. It does not
-contain Suzaku (AGPL-3.0) or MaxMind GeoLite2 data (EULA): `get-suzaku`
-downloads Suzaku into a persistent `/tools` volume, and you mount your own
-GeoLite2 folder. Build it from a checkout:
+contain Suzaku (AGPL-3.0) or IP geolocation data: `get-suzaku` and `get-dbip`
+download Suzaku and the free DB-IP Lite databases into a persistent `/tools`
+volume, or you mount your own GeoLite2 folder. Build it from a checkout:
 
 ```powershell
 docker build -t kamotrace C:\path\to\KamoTrace
@@ -212,7 +218,8 @@ mount it at `/case`. Every command is `docker run ... kamotrace <command>`:
 docker run --rm -v C:\case:/case kamotrace import --source /case/event_history.json --database /case/case.duckdb
 docker run --rm -v kamotrace-tools:/tools kamotrace get-suzaku
 docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace suzaku --database /case/case.duckdb --source /case/event_history.json
-docker run --rm -v C:\case:/case -v C:\geoip:/geoip:ro kamotrace enrich --database /case/case.duckdb --geolite2 /geoip
+docker run --rm -v kamotrace-tools:/tools kamotrace get-dbip
+docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace enrich --database /case/case.duckdb --geolite2 /tools/dbip-lite-2026-10
 docker run --rm --name kamotrace -p 127.0.0.1:8765:8765 -v C:\case:/case kamotrace serve --database /case/case.duckdb
 ```
 
@@ -325,17 +332,31 @@ extra fields your own provider supplies. Enrichment is a labelled lookup about
 an address, not evidence, and is never written into the evidence database.
 There are two options, which can be combined:
 
-1. **GeoLite2 (convenience).** Download the free MaxMind GeoLite2 **City** (or
-   **Country**) and **ASN** databases in `.mmdb` format (requires a free MaxMind
-   account and acceptance of the
-   [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula); KamoTrace does not
-   bundle or download them). Put them in one folder. Commercial GeoIP2 `.mmdb`
-   files with the same layout work too.
+1. **GeoLite2-format `.mmdb` (convenience).** A folder with one **City** (or
+   **Country**) and/or one **ASN** database, matched by file name, any case.
+   - **DB-IP Lite is free and needs no account or licence key.**
+     `kamotrace get-dbip` downloads the current monthly
+     [IP to City Lite](https://db-ip.com/db/download/ip-to-city-lite) and
+     [IP to ASN Lite](https://db-ip.com/db/download/ip-to-asn-lite) `.mmdb`
+     files, checks each against the SHA-1 published on DB-IP's download page and
+     its DB-IP database type, and installs them into
+     `~/.kamotrace/tools/dbip-lite-YYYY-MM` (or `$KAMOTRACE_TOOLS`, or `--dest`),
+     with a `kamotrace-download.json` provenance record. It is licensed
+     [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): credit
+     "IP Geolocation by DB-IP" (https://db-ip.com) in reports that use it.
+     Lite data has lower accuracy and coverage than commercial databases. Rerun
+     `get-dbip` monthly to update; each release keeps its own folder.
+   - **MaxMind GeoLite2** City/Country and ASN `.mmdb` files need a free MaxMind
+     account and acceptance of the
+     [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula), so KamoTrace
+     does not download them; put them in one folder. Commercial GeoIP2 and DB-IP
+     `.mmdb` files with the same layout work too.
 2. **Your own data (provider-neutral JSONL).** Convert any provider's output
    (Spur, ipinfo, an ip-api cache, an internal list) into the schema below.
 
 ```powershell
-kamotrace enrich --database C:\evidence\case.duckdb --geolite2 C:\geoip
+kamotrace get-dbip
+kamotrace enrich --database C:\evidence\case.duckdb --geolite2 $HOME\.kamotrace\tools\dbip-lite-2026-10
 kamotrace enrich --database C:\evidence\case.duckdb --jsonl C:\evidence\spur.jsonl --geolite2 C:\geoip --replace
 ```
 
@@ -343,7 +364,8 @@ Give `--geolite2` at most once; `--jsonl` can be repeated (with distinct file
 names, since the name is the label). **Order is priority:** for
 country, city, ASN and network, the first source given that has a value wins.
 Extra `attributes` from every source are kept, prefixed with the source label.
-The label is `geolite2` or the JSONL file name without its extension (`spur`),
+The label is `geolite2` (also for DB-IP files; the recorded database type says
+which) or the JSONL file name without its extension (`spur`),
 and labels must be unique. Only addresses that appear as a source IP in the
 evidence are stored; AWS service names such as `ec2.amazonaws.com` are skipped.
 
@@ -708,7 +730,7 @@ To scope it to one case instead, put it in that case folder's
 | Annotations, event links and colored tags | `<evidence-stem>.annotations.sqlite3` (or `--annotations`) | Yes (browser and MCP agents, through the same server) |
 | Suzaku detections and their provenance | `<evidence-stem>.detections.duckdb` (or `--detections`), written by `kamotrace suzaku` | No; read-only, rebuilt from Suzaku output |
 | SSM commands, outputs and enrichment | Original JSON export, loaded into memory | No; **not imported into persistent DuckDB tables** |
-| IP enrichment and its provenance | `<evidence-stem>.enrichment.duckdb` (or `--enrichment`), written by `kamotrace enrich` | No; read-only, rebuilt from GeoLite2/JSONL; no online lookups |
+| IP enrichment and its provenance | `<evidence-stem>.enrichment.duckdb` (or `--enrichment`), written by `kamotrace enrich` | No; read-only, rebuilt from DB-IP/GeoLite2 `.mmdb` and/or JSONL; no online lookups |
 | SSM-to-CloudTrail query links | Temporary DuckDB table | Memory only; rebuilt on startup |
 
 Stop the server before backing up the annotation sidecar. Keep it with the exact
@@ -774,8 +796,8 @@ docker build -t kamotrace .
 ```
 
 Only the optional JavaScript syntax check needs Node. There is no Node build.
-The unit tests never download Suzaku; check `get-suzaku` and a real Suzaku run
-in the container by hand, on synthetic data.
+The unit tests never download Suzaku or DB-IP; check `get-suzaku`, `get-dbip`
+and a real Suzaku run in the container by hand, on synthetic data.
 
 Tests use synthetic records and a disposable database built through the bundled importer,
 real HTTP requests, asymmetric Jakarta-midnight boundaries, combined filters,

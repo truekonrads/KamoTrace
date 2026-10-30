@@ -13,7 +13,7 @@ Package layout: `src/kamotrace/`, installed as the `kamotrace` command
 (`pyproject.toml`). Loading data and enrichment are CLI steps; the browser UI
 only reads them.
 
-- `cli.py`: `kamotrace import | get-suzaku | suzaku | enrich | serve | mcp` dispatcher.
+- `cli.py`: `kamotrace import | get-suzaku | suzaku | get-dbip | enrich | serve | mcp` dispatcher.
 - `get_suzaku.py`: downloads the official Suzaku 3.x release for the platform,
   verifies GitHub's published SHA-256, refuses unsafe archive paths, and installs
   into `$KAMOTRACE_TOOLS` (default `~/.kamotrace/tools`), where `kamotrace suzaku`
@@ -29,7 +29,13 @@ only reads them.
 - `enrich.py`: offline IP enrichment from GeoLite2 `.mmdb` (via `maxminddb`)
   and/or provider-neutral JSONL (schema in README) into `<db>.enrichment.duckdb`,
   bound to the evidence identity; also the server-side priority-merging loader.
-  Never bundle or download MaxMind databases; never call online lookup services.
+  `.mmdb` files are matched by name case-insensitively (city/country, asn).
+  Never bundle geolocation data or download MaxMind databases (EULA, account);
+  never call online lookup services.
+- `get_dbip.py`: downloads the free DB-IP Lite City/ASN `.mmdb` release listed on
+  DB-IP's download pages, verifies the published SHA-1 of each decompressed file
+  and its `DBIP-` database type, and installs into `$KAMOTRACE_TOOLS/dbip-lite-YYYY-MM`.
+  Keep the CC BY 4.0 attribution in its output and docs.
 - `server.py`: loopback HTTP endpoints, allowlisted parameterized DuckDB queries,
   enrichment, detections, and SQLite annotation/tag persistence.
 - `ssm.py`: local SSM export loading, account/region/command joins, separate

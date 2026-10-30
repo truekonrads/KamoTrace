@@ -3,6 +3,7 @@
   kamotrace import   --source event_history.json --database case.duckdb
   kamotrace get-suzaku [--version 3.0.0]
   kamotrace suzaku   --database case.duckdb (--source event_history.json [--suzaku suzaku.exe] | --timeline suzaku.duckdb)
+  kamotrace get-dbip [--dest FOLDER]
   kamotrace enrich   --database case.duckdb (--geolite2 FOLDER | --jsonl FILE)...
   kamotrace serve    --database case.duckdb [--ssm-export ...]
   kamotrace mcp      --url http://127.0.0.1:8765
@@ -13,7 +14,8 @@ COMMANDS = {
     "import": ("kamotrace.importer", "Load a CloudTrail Records JSON export into a new, read-only evidence DuckDB"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
-    "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2 and/or provider-neutral JSONL"),
+    "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),
+    "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2-format .mmdb and/or provider-neutral JSONL"),
     "serve": ("kamotrace.server", "Start the local browser UI on 127.0.0.1"),
     "mcp": ("kamotrace.mcp_server", "Stdio MCP adapter for agents, backed by a running `kamotrace serve`"),
 }
