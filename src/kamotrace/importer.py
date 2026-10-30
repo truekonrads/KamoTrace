@@ -1,11 +1,14 @@
 """Load a CloudTrail event-history export without inferring or flattening JSON."""
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack, nullcontext
 from datetime import datetime, timezone
+import glob
 import gzip
 import hashlib
+import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -72,15 +75,128 @@ def expand(source):
     return sources
 
 
-def build(source, database):
+@contextmanager
+def exclusive_lock(path, busy):
+    """Hold SQLite's exclusive lock on `path`: portable, and released if the process dies."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = sqlite3.connect(path, timeout=0, isolation_level=None)
+    try:
+        try:
+            lock.execute("PRAGMA locking_mode=EXCLUSIVE")
+            lock.execute("BEGIN EXCLUSIVE")
+            lock.execute("COMMIT")
+        except sqlite3.OperationalError:
+            raise BlockingIOError(busy) from None
+        yield
+    finally:
+        lock.close()
+
+
+def write_lock(*paths):
+    """Exclusive lock for every path a process will publish, each keyed as <stem>.lock beside it.
+
+    `import`, `enrich`, `suzaku` and `auto` all take it for each output (auto for the database and
+    both sidecars), so two writers of one path can never interleave validation, staging and
+    publication. case.duckdb and case.db share sidecar paths and so share case.lock too. Locks are
+    taken in sorted order and never wait, so lock order cannot deadlock."""
+    stack = ExitStack()
+    try:
+        for lock in sorted({lock_path(path) for path in paths}):
+            stack.enter_context(exclusive_lock(lock, f"{lock.with_suffix('')} is being prepared by another "
+                                                     "KamoTrace process (import, enrich, suzaku or auto)"))
+    except BaseException:
+        stack.close()
+        raise
+    return stack
+
+
+def lock_path(path):
+    return Path(path).resolve().with_suffix(".lock")
+
+
+def database_lock(database):
+    return write_lock(database)
+
+
+STAGING_MARKER = "kamotrace-staging.json"
+STAGING_FILES = {STAGING_MARKER, "staging.duckdb", "staging.duckdb.wal"}
+
+
+@contextmanager
+def staging(output):
+    """A new private folder beside `output` (same file system, so publication is a rename); always removed.
+
+    Yields the DuckDB path to build in. Nothing at a predictable path is ever opened or deleted."""
+    output = Path(output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix=f".{output.name}.", suffix=".staging", dir=output.parent))
+    try:
+        (folder / STAGING_MARKER).write_text(json.dumps({"output": str(output)}), encoding="utf-8")
+        yield folder / "staging.duckdb"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def publish(staged, output, replace=False):
+    """Move a finished staging database to `output`. Without replace, never overwrite anything."""
+    if replace:
+        os.replace(staged, output)
+        return
+    try:
+        os.link(staged, output)  # Atomic no-clobber publication; the staging folder is removed after
+    except FileExistsError:
+        raise FileExistsError(f"{output} appeared while it was being built; it was not replaced") from None
+    except OSError:  # No hard links on this file system: rename (no-clobber on Windows)
+        if output.exists():
+            raise FileExistsError(f"{output} appeared while it was being built; it was not replaced") from None
+        os.rename(staged, output)
+
+
+def in_staging(path):
+    """True if `path` is inside (or is) a folder named like KamoTrace staging, which a later run may remove."""
+    return any(part.startswith(".") and part.endswith(".staging") for part in Path(path).resolve().parts)
+
+
+def discard_abandoned(output, keep=()):
+    """With write_lock(output) held, remove staging folders left by killed runs for this output.
+
+    Every writer of `output` holds its lock while staging, so a folder present now is abandoned. Only
+    folders positively ours are removed: our name pattern, our marker naming this output, nothing but
+    our files, and no `keep` path (inputs) inside."""
+    output = Path(output).resolve()
+    keep = [Path(p).resolve() for p in keep if p is not None]
+    removed = []
+    for folder in output.parent.glob(f".{glob.escape(output.name)}.*.staging"):
+        try:
+            entries = list(folder.iterdir()) if folder.is_dir() and not folder.is_symlink() else None
+            if (entries is None or {p.name for p in entries} - STAGING_FILES
+                    or any(p.is_symlink() or not p.is_file() for p in entries)
+                    or json.loads((folder / STAGING_MARKER).read_text(encoding="utf-8")).get("output") != str(output)
+                    or any(path == folder or folder in path.parents for path in keep)):
+                continue
+        except (OSError, ValueError, AttributeError):
+            continue  # Not positively ours: leave it for the analyst
+        shutil.rmtree(folder)
+        print(f"Removed abandoned staging folder {folder.name} (left by an interrupted run)", file=sys.stderr)
+        removed.append(folder.name)
+    return removed
+
+
+def build(source, database, lock=True):
+    """Import into a new database. Pass lock=False only while already holding write_lock(database)."""
+    with write_lock(database) if lock else nullcontext():
+        return _build(source, database)
+
+
+def _build(source, database):
     # Paths remain rereadable; binary streams are spooled privately for independent verification.
     sources = expand(source)
     if not sources:
         raise ValueError("At least one source is required")
     database = database.resolve()
-    building = database.with_suffix(database.suffix + ".building")
-    if database.exists() or building.exists():
+    if database.exists():
         raise FileExistsError("Use a new database path; existing databases are never overwritten")
+    discard_abandoned(database, [item for item in sources if not hasattr(item, "read")])
     started = time.monotonic()
     database.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="cloudtrail-") as temp:
@@ -115,108 +231,104 @@ def build(source, database):
                     raise ValueError(f"Source changed during import: {label}")
         if not count:
             raise ValueError("No CloudTrail Records found")
-        connection = duckdb.connect(str(building))
-        try:
-            connection.execute("SET threads=2; SET memory_limit='4GB'; SET TimeZone='UTC'")
-            connection.execute("""CREATE TABLE import_sources (
-                source_file VARCHAR, source_bytes BIGINT, source_sha256 VARCHAR,
-                source_records BIGINT, first_record BIGINT, last_record BIGINT)""")
-            connection.executemany("INSERT INTO import_sources VALUES (?,?,?,?,?,?)",
-                [(entry["source_file"], entry["source_bytes"], entry["source_sha256"],
-                  entry["source_records"], entry["first_record"], entry["last_record"]) for entry in provenance])
-            connection.execute("""
-                CREATE TABLE raw_events (
-                    source_record BIGINT PRIMARY KEY, raw_event JSON,
-                    record_sha256 VARCHAR, source_file VARCHAR, source_ordinal BIGINT
+        with staging(database) as building:
+            connection = duckdb.connect(str(building))
+            try:
+                connection.execute("SET threads=2; SET memory_limit='4GB'; SET TimeZone='UTC'")
+                connection.execute("""CREATE TABLE import_sources (
+                    source_file VARCHAR, source_bytes BIGINT, source_sha256 VARCHAR,
+                    source_records BIGINT, first_record BIGINT, last_record BIGINT)""")
+                connection.executemany("INSERT INTO import_sources VALUES (?,?,?,?,?,?)",
+                    [(entry["source_file"], entry["source_bytes"], entry["source_sha256"],
+                      entry["source_records"], entry["first_record"], entry["last_record"]) for entry in provenance])
+                connection.execute("""
+                    CREATE TABLE raw_events (
+                        source_record BIGINT PRIMARY KEY, raw_event JSON,
+                        record_sha256 VARCHAR, source_file VARCHAR, source_ordinal BIGINT
+                    )
+                """)
+                connection.execute("""
+                    INSERT INTO raw_events
+                    SELECT ordinal, json, sha256(json::VARCHAR), source_file, ordinal - first_record + 1
+                    FROM (SELECT row_number() OVER () AS ordinal, json
+                          FROM read_json_objects(?, format='newline_delimited'))
+                    JOIN import_sources ON ordinal BETWEEN first_record AND last_record
+                """, [str(staged)])
+                connection.execute("""
+                    CREATE VIEW events AS
+                    SELECT source_record,
+                        raw_event->>'$.eventID' AS event_id,
+                        raw_event->>'$.eventTime' AS event_time_text,
+                        try_cast(raw_event->>'$.eventTime' AS TIMESTAMPTZ) AS event_time,
+                        raw_event->>'$.eventSource' AS event_source,
+                        raw_event->>'$.eventName' AS event_name,
+                        raw_event->>'$.awsRegion' AS aws_region,
+                        raw_event->>'$.sourceIPAddress' AS source_ip,
+                        raw_event->>'$.userAgent' AS user_agent,
+                        raw_event->>'$.userIdentity.type' AS identity_type,
+                        raw_event->>'$.userIdentity.arn' AS identity_arn,
+                        raw_event->>'$.recipientAccountId' AS recipient_account_id,
+                        raw_event->>'$.errorCode' AS error_code,
+                        raw_event->>'$.errorMessage' AS error_message,
+                        try_cast(raw_event->>'$.readOnly' AS BOOLEAN) AS read_only,
+                        raw_event->'$.userIdentity' AS user_identity,
+                        raw_event->'$.requestParameters' AS request_parameters,
+                        raw_event->'$.responseElements' AS response_elements,
+                        raw_event, record_sha256, source_file, source_ordinal
+                    FROM raw_events
+                """)
+                quality = connection.execute("""
+                    SELECT count(*) AS records, count(DISTINCT event_id) AS distinct_event_ids,
+                        count(*) FILTER (WHERE event_id IS NULL) AS missing_event_ids,
+                        count(*) FILTER (WHERE event_time IS NULL) AS invalid_timestamps,
+                        min(event_time)::VARCHAR AS first_event_utc,
+                        max(event_time)::VARCHAR AS last_event_utc
+                    FROM events
+                """)
+                report = dict(zip([c[0] for c in quality.description], quality.fetchone()))
+                if report["records"] != count:
+                    raise ValueError("Imported count differs from source")
+                # Independently re-stream every source record and compare its canonical hash.
+                rows = connection.execute(
+                    "SELECT source_record, record_sha256 FROM raw_events ORDER BY source_record"
                 )
-            """)
-            connection.execute("""
-                INSERT INTO raw_events
-                SELECT ordinal, json, sha256(json::VARCHAR), source_file, ordinal - first_record + 1
-                FROM (SELECT row_number() OVER () AS ordinal, json
-                      FROM read_json_objects(?, format='newline_delimited'))
-                JOIN import_sources ON ordinal BETWEEN first_record AND last_record
-            """, [str(staged)])
-            connection.execute("""
-                CREATE VIEW events AS
-                SELECT source_record,
-                    raw_event->>'$.eventID' AS event_id,
-                    raw_event->>'$.eventTime' AS event_time_text,
-                    try_cast(raw_event->>'$.eventTime' AS TIMESTAMPTZ) AS event_time,
-                    raw_event->>'$.eventSource' AS event_source,
-                    raw_event->>'$.eventName' AS event_name,
-                    raw_event->>'$.awsRegion' AS aws_region,
-                    raw_event->>'$.sourceIPAddress' AS source_ip,
-                    raw_event->>'$.userAgent' AS user_agent,
-                    raw_event->>'$.userIdentity.type' AS identity_type,
-                    raw_event->>'$.userIdentity.arn' AS identity_arn,
-                    raw_event->>'$.recipientAccountId' AS recipient_account_id,
-                    raw_event->>'$.errorCode' AS error_code,
-                    raw_event->>'$.errorMessage' AS error_message,
-                    try_cast(raw_event->>'$.readOnly' AS BOOLEAN) AS read_only,
-                    raw_event->'$.userIdentity' AS user_identity,
-                    raw_event->'$.requestParameters' AS request_parameters,
-                    raw_event->'$.responseElements' AS response_elements,
-                    raw_event, record_sha256, source_file, source_ordinal
-                FROM raw_events
-            """)
-            quality = connection.execute("""
-                SELECT count(*) AS records, count(DISTINCT event_id) AS distinct_event_ids,
-                    count(*) FILTER (WHERE event_id IS NULL) AS missing_event_ids,
-                    count(*) FILTER (WHERE event_time IS NULL) AS invalid_timestamps,
-                    min(event_time)::VARCHAR AS first_event_utc,
-                    max(event_time)::VARCHAR AS last_event_utc
-                FROM events
-            """)
-            report = dict(zip([c[0] for c in quality.description], quality.fetchone()))
-            if report["records"] != count:
-                raise ValueError("Imported count differs from source")
-            # Independently re-stream every source record and compare its canonical hash.
-            rows = connection.execute(
-                "SELECT source_record, record_sha256 FROM raw_events ORDER BY source_record"
-            )
-            ordinal = 0
-            for path, original, entry in originals:
-                verified = 0
-                with open_json(path) as stream:
-                    for record in records(stream):
-                        ordinal += 1
-                        verified += 1
-                        canonical = json.dumps(record, ensure_ascii=False, use_decimal=True,
-                                               allow_nan=False, separators=(",", ":"))
-                        expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-                        if rows.fetchone() != (ordinal, expected):
-                            raise ValueError(f"Record integrity mismatch: {ordinal}")
-                if (verified != entry["source_records"] or sha256(path) != entry["source_sha256"]
-                        or path.stat().st_mtime_ns != original.st_mtime_ns):
-                    raise ValueError(f"Source changed during import: {entry['source_file']}")
-            if rows.fetchone() is not None:
-                raise ValueError("Source/database reconciliation failed")
-            # Keep legacy single-file identities. Multi-source identity is ordered and path-independent,
-            # since reordering inputs changes source_record IDs used by derived sidecars.
-            identity = provenance[0]["source_sha256"] if len(provenance) == 1 else hashlib.sha256(
-                json.dumps({"format": "kamotrace-source-set-v1", "sha256": [
-                    entry["source_sha256"] for entry in provenance]}, separators=(",", ":")).encode()).hexdigest()
-            report.update(source_file=provenance[0]["source_file"] if len(provenance) == 1 else None,
-                          source_bytes=sum(entry["source_bytes"] for entry in provenance),
-                          source_sha256=identity, source_records=count, sources=provenance,
-                          source_identity="file-sha256" if len(provenance) == 1 else "kamotrace-source-set-v1",
-                          all_record_hashes_verified=True, schema_version=2,
-                          built_at_utc=datetime.now(timezone.utc).isoformat(),
-                          duckdb_version=duckdb.__version__, loader_sha256=sha256(Path(__file__)),
-                          elapsed_seconds=round(time.monotonic() - started, 3))
-            metadata = json.dumps(report, default=str)
-            connection.execute("CREATE TABLE build_info (metadata JSON)")
-            connection.execute("INSERT INTO build_info VALUES (?)", [metadata])
-            connection.execute("CHECKPOINT")
-        except BaseException:
-            connection.close()
-            building.unlink(missing_ok=True)
-            Path(str(building) + ".wal").unlink(missing_ok=True)
-            raise
-        else:
-            connection.close()
-        building.rename(database)
+                ordinal = 0
+                for path, original, entry in originals:
+                    verified = 0
+                    with open_json(path) as stream:
+                        for record in records(stream):
+                            ordinal += 1
+                            verified += 1
+                            canonical = json.dumps(record, ensure_ascii=False, use_decimal=True,
+                                                   allow_nan=False, separators=(",", ":"))
+                            expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                            if rows.fetchone() != (ordinal, expected):
+                                raise ValueError(f"Record integrity mismatch: {ordinal}")
+                    if (verified != entry["source_records"] or sha256(path) != entry["source_sha256"]
+                            or path.stat().st_mtime_ns != original.st_mtime_ns):
+                        raise ValueError(f"Source changed during import: {entry['source_file']}")
+                if rows.fetchone() is not None:
+                    raise ValueError("Source/database reconciliation failed")
+                # Keep legacy single-file identities. Multi-source identity is ordered and path-independent,
+                # since reordering inputs changes source_record IDs used by derived sidecars.
+                identity = provenance[0]["source_sha256"] if len(provenance) == 1 else hashlib.sha256(
+                    json.dumps({"format": "kamotrace-source-set-v1", "sha256": [
+                        entry["source_sha256"] for entry in provenance]}, separators=(",", ":")).encode()).hexdigest()
+                report.update(source_file=provenance[0]["source_file"] if len(provenance) == 1 else None,
+                              source_bytes=sum(entry["source_bytes"] for entry in provenance),
+                              source_sha256=identity, source_records=count, sources=provenance,
+                              source_identity="file-sha256" if len(provenance) == 1 else "kamotrace-source-set-v1",
+                              all_record_hashes_verified=True, schema_version=2,
+                              built_at_utc=datetime.now(timezone.utc).isoformat(),
+                              duckdb_version=duckdb.__version__, loader_sha256=sha256(Path(__file__)),
+                              elapsed_seconds=round(time.monotonic() - started, 3))
+                metadata = json.dumps(report, default=str)
+                connection.execute("CREATE TABLE build_info (metadata JSON)")
+                connection.execute("INSERT INTO build_info VALUES (?)", [metadata])
+                connection.execute("CHECKPOINT")
+            finally:
+                connection.close()
+            publish(building, database)
     print(json.dumps(report, default=str, indent=2))
 
 

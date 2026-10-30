@@ -5,6 +5,7 @@ own model: one row per (evidence record, rule match), linked by exact eventID, r
 The evidence database is attached read-only and never modified; Suzaku itself is never bundled.
 """
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -13,6 +14,8 @@ import subprocess
 import tempfile
 
 import duckdb
+
+from .importer import discard_abandoned, lock_path, publish, staging, write_lock
 
 LEVELS = ("informational", "low", "medium", "high", "critical")
 SCHEMA = 1  # KamoTrace detections sidecar layout
@@ -33,90 +36,139 @@ def evidence_identity(connection, schema="main"):
     return info["source_sha256"], int(info["records"])
 
 
-def import_timeline(database, timeline, output, replace=False, source=None, label=None):
-    """Link a Suzaku aws-ct-timeline DuckDB file to evidence records and write `output`."""
-    database, timeline, output = database.resolve(), timeline.resolve(), output.resolve()
-    if output.exists() and not replace:
-        raise FileExistsError(f"{output} exists; pass --replace to rebuild it from this timeline")
-    building = output.with_suffix(output.suffix + ".building")
-    building.unlink(missing_ok=True)
-    connection = duckdb.connect(str(building))
+def identify_sidecar(path, table, tables):
+    """Run metadata if `path` is positively a KamoTrace sidecar with exactly `tables`; otherwise None."""
     try:
-        connection.execute("SET TimeZone='UTC'")
-        connection.execute("ATTACH ? AS ev (READ_ONLY)", [str(database)])
-        connection.execute("ATTACH ? AS tl (READ_ONLY)", [str(timeline)])
-        tables = {r[0] for r in connection.execute(
-            "SELECT table_name FROM duckdb_tables() WHERE database_name='tl'").fetchall()}
-        if not {"timeline", "suzaku_meta"} <= tables:
-            raise ValueError("Not a Suzaku DuckDB timeline: run `suzaku aws-ct-timeline ... -t duckdb`")
-        # As JSON text: avoids converting Suzaku's TIMESTAMPTZ columns to Python (which needs pytz).
-        meta = json.loads(connection.execute("SELECT to_json(m)::VARCHAR FROM tl.suzaku_meta m LIMIT 1").fetchone()[0])
-        if meta["schema_version"] != 1 or meta["command"] != "aws-ct-timeline":
-            raise ValueError(f"Unsupported Suzaku output: schema {meta['schema_version']}, command {meta['command']}; "
-                             "only aws-ct-timeline schema 1 (Suzaku 3.x) is supported")
-        if meta["timestamp_tz"] != "UTC":
-            raise ValueError("Suzaku timestamps are not UTC; rerun Suzaku without -l/--localtime")
-        source_sha256, records = evidence_identity(connection, "ev")
-        # Exact linkage by eventID. A single-event row must also match region and instant. A correlation
-        # row lists its members' eventIDs (and regions) joined by " ¦ " with the latest member's time, so
-        # each member must match one of those regions at or before that time. A row links only when every
-        # member matches exactly one canonical record (identical duplicate records share a hash and all link).
-        connection.execute("""
-            CREATE TABLE detections AS
-            WITH t AS (
-                SELECT row_number() OVER () AS suzaku_row, *, timezone('UTC', "Timestamp") AS event_time,
-                    list_distinct(string_split(EventID, ' ¦ ')) AS ids, string_split(AwsRegion, ' ¦ ') AS regions
-                FROM tl.timeline
-            ), p AS (
-                SELECT suzaku_row, unnest(ids) AS member_id, len(ids) AS members, regions, event_time, AwsRegion
-                FROM t
-            ), m AS (
-                SELECT p.suzaku_row, p.member_id, p.members, e.source_record, e.record_sha256,
-                    count(DISTINCT e.record_sha256) OVER (PARTITION BY p.suzaku_row, p.member_id) AS hashes
-                FROM p JOIN ev.events e ON e.event_id = p.member_id AND CASE WHEN p.members = 1
-                    THEN e.aws_region IS NOT DISTINCT FROM p.AwsRegion AND e.event_time = p.event_time
-                    ELSE list_contains(p.regions, e.aws_region) AND e.event_time <= p.event_time END
-            ), complete AS (
-                SELECT suzaku_row FROM m GROUP BY suzaku_row, members
-                HAVING count(DISTINCT member_id) FILTER (WHERE hashes = 1) = members
-            ), links AS (
-                -- One row per linked evidence record; unlinked Suzaku rows are kept once, for the record.
-                SELECT suzaku_row, source_record, record_sha256, 'linked' AS link_status
-                FROM m WHERE suzaku_row IN (SELECT suzaku_row FROM complete)
-                UNION ALL
-                SELECT suzaku_row, NULL, NULL,
-                    CASE WHEN suzaku_row IN (SELECT suzaku_row FROM m WHERE hashes > 1) THEN 'ambiguous' ELSE 'no_match' END
-                FROM t WHERE suzaku_row NOT IN (SELECT suzaku_row FROM complete)
-            )
-            SELECT t.suzaku_row, l.source_record, l.record_sha256, l.link_status, len(t.ids) AS members,
-                t.RuleID AS rule_id, t.RuleTitle AS rule_title, t.Level::VARCHAR AS level,
-                list_position(?, t.Level::VARCHAR) - 1 AS level_rank, t.RuleAuthor AS rule_author,
-                coalesce(t.Tactics, []) AS tactics, coalesce(t.TechniqueIDs, []) AS technique_ids,
-                coalesce(t.OtherTags, []) AS other_tags,
-                t.EventID AS event_id, t.AwsRegion AS aws_region, t.event_time, t.EventName AS event_name
-            FROM links l JOIN t USING (suzaku_row)
-            ORDER BY t.event_time, t.suzaku_row, l.source_record
-        """, [list(LEVELS)])
-        counts = dict(connection.execute(
-            "SELECT link_status, count(DISTINCT suzaku_row) FROM detections GROUP BY 1").fetchall())
-        run = {"schema_version": SCHEMA, "imported_at": datetime.now(timezone.utc).isoformat(),
-               "timeline_file": label or str(timeline), "timeline_sha256": sha256(timeline),
-               "evidence_source_sha256": source_sha256, "evidence_records": records,
-               "suzaku_source": str(source) if source else None,
-               "suzaku_source_matches_evidence": (sha256(source) == source_sha256) if source and source.is_file() else None,
-               **{k if k.startswith("suzaku") else f"suzaku_{k}": v for k, v in meta.items()},
-               "linked_rows": counts.get("linked", 0), "no_match_rows": counts.get("no_match", 0),
-               "ambiguous_rows": counts.get("ambiguous", 0)}
-        connection.execute("CREATE TABLE suzaku_run (metadata JSON)")
-        connection.execute("INSERT INTO suzaku_run VALUES (?)", [json.dumps(run)])
-        connection.execute("DETACH ev; DETACH tl; CHECKPOINT")
-    except BaseException:
-        connection.close()
-        building.unlink(missing_ok=True)
-        Path(str(building) + ".wal").unlink(missing_ok=True)
-        raise
-    connection.close()
-    building.replace(output)
+        connection = duckdb.connect(str(path), read_only=True)
+        try:
+            found = {r[0] for r in connection.execute("""SELECT table_name FROM duckdb_tables()
+                WHERE database_name = current_database() AND NOT temporary""").fetchall()}
+            run = json.loads(connection.execute(f"SELECT metadata FROM {table}").fetchone()[0]) if found == tables else None
+        finally:
+            connection.close()
+    except (duckdb.Error, TypeError, ValueError):
+        return None
+    return run if isinstance(run, dict) and "schema_version" in run else None
+
+
+def check_output(output, replace, kind, table, tables, inputs):
+    """Refuse to write a derived sidecar over any input, or over a file that is not that kind of sidecar."""
+    if any(Path(p).resolve() in (output, lock_path(output)) for p in inputs if p is not None):
+        raise ValueError(f"{output} is also an input; choose a different output path")
+    if output.exists():
+        if not replace:
+            raise FileExistsError(f"{output} exists; pass --replace to rebuild it")
+        if identify_sidecar(output, table, tables) is None:
+            raise ValueError(f"{output} exists but is not a KamoTrace {kind} sidecar; refusing to replace it")
+
+
+def tree_sha256(path):
+    """Content digest of a file, or of a folder's relative file names and contents."""
+    if path.is_file():
+        return sha256(path)
+    digest = hashlib.sha256()
+    for item in sorted(p for p in path.rglob("*") if p.is_file()):
+        digest.update(json.dumps([item.relative_to(path).as_posix(), sha256(item)]).encode())
+    return digest.hexdigest()
+
+
+def run_options(executable, rules=None, min_level=None):
+    """Everything besides the input that decides a Suzaku run's output, recorded to detect stale sidecars."""
+    executable = executable.resolve()
+    folders = {"rules": rules.resolve() if rules else executable.parent / "rules", "config": executable.parent / "config"}
+    return {"executable_sha256": sha256(executable), "min_level": min_level,
+            **{f"{name}_sha256": tree_sha256(path) if path.exists() else None for name, path in folders.items()}}
+
+
+def import_timeline(database, timeline, output, replace=False, source=None, label=None, options=None, lock=True):
+    """Link a Suzaku aws-ct-timeline DuckDB file to evidence records and write `output`.
+
+    Pass lock=False only while already holding write_lock(output)."""
+    with write_lock(output) if lock else nullcontext():
+        return _import_timeline(database.resolve(), timeline.resolve(), output.resolve(), replace, source, label, options)
+
+
+def _import_timeline(database, timeline, output, replace, source, label, options):
+    inputs = [database, timeline, source]
+    check_output(output, replace, "detections", "suzaku_run", {"detections", "suzaku_run"}, inputs)
+    discard_abandoned(output, inputs)
+    with staging(output) as building:
+        connection = duckdb.connect(str(building))
+        try:
+            connection.execute("SET TimeZone='UTC'")
+            connection.execute("ATTACH ? AS ev (READ_ONLY)", [str(database)])
+            connection.execute("ATTACH ? AS tl (READ_ONLY)", [str(timeline)])
+            tables = {r[0] for r in connection.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE database_name='tl'").fetchall()}
+            if not {"timeline", "suzaku_meta"} <= tables:
+                raise ValueError("Not a Suzaku DuckDB timeline: run `suzaku aws-ct-timeline ... -t duckdb`")
+            # As JSON text: avoids converting Suzaku's TIMESTAMPTZ columns to Python (which needs pytz).
+            meta = json.loads(connection.execute("SELECT to_json(m)::VARCHAR FROM tl.suzaku_meta m LIMIT 1").fetchone()[0])
+            if meta["schema_version"] != 1 or meta["command"] != "aws-ct-timeline":
+                raise ValueError(f"Unsupported Suzaku output: schema {meta['schema_version']}, command {meta['command']}; "
+                                 "only aws-ct-timeline schema 1 (Suzaku 3.x) is supported")
+            if meta["timestamp_tz"] != "UTC":
+                raise ValueError("Suzaku timestamps are not UTC; rerun Suzaku without -l/--localtime")
+            source_sha256, records = evidence_identity(connection, "ev")
+            # Exact linkage by eventID. A single-event row must also match region and instant. A correlation
+            # row lists its members' eventIDs (and regions) joined by " ¦ " with the latest member's time, so
+            # each member must match one of those regions at or before that time. A row links only when every
+            # member matches exactly one canonical record (identical duplicate records share a hash and all link).
+            connection.execute("""
+                CREATE TABLE detections AS
+                WITH t AS (
+                    SELECT row_number() OVER () AS suzaku_row, *, timezone('UTC', "Timestamp") AS event_time,
+                        list_distinct(string_split(EventID, ' ¦ ')) AS ids, string_split(AwsRegion, ' ¦ ') AS regions
+                    FROM tl.timeline
+                ), p AS (
+                    SELECT suzaku_row, unnest(ids) AS member_id, len(ids) AS members, regions, event_time, AwsRegion
+                    FROM t
+                ), m AS (
+                    SELECT p.suzaku_row, p.member_id, p.members, e.source_record, e.record_sha256,
+                        count(DISTINCT e.record_sha256) OVER (PARTITION BY p.suzaku_row, p.member_id) AS hashes
+                    FROM p JOIN ev.events e ON e.event_id = p.member_id AND CASE WHEN p.members = 1
+                        THEN e.aws_region IS NOT DISTINCT FROM p.AwsRegion AND e.event_time = p.event_time
+                        ELSE list_contains(p.regions, e.aws_region) AND e.event_time <= p.event_time END
+                ), complete AS (
+                    SELECT suzaku_row FROM m GROUP BY suzaku_row, members
+                    HAVING count(DISTINCT member_id) FILTER (WHERE hashes = 1) = members
+                ), links AS (
+                    -- One row per linked evidence record; unlinked Suzaku rows are kept once, for the record.
+                    SELECT suzaku_row, source_record, record_sha256, 'linked' AS link_status
+                    FROM m WHERE suzaku_row IN (SELECT suzaku_row FROM complete)
+                    UNION ALL
+                    SELECT suzaku_row, NULL, NULL,
+                        CASE WHEN suzaku_row IN (SELECT suzaku_row FROM m WHERE hashes > 1) THEN 'ambiguous' ELSE 'no_match' END
+                    FROM t WHERE suzaku_row NOT IN (SELECT suzaku_row FROM complete)
+                )
+                SELECT t.suzaku_row, l.source_record, l.record_sha256, l.link_status, len(t.ids) AS members,
+                    t.RuleID AS rule_id, t.RuleTitle AS rule_title, t.Level::VARCHAR AS level,
+                    list_position(?, t.Level::VARCHAR) - 1 AS level_rank, t.RuleAuthor AS rule_author,
+                    coalesce(t.Tactics, []) AS tactics, coalesce(t.TechniqueIDs, []) AS technique_ids,
+                    coalesce(t.OtherTags, []) AS other_tags,
+                    t.EventID AS event_id, t.AwsRegion AS aws_region, t.event_time, t.EventName AS event_name
+                FROM links l JOIN t USING (suzaku_row)
+                ORDER BY t.event_time, t.suzaku_row, l.source_record
+            """, [list(LEVELS)])
+            counts = dict(connection.execute(
+                "SELECT link_status, count(DISTINCT suzaku_row) FROM detections GROUP BY 1").fetchall())
+            run = {"schema_version": SCHEMA, "imported_at": datetime.now(timezone.utc).isoformat(),
+                   "timeline_file": label or str(timeline), "timeline_sha256": sha256(timeline),
+                   "evidence_source_sha256": source_sha256, "evidence_records": records,
+                   "suzaku_source": str(source) if source else None,
+                   "suzaku_source_matches_evidence": (sha256(source) == source_sha256) if source and source.is_file() else None,
+                   "suzaku_options": options,
+                   **{k if k.startswith("suzaku") else f"suzaku_{k}": v for k, v in meta.items()},
+                   "linked_rows": counts.get("linked", 0), "no_match_rows": counts.get("no_match", 0),
+                   "ambiguous_rows": counts.get("ambiguous", 0)}
+            connection.execute("CREATE TABLE suzaku_run (metadata JSON)")
+            connection.execute("INSERT INTO suzaku_run VALUES (?)", [json.dumps(run)])
+            connection.execute("DETACH ev; DETACH tl; CHECKPOINT")
+        finally:
+            connection.close()
+        # Recheck just before publication: the output may have changed while this was built.
+        check_output(output, replace, "detections", "suzaku_run", {"detections", "suzaku_run"}, inputs)
+        publish(building, output, replace)
     return run
 
 
@@ -193,12 +245,14 @@ def main(argv=None):
     output = args.output or args.database.with_suffix(".detections.duckdb")
     work = None
     try:
-        timeline = args.timeline
-        if args.suzaku:
-            work, timeline = run_suzaku(args.suzaku, args.source, args.rules, args.min_level)
-        run = import_timeline(args.database, timeline, output, args.replace, args.source,
-                              "(temporary output of the Suzaku run, deleted)" if work else None)
-    except (FileExistsError, ValueError, RuntimeError) as error:  # Without a KamoTrace traceback
+        with write_lock(output):  # Before running Suzaku, so a busy output fails fast
+            timeline = args.timeline
+            if args.suzaku:
+                work, timeline = run_suzaku(args.suzaku, args.source, args.rules, args.min_level)
+            run = import_timeline(args.database, timeline, output, args.replace, args.source,
+                                  "(temporary output of the Suzaku run, deleted)" if work else None,
+                                  run_options(args.suzaku, args.rules, args.min_level) if work else None, lock=False)
+    except (FileExistsError, BlockingIOError, ValueError, RuntimeError) as error:  # Without a KamoTrace traceback
         parser.error(str(error))
     finally:
         if work:

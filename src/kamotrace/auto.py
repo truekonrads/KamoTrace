@@ -5,9 +5,9 @@ import, enrich, suzaku, serve. Rerun the same command after a failure or interru
 keeps verified completed work and redoes only what is missing or partial.
 """
 import argparse
+from contextlib import ExitStack
 import json
 from pathlib import Path
-import sqlite3
 import sys
 
 import duckdb
@@ -15,8 +15,9 @@ import ijson
 
 from . import download, get_dbip, get_suzaku, server
 from .enrich import SCHEMA as ENRICH_SCHEMA, Source, build as enrich, read_geolite2
-from .importer import build as import_evidence, expand, sha256
-from .suzaku import LEVELS, SCHEMA as SUZAKU_SCHEMA, evidence_identity, import_timeline, run_suzaku
+from .importer import build as import_evidence, expand, in_staging, lock_path, sha256, write_lock
+from .suzaku import (LEVELS, SCHEMA as SUZAKU_SCHEMA, evidence_identity, identify_sidecar, import_timeline,
+                     run_options, run_suzaku)
 
 STAGES = ("get-suzaku", "get-dbip", "download", "import", "enrich", "suzaku", "serve")
 
@@ -76,19 +77,24 @@ def matches_request(manifest, args):
     return bool(manifest.get("end_default"))
 
 
-def sidecar_run(path, table, schema, identity):
+def missing_exports(folder, manifest, ssm=True):
+    """Published files a complete manifest names that are absent or (for S3 objects) altered.
+
+    ssm=False when --ssm-export replaces the collection's SSM export."""
+    suffix = ".json.gz" if manifest.get("compress") else ".json"
+    missing = [name + suffix for name in ("cloudtrail", "ssm") if (ssm or name != "ssm")
+               and name in manifest.get("services", []) and not (folder / (name + suffix)).is_file()]
+    for log in manifest.get("logs", []):
+        path = folder / log["file"]
+        if not path.is_file() or ("sha256" in log and sha256(path) != log["sha256"]):
+            missing.append(log["file"])
+    return missing
+
+
+def sidecar_run(path, table, tables, schema, identity):
     """A derived sidecar's run metadata if it is complete, current and bound to this evidence; else None."""
-    if not path.is_file():
-        return None
-    try:
-        connection = duckdb.connect(str(path), read_only=True)
-        try:
-            run = json.loads(connection.execute(f"SELECT metadata FROM {table}").fetchone()[0])
-        finally:
-            connection.close()
-    except (duckdb.Error, TypeError, ValueError):
-        return None
-    if run.get("schema_version") != schema or (run.get("evidence_source_sha256"), run.get("evidence_records")) != identity:
+    run = identify_sidecar(path, table, tables) if path.is_file() else None
+    if run is None or run.get("schema_version") != schema or (run.get("evidence_source_sha256"), run.get("evidence_records")) != identity:
         return None
     return run
 
@@ -140,12 +146,12 @@ def parser():
     detections = parser.add_argument_group("detections (kamotrace get-suzaku / suzaku)")
     detections.add_argument("--skip-suzaku", action="store_true", help="No Suzaku detections")
     detections.add_argument("--suzaku", type=Path, help="Suzaku executable (default: installed copy, else get-suzaku)")
-    detections.add_argument("--suzaku-version", help="Version for get-suzaku when none is installed (default: latest 3.x)")
+    detections.add_argument("--suzaku-version", help="Use exactly this Suzaku version, installed or downloaded (default: newest installed, else latest 3.x)")
     detections.add_argument("--timeline", type=Path, help="Existing `suzaku aws-ct-timeline -t duckdb` output to import")
     detections.add_argument("--rules", type=Path, help="Suzaku rules folder")
     detections.add_argument("--min-level", choices=LEVELS)
     parser.add_argument("--rebuild-sidecars", action="store_true",
-                        help="Rebuild enrichment and detections even if current (e.g. after updating Suzaku or DB-IP)")
+                        help="Rebuild enrichment and detections even if their recorded inputs and options are unchanged")
     ui = parser.add_argument_group("browser UI (kamotrace serve)")
     ui.add_argument("--no-serve", action="store_true", help="Prepare the case and exit without starting the UI")
     ui.add_argument("--port", type=int, default=8765)
@@ -165,6 +171,8 @@ def main(argv=None):
         options.error("--skip-suzaku cannot be combined with other Suzaku options")
     if args.skip_enrich and args.sources:
         options.error("--skip-enrich cannot be combined with --geolite2/--jsonl")
+    if args.suzaku_version and (args.suzaku or args.timeline or args.skip_suzaku):
+        options.error("--suzaku-version selects an installed or downloaded Suzaku; omit --suzaku/--timeline/--skip-suzaku")
     if args.ssm_export and not (args.source or args.skip_download):
         options.error("--ssm-export replaces the downloaded SSM export; use it with --source or --skip-download")
     for path in (*(args.source or []), args.ssm_export, args.suzaku, args.timeline, args.rules,
@@ -182,18 +190,27 @@ def main(argv=None):
     database = (args.database or target / "case.duckdb").resolve()
     folder = (args.download_dir or target / "download").resolve()
     tools = (args.tools or get_suzaku.tools_folder()).resolve()
+    # Outputs must never be any original input: derived files are replaced, evidence is never written twice.
+    # Staging happens in fresh private folders, and leftover ones are removed only when positively ours
+    # and holding no input (importer.discard_abandoned), so these are the only predictable write paths.
+    published = (database, database.with_suffix(".enrichment.duckdb"), database.with_suffix(".detections.duckdb"))
+    outputs = {*published, *map(lock_path, published)}
+    inputs = (*(args.source or []), args.ssm_export, args.suzaku, args.timeline, args.rules, *(p for _, p in args.sources or []))
+    for path in inputs:
+        if path is not None and path.resolve() in outputs:
+            options.error(f"{path} is an input but also a path this run writes; choose another --database or TARGET")
+    # Any stage may remove an abandoned `.<name>.<random>.staging` folder, so no input may live in one.
+    # Checked before anything is written; expanded --source folders are checked again before import.
+    for path in (*inputs, args.download_dir or target / "download", args.tools or get_suzaku.tools_folder()):
+        if path is not None and in_staging(path):
+            options.error(f"{path} is inside a KamoTrace staging folder, which may be removed; move it first")
     stage = STAGES[0]
-    lock = None
+    locks = ExitStack()
     try:
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # One run per case: SQLite's exclusive lock is portable and released if the process dies.
-        lock = sqlite3.connect(target / ".kamotrace-auto.lock", timeout=0, isolation_level=None)
-        try:
-            lock.execute("PRAGMA locking_mode=EXCLUSIVE")
-            lock.execute("BEGIN EXCLUSIVE")
-            lock.execute("COMMIT")
-        except sqlite3.OperationalError:
-            raise StageError(f"another `kamotrace auto` run is using {target}") from None
+        # Shared with `import`, `enrich` and `suzaku`: one process writes each of these paths at a time.
+        # (The downloader separately locks its own checkpoint.)
+        locks.enter_context(write_lock(*published))
 
         # 1. Suzaku: tools are set up first, so a missing tool fails before a long collection.
         suzaku = args.suzaku
@@ -202,13 +219,15 @@ def main(argv=None):
         elif suzaku:
             say(stage, f"using {suzaku}")
         else:
-            suzaku = get_suzaku.installed(tools)
+            suzaku = get_suzaku.installed(tools, args.suzaku_version)
             if suzaku is None:
-                say(stage, f"no Suzaku in {tools}; downloading the official release")
+                say(stage, f"no Suzaku {args.suzaku_version or ''} in {tools}; downloading the official release")
                 tools.mkdir(parents=True, exist_ok=True)
                 run_command(get_suzaku.main, ["--dest", str(tools)] +
                             (["--version", args.suzaku_version] if args.suzaku_version else []), "get-suzaku")
-                suzaku = get_suzaku.installed(tools)
+                suzaku = get_suzaku.installed(tools, args.suzaku_version)
+                if suzaku is None:
+                    raise StageError(f"get-suzaku did not install Suzaku {args.suzaku_version or ''} in {tools}")
             else:
                 say(stage, f"using installed {suzaku}")
 
@@ -238,12 +257,18 @@ def main(argv=None):
             inputs = list(args.source)
         else:
             manifest = collection(folder)
+            complete = bool(manifest and manifest.get("complete"))
+            missing = missing_exports(folder, manifest, ssm_export is None) if complete else []
             if args.skip_download:
+                if complete and missing:
+                    raise StageError(f"{folder} is missing published exports {missing}; "
+                                     "run without --skip-download to regenerate them from the checkpoint")
                 say(stage, f"skipped: using the collection in {folder}")
-            elif manifest and manifest.get("complete") and matches_request(manifest, args):
+            elif complete and not missing and matches_request(manifest, args):
                 say(stage, f"already complete in {folder}; reused without contacting AWS")
             else:
-                say(stage, f"collecting into {folder} with the existing AWS login")
+                say(stage, f"regenerating missing {missing} from the checkpoint in {folder}" if missing
+                    else f"collecting into {folder} with the existing AWS login")
                 argv = ["--dest", str(folder), "--regions", *args.regions, "--services", *args.services,
                         "--progress", args.progress]
                 for flag, value in (("--profile", args.profile), ("--start", args.start), ("--end", args.end)):
@@ -256,6 +281,8 @@ def main(argv=None):
                     argv += ["--session-log-group", group]
                 run_command(download.main, argv, "download")
                 manifest = collection(folder)
+                if manifest and manifest.get("complete") and missing_exports(folder, manifest):
+                    raise StageError(f"{folder} is still missing {missing_exports(folder, manifest)} after download")
             if not manifest or not manifest.get("complete"):
                 raise StageError(f"{folder} has no completed collection; run without --skip-download to resume it")
             if "cloudtrail" not in manifest["services"]:
@@ -268,6 +295,9 @@ def main(argv=None):
         # 4. Evidence: imported once, never overwritten; an existing database must match these inputs.
         stage = STAGES[3]
         files = expand(inputs)
+        for path in files:
+            if in_staging(path):
+                raise StageError(f"{path} is inside a KamoTrace staging folder, which may be removed; move it first")
         if database.exists():
             evidence = duckdb.connect(str(database), read_only=True)
             try:
@@ -283,14 +313,8 @@ def main(argv=None):
                                  "Use a new TARGET (or --database) for different evidence")
             say(stage, f"verified existing {database} against its sources; reused")
         else:
-            building = database.with_suffix(database.suffix + ".building")
-            for stale in (building, Path(str(building) + ".wal")):
-                if stale.exists():
-                    # Only ever published by rename after full verification, so this is an abandoned partial.
-                    say(stage, f"removing unfinished import {stale.name}")
-                    stale.unlink()
             say(stage, f"importing {len(files)} source file(s) into {database}")
-            import_evidence(files, database)
+            import_evidence(files, database, lock=False)
         connection = duckdb.connect(str(database), read_only=True)
         try:
             identity = evidence_identity(connection)
@@ -304,7 +328,7 @@ def main(argv=None):
             say(stage, "skipped")
         else:
             expected = enrichment_inputs(sources)
-            run = sidecar_run(output, "enrichment_run", ENRICH_SCHEMA, identity)
+            run = sidecar_run(output, "enrichment_run", {"ip_enrichment", "enrichment_run"}, ENRICH_SCHEMA, identity)
             recorded = run and [{"label": s["label"], "kind": s["kind"], **(
                 {"databases": s.get("databases")} if s["kind"] == "geolite2" else {"sha256": s.get("sha256")})}
                 for s in run["sources"]]
@@ -312,32 +336,35 @@ def main(argv=None):
                 say(stage, f"{output.name} is current; reused")
             else:
                 say(stage, f"building {output.name}")
-                enrich(database, output, sources, replace=True)
+                enrich(database, output, sources, replace=True, lock=False)
 
-        # 6. Detections: derived leads, rebuilt atomically unless built from the same CloudTrail input.
+        # 6. Detections: derived leads, rebuilt atomically unless built from the same input, Suzaku,
+        # rules, config and minimum level.
         stage = STAGES[5]
         output = database.with_suffix(".detections.duckdb")
         if args.skip_suzaku:
             say(stage, "skipped")
         else:
-            run = sidecar_run(output, "suzaku_run", SUZAKU_SCHEMA, identity)
+            run = sidecar_run(output, "suzaku_run", {"detections", "suzaku_run"}, SUZAKU_SCHEMA, identity)
             if args.timeline:
                 current = run and run.get("timeline_sha256") == sha256(args.timeline.resolve())
             else:
                 if len(inputs) != 1:
                     raise StageError("Suzaku runs on one CloudTrail file or folder; pass --timeline or --skip-suzaku")
-                current = run and run.get("suzaku_source") == str(inputs[0].resolve())
+                fingerprint = run_options(suzaku, args.rules, args.min_level)
+                current = (run and run.get("suzaku_source") == str(inputs[0].resolve())
+                           and run.get("suzaku_options") == fingerprint)
             if current and not args.rebuild_sidecars:
                 say(stage, f"{output.name} is current; reused")
             elif args.timeline:
                 say(stage, f"importing {args.timeline}")
-                import_timeline(database, args.timeline, output, replace=True)
+                import_timeline(database, args.timeline, output, replace=True, lock=False)
             else:
                 say(stage, f"running {suzaku}")
                 work, timeline = run_suzaku(suzaku, inputs[0], args.rules, args.min_level)
                 try:
                     import_timeline(database, timeline, output, True, inputs[0].resolve(),
-                                    "(temporary output of the Suzaku run, deleted)")
+                                    "(temporary output of the Suzaku run, deleted)", fingerprint, lock=False)
                 finally:
                     work.cleanup()
 
@@ -347,6 +374,7 @@ def main(argv=None):
             say(stage, f"skipped; start later with: kamotrace serve --database {database}"
                 + (f" --ssm-export {ssm_export}" if ssm_export else ""))
             return 0
+        locks.close()  # Preparation is done; the server only reads the database and sidecars.
         say(stage, "starting the local browser UI (Ctrl+C to stop)")
         run_command(server.main, ["--database", str(database), "--port", str(args.port)] +
                     (["--ssm-export", str(ssm_export)] if ssm_export else []), "serve")
@@ -354,10 +382,12 @@ def main(argv=None):
     except KeyboardInterrupt:
         print(f"kamotrace auto interrupted during {stage}; rerun the same command to resume.", file=sys.stderr)
         return 130
+    except BlockingIOError as error:  # Contention, not a failed stage: nothing to renew or resume
+        print(f"kamotrace auto stopped: {error}\nWait for the other run to finish, then rerun.", file=sys.stderr)
+        return 1
     except (StageError, OSError, ValueError, RuntimeError, duckdb.Error, ijson.JSONError) as error:
         print(f"kamotrace auto stopped during {stage}: {error}\nCompleted work is kept; fix the cause "
               "(e.g. renew your AWS login), then rerun the same command to resume.", file=sys.stderr)
         return getattr(error, "status", 1)
     finally:
-        if lock is not None:
-            lock.close()
+        locks.close()

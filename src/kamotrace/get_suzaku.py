@@ -44,13 +44,13 @@ def platform_tag():
     raise RuntimeError(f"No Suzaku release for {sys.platform}/{machine}; download it manually and pass --suzaku")
 
 
-def installed(folder=None):
-    """Newest Suzaku installed by this helper: (version folder, executable) or None."""
+def installed(folder=None, version=None):
+    """Executable of the newest Suzaku (or exactly `version`) installed by this helper, or None."""
     found = []
     for meta in (folder or tools_folder()).glob("suzaku-*/kamotrace-download.json"):
         info = json.loads(meta.read_text(encoding="utf-8"))
         executable = meta.parent / info["executable"]
-        if executable.is_file():
+        if executable.is_file() and version in (None, info["version"]):
             found.append((tuple(int(p) for p in info["version"].split(".")), executable))
     return max(found)[1] if found else None
 

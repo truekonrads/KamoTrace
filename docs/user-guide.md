@@ -200,7 +200,7 @@ other commands' code in dependency order, printing `[N/7 stage]` progress to std
 
 | Stage | Default | Override or skip |
 | --- | --- | --- |
-| 1. `get-suzaku` | Newest Suzaku installed in the tools folder; otherwise download and verify the latest 3.x | `--suzaku EXE`, `--suzaku-version X.Y.Z`, `--timeline FILE`, `--skip-suzaku` |
+| 1. `get-suzaku` | Newest Suzaku installed in the tools folder; otherwise download and verify the latest 3.x | `--suzaku EXE`, `--suzaku-version X.Y.Z` (that exact version, installed or downloaded), `--timeline FILE`, `--skip-suzaku` |
 | 2. `get-dbip` | Newest complete DB-IP Lite folder in the tools folder; otherwise download and verify | `--geolite2 FOLDER` and/or `--jsonl FILE` (earlier wins), `--skip-enrich` |
 | 3. `download` | `CASE_FOLDER/download`, all enabled regions, CloudTrail and SSM, maximum available history | `--download-dir`, `--profile`, `--regions`, `--start`, `--end`, `--services`, `--compress`, `--progress`, `--session-s3`, `--session-log-group`; `--source FILE...` or `--skip-download` to use existing data |
 | 4. `import` | `CASE_FOLDER/case.duckdb` from `cloudtrail.json[.gz]` | `--database` |
@@ -233,18 +233,39 @@ command**. Each stage checks what already exists:
 - **Collection** resumes from the downloader's checkpoint. Its default end time
   is frozen at the first run, so later reruns finish the same snapshot instead
   of moving the range. A completed collection with the same options is reused
-  without contacting AWS. Different options are refused; use a new case folder
-  for a fresh snapshot.
+  without contacting AWS only while every export it lists is present (and S3
+  objects still match their SHA-256). If one is missing, the downloader
+  regenerates it from the checkpoint after checking your AWS login; with
+  `--skip-download` the run refuses instead. Different options are refused; use
+  a new case folder for a fresh snapshot.
 - **Evidence** is imported only after the collection is marked complete. An existing
   database is reused only if its recorded source files and SHA-256 hashes match
-  the current inputs; otherwise the run stops and the database is never overwritten. An unfinished
-  `case.duckdb.building` file left by a killed import is deleted and the import is redone.
+  the current inputs; otherwise the run stops and the database is never overwritten.
+  Every database and sidecar is built in a new private folder beside it,
+  `.<name>.<random>.staging`, and published by an atomic rename. A folder left
+  by a killed run is removed on the next run, but only if it is positively
+  KamoTrace's: it has the staging marker for that output, holds only regular
+  staging files and contains no input. Anything else, including files named
+  like an old `case.duckdb.building`, is left alone. `auto` refuses, before
+  writing anything, any input, download folder or tools folder inside a folder
+  named `.<name>.staging`, since a later stage could remove it.
 - **Enrichment and detections** are derived sidecars, written atomically.
   They are reused only if they are bound to this evidence database. Enrichment
-  must also have the same source files and hashes. Detections must come from the
-  same CloudTrail input or timeline hash. Otherwise they are rebuilt.
-  To refresh them after updating Suzaku or DB-IP, pass `--rebuild-sidecars`.
-- Only one `auto` run can use a case folder at a time (`CASE_FOLDER/.kamotrace-auto.lock`).
+  must also have the same source files and hashes. Detections must have the same
+  CloudTrail input and the same Suzaku executable, rules, config and
+  `--min-level` (or the same `--timeline` hash). Otherwise they are rebuilt.
+  Rules updated in place in Suzaku's own `rules` folder count as a change.
+  To force a rebuild anyway, pass `--rebuild-sidecars`.
+  A file at a sidecar path that is not that kind of KamoTrace sidecar is never
+  replaced, and no output may be one of the inputs: move it or pick another `--database`.
+  Each output is checked again just before publication; without `--replace`
+  publication never overwrites a file that appeared meanwhile.
+- One process at a time writes each output: `auto`, `import`, `enrich` and
+  `suzaku` lock every path they publish with `<output stem>.lock` beside it
+  (`auto` locks the database and both sidecars). A second writer of the same
+  database or sidecar, even from another case folder or with a custom
+  `--output`, stops with a "being prepared by another KamoTrace process" error.
+  Locks are released when the UI starts and if the process dies.
 
 ## Docker
 

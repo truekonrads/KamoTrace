@@ -17,6 +17,10 @@ only reads them.
 - `auto.py`: full-auto, rerunnable pipeline over the other modules (tools, download, import, enrich,
   suzaku, serve). It holds no logic of its own beyond deciding per stage whether verified
   completed work can be reused; never let it overwrite evidence or trust unpublished partials.
+  Derived sidecars are replaced only when positively identified, never over an input.
+  Every writer of a database or sidecar holds `importer.write_lock(output)` (`<stem>.lock`) through
+  validation, private staging (`importer.staging`) and publication (`importer.publish`); never
+  stage at, or delete, a predictable path.
 - `get_suzaku.py`: downloads the official Suzaku 3.x release for the platform,
   verifies GitHub's published SHA-256, refuses unsafe archive paths, and installs
   into `$KAMOTRACE_TOOLS` (default `~/.kamotrace/tools`), where `kamotrace suzaku`

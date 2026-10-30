@@ -14,7 +14,10 @@ import re
 
 import duckdb
 
-from .suzaku import evidence_identity, sha256
+from contextlib import nullcontext
+
+from .importer import discard_abandoned, publish, staging, write_lock
+from .suzaku import check_output, evidence_identity, sha256
 
 SCHEMA = 1
 FIELDS = ("country", "country_code", "city", "asn", "as_org")  # Provider-neutral JSONL fields
@@ -108,11 +111,17 @@ def read_geolite2(folder, ips):
     return rows, provenance
 
 
-def build(database, output, sources, replace=False):
-    """Write `output` from `sources`, a list of ("geolite2", folder) or ("jsonl", file), highest priority first."""
-    database, output = database.resolve(), output.resolve()
-    if output.exists() and not replace:
-        raise FileExistsError(f"{output} exists; pass --replace to rebuild it")
+def build(database, output, sources, replace=False, lock=True):
+    """Write `output` from `sources`, a list of ("geolite2", folder) or ("jsonl", file), highest priority first.
+
+    Pass lock=False only while already holding write_lock(output)."""
+    with write_lock(output) if lock else nullcontext():
+        return _build(database.resolve(), output.resolve(), sources, replace)
+
+
+def _build(database, output, sources, replace):
+    inputs = [database, *(path for _, path in sources)]
+    check_output(output, replace, "enrichment", "enrichment_run", {"ip_enrichment", "enrichment_run"}, inputs)
     labels = ["geolite2" if kind == "geolite2" else path.stem for kind, path in sources]
     if len(set(labels)) != len(labels):
         raise ValueError(f"Source labels must be unique: {labels} (JSONL labels are file names without extension)")
@@ -128,41 +137,39 @@ def build(database, output, sources, replace=False):
                 pass  # AWS service names such as ec2.amazonaws.com are not addresses.
     finally:
         evidence.close()
-    building = output.with_suffix(output.suffix + ".building")
-    building.unlink(missing_ok=True)
-    connection = duckdb.connect(str(building))
-    try:
-        connection.execute("""CREATE TABLE ip_enrichment(ip VARCHAR, source VARCHAR, priority INTEGER,
-            country VARCHAR, country_code VARCHAR, city VARCHAR, asn BIGINT, as_org VARCHAR, attributes JSON)""")
-        summary = []
-        for priority, ((kind, path), label) in enumerate(zip(sources, labels)):
-            path = path.resolve()
-            if kind == "geolite2":
-                found, detail = read_geolite2(path, sorted(by_ip))
-                about = {"databases": detail}
-            else:
-                found, about = read_jsonl(path), {"file": str(path), "sha256": sha256(path)}
-            rows = [(raw, label, priority, *values[:-1], json.dumps(values[-1]) if values[-1] else None)
-                    for ip, values in found.items() for raw in by_ip.get(ip, [])]
-            if rows:
-                connection.executemany("INSERT INTO ip_enrichment VALUES (?,?,?,?,?,?,?,?,?)", rows)
-            summary.append({"label": label, "kind": kind, **about, "entries": len(found),
-                            "evidence_ips_matched": len({r[0] for r in rows}),
-                            "entries_not_in_evidence": sum(ip not in by_ip for ip in found),
-                            "attribute_keys": sorted({k for v in found.values() for k in v[-1]})})
-        run = {"schema_version": SCHEMA, "built_at": datetime.now(timezone.utc).isoformat(),
-               "evidence_source_sha256": source_sha256, "evidence_records": records,
-               "evidence_ips": len(by_ip), "sources": summary}
-        connection.execute("CREATE TABLE enrichment_run (metadata JSON)")
-        connection.execute("INSERT INTO enrichment_run VALUES (?)", [json.dumps(run)])
-        connection.execute("CHECKPOINT")
-    except BaseException:
-        connection.close()
-        building.unlink(missing_ok=True)
-        Path(str(building) + ".wal").unlink(missing_ok=True)
-        raise
-    connection.close()
-    building.replace(output)
+    discard_abandoned(output, inputs)
+    with staging(output) as building:
+        connection = duckdb.connect(str(building))
+        try:
+            connection.execute("""CREATE TABLE ip_enrichment(ip VARCHAR, source VARCHAR, priority INTEGER,
+                country VARCHAR, country_code VARCHAR, city VARCHAR, asn BIGINT, as_org VARCHAR, attributes JSON)""")
+            summary = []
+            for priority, ((kind, path), label) in enumerate(zip(sources, labels)):
+                path = path.resolve()
+                if kind == "geolite2":
+                    found, detail = read_geolite2(path, sorted(by_ip))
+                    about = {"databases": detail}
+                else:
+                    found, about = read_jsonl(path), {"file": str(path), "sha256": sha256(path)}
+                rows = [(raw, label, priority, *values[:-1], json.dumps(values[-1]) if values[-1] else None)
+                        for ip, values in found.items() for raw in by_ip.get(ip, [])]
+                if rows:
+                    connection.executemany("INSERT INTO ip_enrichment VALUES (?,?,?,?,?,?,?,?,?)", rows)
+                summary.append({"label": label, "kind": kind, **about, "entries": len(found),
+                                "evidence_ips_matched": len({r[0] for r in rows}),
+                                "entries_not_in_evidence": sum(ip not in by_ip for ip in found),
+                                "attribute_keys": sorted({k for v in found.values() for k in v[-1]})})
+            run = {"schema_version": SCHEMA, "built_at": datetime.now(timezone.utc).isoformat(),
+                   "evidence_source_sha256": source_sha256, "evidence_records": records,
+                   "evidence_ips": len(by_ip), "sources": summary}
+            connection.execute("CREATE TABLE enrichment_run (metadata JSON)")
+            connection.execute("INSERT INTO enrichment_run VALUES (?)", [json.dumps(run)])
+            connection.execute("CHECKPOINT")
+        finally:
+            connection.close()
+        # Recheck just before publication: the output may have changed while this was built.
+        check_output(output, replace, "enrichment", "enrichment_run", {"ip_enrichment", "enrichment_run"}, inputs)
+        publish(building, output, replace)
     return run
 
 
@@ -226,7 +233,7 @@ def main(argv=None):
             parser.error(f"not found: {path}")
     output = args.output or args.database.with_suffix(".enrichment.duckdb")
     try:
-        run = build(args.database, output, args.sources, args.replace)
-    except (FileExistsError, ValueError) as error:  # Invalid input: report it without a traceback.
+        run = build(args.database, output, args.sources, args.replace)  # Locks the output
+    except (FileExistsError, BlockingIOError, ValueError) as error:  # Invalid input: report it without a traceback.
         parser.error(str(error))
     print(json.dumps({"output": str(output.resolve()), **run}, indent=2))
