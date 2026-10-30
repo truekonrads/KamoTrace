@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+# The virtualenv and caches survive pause/resume. Check readiness without
+# resolving packages, accessing the network or starting an evidence server.
+.venv/bin/python -c 'import duckdb, kamotrace, maxminddb, mcp, mmdb_writer'
+printf '[resume] KamoTrace runtime and development dependencies are ready\n'

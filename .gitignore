@@ -10,6 +10,7 @@ ssm_command_session_activity*.json
 /ssm_exports/
 /data/
 /.amp/in/
+/.amp/portals/
 
 # Python environments and generated files.
 __pycache__/

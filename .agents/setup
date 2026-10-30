@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+SECONDS=0
+
+# Amp's base orb already supplies uv, Node and npm. Reuse them rather than
+# reinstalling toolchains; only the managed Python and locked project need setup.
+printf '[setup] Checking orb tools\n'
+uv --version
+node --version
+npm --version
+
+printf '[setup] Syncing Python 3.12 and locked runtime/development dependencies\n'
+uv sync --locked --python 3.12 --dev --compile-bytecode
+printf '[setup] Dependencies ready after %ss\n' "$SECONDS"
+
+# No evidence, Suzaku, GeoLite2, credentials or long-lived services belong in
+# the shared snapshot. Tests create their own disposable synthetic databases.
+printf '[setup] Checking the installed CLI\n'
+uv run --no-sync kamotrace --help >/dev/null
+printf '[setup] Ready in %ss\n' "$SECONDS"
