@@ -13,7 +13,7 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 - [Run KamoTrace in Docker](#docker)
 - [Add Suzaku detections](#suzaku-detections)
 - [Add offline IP enrichment](#ip-enrichment)
-- [Save findings with tags and notes](#findings-tags-and-notes)
+- [Record findings and tag events](#findings-and-event-tags)
 - [Search and inspect CloudTrail events](#cloudtrail-workflow)
 - [Browse SSM commands and output](#ssm-command-browser-desktop)
 - [Connect an AI agent](#agent-access-mcp)
@@ -107,9 +107,9 @@ Open **http://127.0.0.1:8765**. The histogram shows the burst on 25 October,
 and the **Detections** tab lists the Suzaku rules that fired. The **Source IP**
 column summary (**≡** in its header) shows two rare addresses next to the
 office IP. Hover one in the grid, click its funnel button and choose **is** to
-pivot to it; **Back** returns. Select events with the checkboxes, tag them with **Quick tag**, and
-write a Markdown note with **Add to note**. The **Findings** sidebar lists tags,
-notes and rules as things you can browse and reopen.
+pivot to it; **Back** returns. Select events with the checkboxes, label them with **Tag events**,
+and record what you observed with **Add to finding**. The left sidebar lists
+findings, event tags and rules as things you can browse and reopen.
 
 ### 7. Connect an agent (optional)
 
@@ -136,8 +136,8 @@ confirm."* In the run behind the screenshot, the agent:
 4. pivoted to `identity contains svc-backup` (8 events), tagged `backdoor-user`,
    `defense-evasion` and `impact`, and wrote a second note.
 
-Refresh the browser to review the agent's tags and notes, and change or delete
-any you disagree with: you and the agent share one set of findings.
+Refresh the browser to review the agent's tags and notes (shown as findings), and
+change or delete any you disagree with: you and the agent share one set of findings.
 
 Leave the server running while you work. Native installations listen on loopback
 by default. Access from a different computer requires a trusted
@@ -372,7 +372,7 @@ Detections are stored separately from the original records:
 
 ### Review detections in the browser
 
-In the browser, the **Findings** sidebar gains a **Detections** tab listing each
+In the browser, the expanded sidebar gains a **Detections** tab listing each
 rule, most severe first, with its severity letter (I/L/M/H/C), ATT&CK tags (on
 hover) and linked event count. Click a rule to add it to the query as a
 `Sigma: <rule>` scope; several rule scopes must all match, like tags. The grid's
@@ -380,7 +380,7 @@ hover) and linked event count. Click a rule to add it to the query as a
 click it for the full rule list. The inspector lists an event's detections too.
 A correlation rule appears on each of its member events. A note saved by an
 agent with a minimum level reopens with a removable `Sigma ≥ <level>` scope.
-Detections are leads, not findings: tag or annotate what you confirm.
+Detections are automated leads: tag events or record a finding about what you observe.
 
 ## IP enrichment
 
@@ -469,70 +469,96 @@ value summaries like other fields; free-text search covers raw event JSON only,
 not enrichment. Proxy and VPN exits make geography misleading; it is not proof
 of a person's location.
 
-## Findings: tags and notes
+## Findings and event tags
 
-Use the **Findings** sidebar to review tags and notes. Toggle it from the top
-bar to give the grid more space. It has **Tags** and **Notes** tabs, plus a
-**Detections** tab when detections are loaded.
+KamoTrace records two separate kinds of review:
 
-### Browse tags
+- A **finding** is a shared Markdown write-up linked to one or more events: an
+  observation, not necessarily a confirmed conclusion. Say what you saw and what
+  you infer. Findings are stored as notes; agents and the MCP tools call them
+  notes (`create_note`, `list_notes` and so on).
+- An **event tag** is a coloured label on individual events, such as
+  `needs-review`. Tags are for grouping and filtering; they carry no text.
 
-The **Tags** tab lists every tag, its colour and its event count across the
-whole database, not just the current query.
+### Use the sidebar
+
+The left sidebar is always present. Collapsed, it is a narrow rail of event
+tags; expanded, it shows **Findings**, **Event tags** and **Detections** (when
+detections are loaded) tabs, findings first. Use the **›** chevron at the top of
+the rail to expand it and the **‹** chevron to collapse it again. The browser
+remembers your choice.
+
+In the collapsed rail:
+
+- Each tag shows its colour swatch and name, cut short when long. Hover or focus
+  a tag to see its full name and event count.
+- Select a tag to add it to the query. Select it again to remove it. Active tags
+  are highlighted and their swatch shows a check mark.
+- The list scrolls when there are more tags than fit. **All tags** expands the
+  sidebar on the **Event tags** tab.
+
+### Browse event tags
+
+The **Event tags** tab lists every tag, its colour and its event count across
+the whole database, not just the current query.
 
 - Select a tag name to add it to the query. Select it again to remove it.
-- If you select several tags, events must have all of them to match.
+- If you select several tags, events must have all of them to match. Each active
+  tag also appears as a removable chip above the grid.
 - Select a colour swatch to change that tag's colour everywhere.
 
-### Read and manage notes
+### Read and manage findings
 
-The **Notes** tab lists shared Markdown notes, newest first. Use the search box
-to find a note. Its first line is its title.
+The **Findings** tab lists shared findings, newest first. Use the search box
+to find one. Its first line is its title.
 
-Expand a note to read it and see its oldest 25 linked events. Select an event to
-open the inspector. Use these controls to work with the note:
+Expand a finding to read it and see its oldest 25 linked events. Select an event
+to open the inspector. Use these controls to work with the finding:
 
 | Control | Action |
 | --- | --- |
-| **Filter to note** | Add the note's events to the current query as a filter |
-| **All linked** | Show only the note's events across the whole export |
-| **Reopen query** | Restore the query saved when the note was written |
+| **Filter to finding** | Add the finding's events to the current query as a filter |
+| **All linked** | Show only the finding's events across the whole export |
+| **Reopen query** | Restore the query saved when the finding was written |
 | **Link/Unlink N selected** | Add or remove links to selected events |
-| **Edit** or **Delete** | Change or delete the shared note for all its linked events |
+| **Edit** or **Delete** | Change or delete the shared finding for all its linked events |
 
-A note must keep at least one linked event. Delete the note instead of removing
-its last link. Notes accept up to 30,000 characters. Markdown is sanitised:
-scripts, raw HTML controls and embedded images are not rendered.
+A finding must keep at least one linked event. Delete the finding instead of
+removing its last link. Findings accept up to 30,000 characters. Markdown is
+sanitised: scripts, raw HTML controls and embedded images are not rendered.
 
-If another tab or an [agent](#agent-access-mcp) changes a note after you open it,
-**Save** and **Delete** will refuse to overwrite that change. Copy your text,
-reopen the note and reapply your edits.
+If another tab or an [agent](#agent-access-mcp) changes a finding after you open
+it, **Save** and **Delete** will refuse to overwrite that change. Copy your
+text, reopen the finding and reapply your edits.
 
-Each **Run**, or filter using a table value, refreshes the Tags and Notes tabs.
-This includes tags and notes written by agents.
+Each **Run**, or filter using a table value, refreshes the findings and tags.
+This includes notes and tags written by agents.
 
-### Tag events and link notes
+### Tag events and add them to findings
 
-Use the bar above the grid to tag and annotate selected events:
+Use the bar above the grid to work with selected events:
 
 - Check events, or use the header checkbox to select **loaded rows only**.
   Selection persists while scrolling and while tagging/annotating, but resets when
   the query or sort changes. Up to 5,000 events can be changed at once.
-- **Quick tag** (or press `T`) lists every tag with an all/some/none checkbox and
+- **Tag events** (or press `T`) lists every tag with an all/some/none checkbox and
   a count such as `2/3` for the selected events. Ticking a tag that is on none or
   some adds it to all selected events (other tags are untouched); unticking a tag
   that is on all removes it from all of them. Type to search, or type a new slug
   and choose a colour to create it. Tags are lowercase ASCII letters and digits with
   hyphen separators, at most 256 characters (e.g. `needs-review`).
-- **Add to note** creates a new note on the selected events (recording the current
-  query) or links them to an existing note.
+- **Add to finding** offers **New finding…**, which records the current query
+  with it, or a list to link the selected events to an existing finding.
+- Hover a row's **Tags** or **Findings** cell and click its **+** to tag or add
+  just that event. The inspector's **Add to finding…** also targets only the
+  event it shows, not other selected events.
 - Changes update loaded rows in place: scroll position, loaded batches and the
-  selection are kept. If a tag or note scope is active and the change could alter
+  selection are kept. If a tag or finding scope is active and the change could alter
   which events match, a **Refresh results** notice appears instead of reloading.
 - Rows stay one line high. The **Tags** column shows up to three initial-letter
   squares, or two plus `+N`; click any of them for the full tag names (each filters)
-  and **Edit tags on this event**. The **Notes** column shows a note icon and count;
-  click it to open those notes in the sidebar.
+  and **Edit tags on this event**. The **Findings** column shows an icon and count;
+  click it to open those findings in the sidebar.
 
 ### Store findings separately from evidence
 
@@ -794,7 +820,7 @@ and the server accepts it as a local, same-host client. There is no SQL, file pa
 or network-fetch tool. Agents
 cannot modify the CloudTrail evidence; they can only add, change or remove
 notes and tags in the sidecar, so back it up as usual. Treat agent changes like
-your own: review them in the **Findings** sidebar.
+your own: review them in the sidebar's **Findings** and **Event tags** tabs.
 
 ### Identify events and handle note conflicts
 

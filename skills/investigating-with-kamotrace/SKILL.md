@@ -155,8 +155,10 @@ takes the same `query` object. **Everything combines with AND.**
 
 ## Notes
 
-- Notes are Markdown findings linked to one or more events. The browser renders
-  them sanitized. Write for the analyst: a short title line, what happened,
+- Notes are Markdown findings linked to one or more events. The browser calls
+  them **Findings** (an evidence-linked observation, not necessarily a confirmed
+  conclusion) and keeps event tags separate; the tools keep the note names. The
+  browser renders them sanitized. Write for the analyst: a short title line, what happened,
   evidence (`event_id`, time with timezone, actor, source), what is inferred, and next
   steps. Start agent-written notes with something like
   `**Agent note**` so the analyst can tell who wrote them.

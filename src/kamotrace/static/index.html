@@ -25,14 +25,6 @@
         <button id="commands-tab" aria-pressed="false">SSM commands</button>
       </nav>
       <div class="utilities">
-        <button
-          id="toggle-findings"
-          aria-pressed="true"
-          aria-controls="findings"
-          title="Show or hide the Findings sidebar (tags and notes)"
-        >
-          Findings
-        </button>
         <button id="show-sql" title="Show the generated SQL below the grid">
           SQL
         </button>
@@ -40,61 +32,104 @@
       </div>
     </header>
     <div class="layout">
-      <aside id="findings" aria-label="Findings: tags and notes">
-        <div class="findings-head">
-          <h2>Findings</h2>
+      <aside id="sidebar" aria-label="Findings, event tags and detections">
+        <nav id="rail" aria-label="Event tag filters">
           <button
-            id="close-findings"
+            id="expand-sidebar"
             class="icon-button"
-            aria-label="Hide Findings sidebar"
+            aria-expanded="false"
+            aria-controls="sidebar-panel"
+            aria-label="Expand sidebar: findings, event tags and detections"
+            title="Expand sidebar: findings, event tags and detections"
           >
-            ×
+            ›
           </button>
-        </div>
-        <div class="findings-tabs" role="tablist">
-          <button id="tags-tab" role="tab" aria-selected="true">Tags</button>
-          <button id="notes-tab" role="tab" aria-selected="false">Notes</button>
-          <button id="detections-tab" role="tab" aria-selected="false" hidden>
-            Detections
+          <ul id="rail-tags"></ul>
+          <button
+            id="rail-all-tags"
+            class="text-button"
+            title="Show all event tags with counts"
+          >
+            <svg aria-hidden="true" viewBox="0 0 16 16" width="14" height="14">
+              <path
+                d="M1.5 2.5v5l7 7 6-6-7-7h-5z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linejoin="round"
+              />
+              <circle cx="4.5" cy="5" r="1.2" fill="currentColor" /></svg
+            >All tags
           </button>
+        </nav>
+        <div id="sidebar-panel" hidden>
+          <div class="sidebar-head">
+            <h2>Findings</h2>
+            <button
+              id="collapse-sidebar"
+              class="icon-button"
+              aria-expanded="true"
+              aria-controls="sidebar-panel"
+              aria-label="Collapse sidebar to the tag rail"
+              title="Collapse sidebar to the tag rail"
+            >
+              ‹
+            </button>
+          </div>
+          <div class="sidebar-tabs" role="tablist">
+            <button id="notes-tab" role="tab" aria-selected="true">
+              Findings
+            </button>
+            <button id="tags-tab" role="tab" aria-selected="false">
+              Event tags
+            </button>
+            <button id="detections-tab" role="tab" aria-selected="false" hidden>
+              Detections
+            </button>
+          </div>
+          <section id="notes-pane" aria-label="Findings">
+            <input
+              id="note-search"
+              type="search"
+              placeholder="Search findings…"
+              aria-label="Search findings"
+            />
+            <p class="hint">
+              Evidence-linked observations, not necessarily confirmed
+              conclusions.
+            </p>
+            <p id="note-scope" class="hint" hidden></p>
+            <ul id="note-list"></ul>
+          </section>
+          <section id="tags-pane" aria-label="Event tags" hidden>
+            <input
+              id="tag-search"
+              type="search"
+              placeholder="Search tags…"
+              aria-label="Search tags"
+            />
+            <p class="hint">
+              Labels on individual events, separate from findings. Counts cover
+              all evidence. Click to filter; all tag filters must match. Click a
+              swatch to recolor it everywhere.
+            </p>
+            <ul id="tag-list"></ul>
+          </section>
+          <section id="detections-pane" aria-label="Suzaku detections" hidden>
+            <input
+              id="rule-search"
+              type="search"
+              placeholder="Search rules, levels, ATT&amp;CK…"
+              aria-label="Search detection rules"
+            />
+            <p class="hint">
+              Sigma rules Suzaku matched, most severe first, with linked event
+              counts. Click to filter; all rule filters must match.
+            </p>
+            <ul id="rule-list"></ul>
+            <p id="detections-run" class="hint"></p>
+          </section>
         </div>
-        <section id="tags-pane" aria-label="Tags">
-          <input
-            id="tag-search"
-            type="search"
-            placeholder="Search tags…"
-            aria-label="Search tags"
-          />
-          <p class="hint">
-            Event counts across all evidence. Click to filter; all tag filters
-            must match. Click a swatch to recolor it everywhere.
-          </p>
-          <ul id="tag-list"></ul>
-        </section>
-        <section id="notes-pane" aria-label="Notes" hidden>
-          <input
-            id="note-search"
-            type="search"
-            placeholder="Search notes…"
-            aria-label="Search notes"
-          />
-          <p id="note-scope" class="hint" hidden></p>
-          <ul id="note-list"></ul>
-        </section>
-        <section id="detections-pane" aria-label="Suzaku detections" hidden>
-          <input
-            id="rule-search"
-            type="search"
-            placeholder="Search rules, levels, ATT&amp;CK…"
-            aria-label="Search detection rules"
-          />
-          <p class="hint">
-            Sigma rules Suzaku matched, most severe first, with linked event
-            counts. Click to filter; all rule filters must match.
-          </p>
-          <ul id="rule-list"></ul>
-          <p id="detections-run" class="hint"></p>
-        </section>
       </aside>
       <main>
         <section class="time-panel" aria-label="Time range and histograms">
@@ -257,15 +292,21 @@
           </div>
           <div class="review-toolbar">
             <span id="selected-count" role="status">0 selected</span>
-            <button id="quick-tag" disabled title="Tag selected events (T)">
-              Quick tag ▾
+            <button
+              id="add-to-note"
+              disabled
+              title="Record an evidence-linked observation about the selected events"
+            >
+              Add to finding ▾
             </button>
-            <button id="add-to-note" disabled>Add to note ▾</button>
+            <button id="quick-tag" disabled title="Tag selected events (T)">
+              Tag events ▾
+            </button>
             <button id="clear-selection" class="text-button">
               Clear selection
             </button>
             <span id="stale" hidden
-              >Tags or notes changed since this query ran ·
+              >Tags or findings changed since this query ran ·
               <button id="refresh-stale" class="text-button">
                 Refresh results
               </button></span
@@ -425,18 +466,19 @@
     <div
       id="note-menu"
       popover="auto"
-      aria-label="Add selected events to a note"
+      aria-label="Add selected events to a finding"
     >
       <p id="note-menu-title" class="menu-title"></p>
-      <button id="new-note" class="primary">New note…</button>
+      <button id="new-note" class="primary">New finding…</button>
       <input
         id="note-menu-search"
         type="search"
-        placeholder="Or link to an existing note…"
-        aria-label="Search existing notes"
+        placeholder="Link to existing finding…"
+        aria-label="Search existing findings to link"
       />
       <ul id="note-menu-list"></ul>
     </div>
+    <div id="rail-tip" role="tooltip" hidden></div>
     <input
       id="recolor"
       type="color"
@@ -472,23 +514,27 @@
     </dialog>
     <dialog id="review-dialog" aria-labelledby="review-title">
       <div class="dialog-heading">
-        <h2 id="review-title">Note</h2>
+        <h2 id="review-title">Finding</h2>
         <button id="close-review">Close</button>
       </div>
       <p id="review-error" role="alert" hidden></p>
       <p id="review-context" class="hint"></p>
+      <p class="hint">
+        A finding is an evidence-linked observation: record what you saw and why
+        it matters, confirmed or not.
+      </p>
       <label for="note-body"
-        >Note (Markdown; the first line is its title)</label
+        >Finding (Markdown; the first line is its title)</label
       >
       <textarea
         id="note-body"
         maxlength="30000"
         rows="7"
-        placeholder="What did you find? Use **bold**, lists, links or code."
+        placeholder="What did you observe? Use **bold**, lists, links or code."
       ></textarea>
       <h3>Preview</h3>
       <div id="note-preview" class="markdown"></div>
-      <button id="save-note" class="primary">Save note</button>
+      <button id="save-note" class="primary">Save finding</button>
     </dialog>
     <dialog id="detail" aria-labelledby="detail-title">
       <div class="dialog-heading">
@@ -496,7 +542,7 @@
           <h2 id="detail-title">Original CloudTrail event</h2>
           <span id="detail-id"></span>
         </div>
-        <span>
+        <span class="detail-actions">
           <button id="detail-prev" title="Previous loaded event (K)">
             ‹ Prev
           </button>
@@ -506,10 +552,6 @@
           </button>
         </span>
       </div>
-      <p id="detail-provenance" class="hint">
-        Original JSON preserves numeric precision. Treat request/response
-        contents as sensitive.
-      </p>
       <div id="detail-findings"></div>
       <div id="event-command-links" class="command-links"></div>
       <pre id="raw-event"></pre>

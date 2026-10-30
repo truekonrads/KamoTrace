@@ -76,6 +76,7 @@ let reviews = { annotations: [], tags: [] },
   editingNote = null;
 const selectedEvents = new Set();
 let reviewHashes = [],
+  noteMenuHashes = [],
   quickTagHashes = [];
 let commandKey = null,
   commandsActive = false,
@@ -296,7 +297,7 @@ function noteTitle(note) {
     line
       .replace(/^[#>*\-\s]+/, "")
       .replace(/[*_`]/g, "")
-      .slice(0, 90) || `Note #${note?.id}`
+      .slice(0, 90) || `Finding #${note?.id}`
   );
 }
 
@@ -356,12 +357,16 @@ function renderScopes() {
   if (s.annotation_id !== null) {
     const note = reviews.annotations.find((n) => n.id === s.annotation_id);
     out.push(
-      chip(`Note #${s.annotation_id}: ${note ? noteTitle(note) : "deleted"}`, {
-        kind: "note",
-        title: "Events linked to this note. Click to show it in Findings.",
-        onClick: () => showNotes([s.annotation_id]),
-        onRemove: () => apply({ ...s, annotation_id: null }),
-      }),
+      chip(
+        `Finding #${s.annotation_id}: ${note ? noteTitle(note) : "deleted"}`,
+        {
+          kind: "note",
+          title:
+            "Events linked to this finding. Click to show it in the sidebar.",
+          onClick: () => showNotes([s.annotation_id]),
+          onRemove: () => apply({ ...s, annotation_id: null }),
+        },
+      ),
     );
   }
   for (const id of s.rules) {
@@ -373,7 +378,7 @@ function renderScopes() {
           "Suzaku detection (Sigma rule " +
           id +
           "). Several rule scopes must all match.",
-        onClick: () => findingsTab("detections"),
+        onClick: () => sidebarTab("detections"),
         onRemove: () => apply({ ...s, rules: s.rules.filter((r) => r !== id) }),
       }),
     );
@@ -383,7 +388,7 @@ function renderScopes() {
       chip(`Sigma ≥ ${s.min_level}`, {
         kind: "rule",
         title: `Only events with a Suzaku detection at level ${s.min_level} or above.`,
-        onClick: () => findingsTab("detections"),
+        onClick: () => sidebarTab("detections"),
         onRemove: () => apply({ ...s, min_level: null }),
       }),
     );
@@ -884,8 +889,6 @@ async function openCommand(key, keepLayout = false) {
             detailRow = null;
             $("detail-id").textContent =
               `${data.event_id} · Supplemental SSM export (not in original DuckDB)`;
-            $("detail-provenance").textContent =
-              "Supplemental CloudTrail event, reconstructed from the SSM export JSON. Treat request/response contents as sensitive.";
             $("raw-event").textContent = data.raw_json;
             $("record-hash").textContent =
               "Supplemental event reconstructed from export JSON; original evidence database is unchanged.";
@@ -997,8 +1000,8 @@ function markdown(target, text) {
 async function refreshReviews() {
   reviews = await request("/api/reviews");
   noteEvents.clear();
-  $("tags-tab").textContent = `Tags (${reviews.tags.length})`;
-  $("notes-tab").textContent = `Notes (${reviews.annotations.length})`;
+  tabLabel("tags-tab", "Event tags", reviews.tags.length);
+  tabLabel("notes-tab", "Findings", reviews.annotations.length);
   renderTags();
   renderNotes();
   if (applied) renderScopes();
@@ -1069,15 +1072,69 @@ function renderTags() {
     li.className = "hint";
     li.textContent = reviews.tags.length
       ? "No matching tags."
-      : "No tags yet. Select events and use Quick tag.";
+      : "No tags yet. Select events and use Tag events.";
     items.push(li);
   }
   $("tag-list").replaceChildren(...items);
+  renderRail();
+}
+
+// The collapsed rail: every tag as a compact filter toggle; full names show on hover/focus.
+function renderRail() {
+  // Rebuilt buttons never fire blur/pointerleave: drop the tip and keep keyboard focus in place.
+  $("rail-tip").hidden = true;
+  const focused = document.activeElement?.closest?.(".rail-tag")?.dataset.slug;
+  const items = reviews.tags.map((tag) => {
+    const li = document.createElement("li");
+    const active = applied.tags.includes(tag.slug);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "rail-tag" + (active ? " active" : "");
+    b.dataset.slug = tag.slug;
+    b.setAttribute("aria-pressed", String(active));
+    b.setAttribute("aria-describedby", "rail-tip");
+    const color = swatch(tag);
+    color.removeAttribute("title");
+    if (active) color.textContent = "✓";
+    color.setAttribute("aria-hidden", "true");
+    const name = document.createElement("span");
+    name.className = "rail-name";
+    name.textContent = tag.slug;
+    b.append(color, name);
+    const tip = () => {
+      $("rail-tip").textContent =
+        `${tag.slug} · ${number(tag.events)} events · ` +
+        (active ? "filter on; click to remove" : "click to filter");
+      $("rail-tip").hidden = false;
+      const r = b.getBoundingClientRect();
+      $("rail-tip").style.left = `${r.right + 6}px`;
+      $("rail-tip").style.top = `${r.top + r.height / 2}px`;
+    };
+    const untip = () => ($("rail-tip").hidden = true);
+    b.onpointerenter = tip;
+    b.onfocus = () => b.matches(":focus-visible") && tip();
+    b.onpointerleave = b.onblur = untip;
+    b.onclick = () => {
+      untip();
+      toggleTagFilter(tag.slug);
+    };
+    li.append(b);
+    return li;
+  });
+  if (!items.length) {
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = "No tags yet";
+    items.push(li);
+  }
+  $("rail-tags").replaceChildren(...items);
+  if (focused)
+    $("rail-tags").querySelector(`[data-slug="${focused}"]`)?.focus();
 }
 
 function showNotes(ids) {
-  setFindings(true);
-  findingsTab("notes");
+  setSidebar(true);
+  sidebarTab("notes");
   noteScope = ids;
   expandedNotes = new Set(ids);
   renderNotes();
@@ -1127,11 +1184,11 @@ function renderNotes() {
   $("note-scope").hidden = !noteScope;
   if (noteScope) {
     $("note-scope").replaceChildren(
-      `Showing ${noteScope.length} note(s) on one event · `,
+      `Showing ${noteScope.length} finding(s) on one event · `,
     );
     const all = document.createElement("button");
     all.className = "text-button";
-    all.textContent = "Show all notes";
+    all.textContent = "Show all findings";
     all.onclick = () => {
       noteScope = null;
       renderNotes();
@@ -1157,7 +1214,7 @@ function renderNotes() {
       title.textContent = noteTitle(note);
       const info = document.createElement("span");
       info.className = "hint";
-      info.textContent = `#${note.id} · ${number(note.events)} events · ${shown(Date.parse(note.updated)).slice(0, 16)} ${meta.timezone}`;
+      info.textContent = `#${note.id} · ${number(note.events)} linked events · ${shown(Date.parse(note.updated)).slice(0, 16)} ${meta.timezone}`;
       head.append(title, info);
       head.onclick = () => {
         if (expandedNotes.has(note.id)) expandedNotes.delete(note.id);
@@ -1181,12 +1238,12 @@ function renderNotes() {
           actions.append(b);
         };
         action(
-          "Filter to note",
+          "Filter to finding",
           () => {
             if (commandsActive) switchView(false, false);
             apply({ ...applied, annotation_id: note.id });
           },
-          "Add this note to the current query (AND)",
+          "Add this finding's events to the current query (AND)",
         );
         action(
           "All linked",
@@ -1198,7 +1255,7 @@ function renderNotes() {
               annotation_id: note.id,
             });
           },
-          "Whole export, only this note's events. Back restores your query.",
+          "Whole export, only this finding's events. Back restores your query.",
         );
         if (note.context)
           action(
@@ -1207,7 +1264,7 @@ function renderNotes() {
               if (commandsActive) switchView(false, false);
               apply(note.context);
             },
-            "Restore the query this note was written from",
+            "Restore the query this finding was written from",
           );
         const rows = rowsByHash();
         const onNote = selected.filter((h) =>
@@ -1219,20 +1276,20 @@ function renderNotes() {
             `Link ${unlinked.length} selected`,
             () =>
               writeReview({ action: "link", id: note.id, hashes: unlinked }),
-            "Add the selected events that are not yet linked to this note",
+            "Link the selected events that are not yet linked to this finding",
           );
         if (onNote.length)
           action(
             `Unlink ${onNote.length} selected`,
             () =>
               writeReview({ action: "unlink", id: note.id, hashes: onNote }),
-            "Remove the selected events from this note",
+            "Unlink the selected events from this finding",
           );
         action("Edit", () => noteDialog(note));
         action("Delete", () => {
           if (
             confirm(
-              `Delete note #${note.id} from all ${note.events} linked events?`,
+              `Delete finding #${note.id} and its links to ${note.events} events? Event tags are unaffected.`,
             )
           )
             writeReview({
@@ -1252,18 +1309,20 @@ function renderNotes() {
     const li = document.createElement("li");
     li.className = "hint";
     li.textContent = reviews.annotations.length
-      ? "No matching notes."
-      : "No notes yet. Select events and use Add to note.";
+      ? "No matching findings."
+      : "No findings yet. Select events and use Add to finding.";
     items.push(li);
   }
   $("note-list").replaceChildren(...items);
 }
 
-function setFindings(open) {
-  document.querySelector(".layout").classList.toggle("no-findings", !open);
-  $("findings").hidden = !open;
-  $("toggle-findings").setAttribute("aria-pressed", String(open));
-  localStorage.setItem("findings-open", open ? "1" : "0");
+// Collapsed, the sidebar is a narrow tag rail that stays visible; expanded, the full panel.
+function setSidebar(open) {
+  document.querySelector(".layout").classList.toggle("sidebar-open", open);
+  $("rail").hidden = open;
+  $("sidebar-panel").hidden = !open;
+  $("rail-tip").hidden = true;
+  localStorage.setItem("sidebar-expanded", open ? "1" : "0");
   requestAnimationFrame(() => {
     table?.redraw();
     if (lastHistogram) frequency(lastHistogram, lastContext);
@@ -1272,7 +1331,14 @@ function setFindings(open) {
   });
 }
 
-function findingsTab(which) {
+function tabLabel(id, label, n) {
+  const count = document.createElement("span");
+  count.className = "tab-count";
+  count.textContent = number(n);
+  $(id).replaceChildren(label, count);
+}
+
+function sidebarTab(which) {
   for (const name of ["tags", "notes", "detections"]) {
     $(`${name}-tab`).setAttribute("aria-selected", String(which === name));
     $(`${name}-pane`).hidden = which !== name;
@@ -1352,14 +1418,14 @@ function renderDetections() {
       (run.no_match_rows || run.ambiguous_rows
         ? ` · ${number(run.no_match_rows + run.ambiguous_rows)} not linked (no exact event)`
         : "") +
-      ". Detections are leads, not findings: tag or note what you confirm."
+      ". Detections are automated leads: tag events or record a finding about what you observe."
     : "";
 }
 
 async function loadDetections() {
   detections = await request("/api/detections");
   $("detections-tab").hidden = !detections.run;
-  $("detections-tab").textContent = `Detections (${detections.rules.length})`;
+  tabLabel("detections-tab", "Detections", detections.rules.length);
   renderDetections();
 }
 
@@ -1495,9 +1561,12 @@ async function createTag() {
   renderQuickTag();
 }
 
-function openNoteMenu(anchor) {
+function openNoteMenu(anchor, hashes = [...selectedEvents]) {
+  noteMenuHashes = hashes;
   $("note-menu-title").textContent =
-    `${number(selectedEvents.size)} selected events`;
+    hashes.length === 1
+      ? "Add this event to a finding"
+      : `Add ${number(hashes.length)} selected events to a finding`;
   $("note-menu-search").value = "";
   renderNoteMenu();
   placeMenu($("note-menu"), anchor);
@@ -1514,13 +1583,13 @@ function renderNoteMenu() {
         const b = document.createElement("button");
         b.type = "button";
         b.textContent = `#${note.id} ${noteTitle(note)} (${number(note.events)})`;
-        b.title = "Link the selected events to this note";
+        b.title = "Link these events to this finding";
         b.onclick = async () => {
           $("note-menu").hidePopover();
           await writeReview({
             action: "link",
             id: note.id,
-            hashes: [...selectedEvents],
+            hashes: noteMenuHashes,
           });
           showNotes([note.id]);
           noteScope = null;
@@ -1538,7 +1607,7 @@ function scopeSummary(s) {
   for (const f of s.filters)
     parts.push(`${meta.fields[f.field]} ${OPS[f.op][1]} ${f.value}`);
   for (const t of s.tags) parts.push(`tag ${t}`);
-  if (s.annotation_id !== null) parts.push(`note #${s.annotation_id}`);
+  if (s.annotation_id !== null) parts.push(`finding #${s.annotation_id}`);
   for (const r of s.rules || [])
     parts.push(
       `Sigma ${detections.rules.find((d) => d.rule_id === r)?.title || r}`,
@@ -1549,13 +1618,13 @@ function scopeSummary(s) {
   return parts.join(" · ");
 }
 
-function noteDialog(note = null) {
+function noteDialog(note = null, hashes = [...selectedEvents]) {
   editingNote = note; // Keeps `updated`: the server rejects edits to a note changed since.
-  reviewHashes = [...selectedEvents];
+  reviewHashes = [...hashes];
   $("review-error").hidden = true;
   $("review-title").textContent = note
-    ? `Edit note #${note.id} (${note.events} linked events)`
-    : `New note on ${number(reviewHashes.length)} selected events`;
+    ? `Edit finding #${note.id} (${note.events} linked events)`
+    : `New finding on ${number(reviewHashes.length)} ${reviewHashes.length === 1 ? "event" : "selected events"}`;
   $("review-context").textContent = note
     ? note.context
       ? "Written from: " + scopeSummary(normalize(note.context))
@@ -1765,7 +1834,7 @@ function detailFindings() {
   const notes = document.createElement("div");
   notes.className = "detail-notes";
   const nlabel = document.createElement("strong");
-  nlabel.textContent = "Notes";
+  nlabel.textContent = "Findings";
   notes.append(nlabel);
   for (const id of detailRow.annotations) {
     const note = reviews.annotations.find((n) => n.id === id);
@@ -1777,6 +1846,12 @@ function detailFindings() {
     notes.append(b);
   }
   if (!detailRow.annotations.length) notes.append(" none");
+  const addNote = document.createElement("button");
+  addNote.type = "button";
+  addNote.className = "text-button";
+  addNote.textContent = "Add to finding…";
+  addNote.onclick = () => openNoteMenu(addNote, [detailRow.record_sha256]);
+  notes.append(addNote);
   target.append(tags, notes);
   if ((detailRow.detections || []).length) {
     const det = document.createElement("div");
@@ -1803,8 +1878,6 @@ async function detail(row) {
     detailRow = row.record_sha256 ? row : null;
     $("detail-id").textContent =
       `${data.event_id} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
-    $("detail-provenance").textContent =
-      "Original DuckDB evidence JSON preserves numeric precision. Treat request/response contents as sensitive.";
     eventCommandLinks(data.ssm_commands);
     // Format using token-aware whitespace only: do not parse/stringify numeric evidence in JavaScript.
     let indent = 0,
@@ -2191,10 +2264,25 @@ function fitGrid() {
   table.setHeight(Math.max(260, h));
 }
 
+function eventReviewAdd(row, kind) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "review-add";
+  b.textContent = "+";
+  b.title = kind === "tags" ? "Tag this event" : "Add this event to a finding";
+  b.setAttribute("aria-label", b.title);
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (kind === "tags") openQuickTag(b, [row.record_sha256]);
+    else openNoteMenu(b, [row.record_sha256]);
+  };
+  return b;
+}
+
 function tagCell(cell) {
   const d = cell.getRow().getData();
   const wrap = document.createElement("span");
-  wrap.className = "tag-markers";
+  wrap.className = "tag-markers review-cell";
   const visible = d.tags.length > 3 ? d.tags.slice(0, 2) : d.tags;
   for (const tag of visible) {
     const s = swatch(tag, (e) => {
@@ -2220,6 +2308,7 @@ function tagCell(cell) {
     };
     wrap.append(more);
   }
+  wrap.append(eventReviewAdd(d, "tags"));
   return wrap;
 }
 
@@ -2257,7 +2346,10 @@ function tagPopover(anchor, row) {
 
 function noteCell(cell) {
   const d = cell.getRow().getData();
-  if (!d.annotations.length) return "";
+  const wrap = document.createElement("span");
+  wrap.className = "review-cell";
+  wrap.append(eventReviewAdd(d, "notes"));
+  if (!d.annotations.length) return wrap;
   const b = document.createElement("button");
   b.type = "button";
   b.className = "note-marker";
@@ -2272,13 +2364,14 @@ function noteCell(cell) {
     .join("\n");
   b.setAttribute(
     "aria-label",
-    `${d.annotations.length} notes; show in Findings`,
+    `${d.annotations.length} findings; show them in the sidebar`,
   );
   b.onclick = (e) => {
     e.stopPropagation();
     showNotes(d.annotations);
   };
-  return b;
+  wrap.prepend(b);
+  return wrap;
 }
 
 async function init() {
@@ -2296,13 +2389,24 @@ async function init() {
   applied = normalize({});
   queryHistory.push(applied);
   historyPos = 0;
-  setFindings(localStorage.getItem("findings-open") !== "0");
-  $("toggle-findings").onclick = () =>
-    setFindings($("toggle-findings").getAttribute("aria-pressed") !== "true");
-  $("close-findings").onclick = () => setFindings(false);
-  $("tags-tab").onclick = () => findingsTab("tags");
-  $("notes-tab").onclick = () => findingsTab("notes");
-  $("detections-tab").onclick = () => findingsTab("detections");
+  setSidebar(localStorage.getItem("sidebar-expanded") === "1");
+  $("expand-sidebar").onclick = () => {
+    setSidebar(true);
+    $("collapse-sidebar").focus();
+  };
+  $("collapse-sidebar").onclick = () => {
+    setSidebar(false);
+    $("expand-sidebar").focus();
+  };
+  $("rail-all-tags").onclick = () => {
+    setSidebar(true);
+    sidebarTab("tags");
+    $("tag-search").focus();
+  };
+  $("rail-tags").onscroll = () => ($("rail-tip").hidden = true);
+  $("tags-tab").onclick = () => sidebarTab("tags");
+  $("notes-tab").onclick = () => sidebarTab("notes");
+  $("detections-tab").onclick = () => sidebarTab("detections");
   $("rule-search").oninput = renderDetections;
   $("tag-search").oninput = renderTags;
   $("note-search").oninput = renderNotes;
@@ -2390,7 +2494,7 @@ async function init() {
   $("note-menu-search").oninput = renderNoteMenu;
   $("new-note").onclick = () => {
     $("note-menu").hidePopover();
-    noteDialog();
+    noteDialog(null, noteMenuHashes);
   };
   $("tag-slug").oninput = renderQuickTag;
   $("tag-slug").onkeydown = (e) => {
@@ -2438,6 +2542,11 @@ async function init() {
             !d.annotations.includes(result.id)
           )
             row.update({ annotations: [...d.annotations, result.id] });
+        }
+        if (detailRow && reviewHashes.includes(detailRow.record_sha256)) {
+          if (!detailRow.annotations.includes(result.id))
+            detailRow.annotations = [...detailRow.annotations, result.id];
+          detailFindings();
         }
         showNotes([result.id]);
         noteScope = null;
@@ -2700,9 +2809,9 @@ async function init() {
         formatter: tagCell,
       },
       {
-        title: "Notes",
+        title: "Findings",
         field: "annotations",
-        width: 54,
+        width: 74,
         frozen: true,
         headerSort: false,
         formatter: noteCell,

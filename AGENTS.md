@@ -52,7 +52,10 @@ only reads them.
   the MCP tools. When a tool, argument, operator, error message or identity rule
   changes, update the skill too, and recheck its examples through a real MCP session.
 - `static/app.js`, `app.css`, `index.html`: desktop UI. Reuse the vendored
-  Tabulator grid and noUiSlider rather than introducing a framework.
+  Tabulator grid and noUiSlider rather than introducing a framework. The UI calls
+  notes **Findings** (evidence-linked observations, not necessarily confirmed)
+  and keeps **Event tags** separate; the API, sidecar and MCP keep note/annotation
+  names. The left sidebar collapses to a persistent tag rail, never disappears.
 - `static/vendor/`: unmodified third-party assets and their licenses.
 - `tests/test_contract.py`: synthetic end-to-end HTTP contract tests using real
   DuckDB, a real stdio MCP client session, and Suzaku import/linkage.

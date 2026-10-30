@@ -9,7 +9,7 @@ related activity and record findings with tags and notes.
 
 In this synthetic case, an AI agent uses MCP to trace a leaked access key and
 follow the `svc-backup` user's activity. It tags related events and writes the
-evidence-linked notes shown in **Findings**, ready for human review.
+evidence-linked notes shown as **Findings**, ready for human review.
 [Follow the worked investigation](docs/user-guide.md#end-to-end-example).
 
 You can also use an AI assistant to help investigate. Connect Claude Code, Amp
@@ -24,7 +24,7 @@ KamoTrace, a database server, Docker or a Node.js build.
 
 - Search event content and filter by time, identity, IP address and other fields.
 - Find unusual activity with value counts and a timeline of events.
-- Save findings as shared notes linked to evidence.
+- Record findings: shared, evidence-linked observations, separate from event tags.
 - Add [Suzaku detections](docs/user-guide.md#suzaku-detections) based on Sigma rules.
 - Add country, city and network information with [offline IP enrichment](docs/user-guide.md#ip-enrichment).
 - Review [AWS Systems Manager (SSM) commands and output](docs/user-guide.md#ssm-command-browser-desktop).
@@ -275,8 +275,9 @@ detection files beside `case.duckdb` automatically when they are present.
 1. Choose a **Timezone** and time range. The default timezone is UTC.
 2. Enter a search term or use **+ Filter**, then choose **Run**.
 3. Select a row to inspect the original JSON and record hash.
-4. Select event checkboxes and use **Quick tag** or **Add to note**.
-5. Review your tags and notes in the **Findings** sidebar.
+4. Select event checkboxes and use **Add to finding** or **Tag events**.
+5. Review findings and event tags in the left sidebar. Collapsed, it shows your
+   tags as one-click filters; expand it with **›**.
 
 Counts and charts cover all matching events, not just the rows loaded in the
 grid. Time ranges include the start and exclude the end.
@@ -300,7 +301,8 @@ assistant cannot change the original CloudTrail records.
    > what it did, and tag and note what you can confirm. Separate observations
    > from assumptions.
 
-Review the assistant's tags and notes in **Findings**. You can edit or remove
+Review the assistant's tags and notes in the sidebar, where notes appear as
+**Findings**. You can edit or remove
 them. Check your assistant's data-handling settings before using real evidence:
 although KamoTrace runs locally, your assistant may send tool results to its
 AI provider.
@@ -314,7 +316,7 @@ AI provider.
 | Run in a container | [Docker](docs/user-guide.md#docker) |
 | Add threat detections | [Suzaku detections](docs/user-guide.md#suzaku-detections) |
 | Look up source IP information offline | [IP enrichment and JSONL format](docs/user-guide.md#ip-enrichment) |
-| Organise and review findings | [Tags and notes](docs/user-guide.md#findings-tags-and-notes) |
+| Organise and review findings | [Findings and event tags](docs/user-guide.md#findings-and-event-tags) |
 | Inspect collected command output | [SSM command browser](docs/user-guide.md#ssm-command-browser-desktop) |
 | Connect Claude Code, Amp or another MCP client | [Agent setup and tools](docs/user-guide.md#agent-access-mcp) |
 | Back up or move a case | [Storage and backups](docs/user-guide.md#storage-and-backups) |

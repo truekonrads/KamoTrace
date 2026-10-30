@@ -9,7 +9,8 @@
   --line: #9eb9c3;
   --ink: #103b55;
   --selected: #d9eeef;
-  --sidebar: 268px;
+  --sidebar: 300px;
+  --rail: 148px;
 }
 * {
   box-sizing: border-box;
@@ -178,52 +179,129 @@ h1 {
 
 .layout {
   display: grid;
-  grid-template-columns: var(--sidebar) minmax(0, 1fr);
+  grid-template-columns: var(--rail) minmax(0, 1fr);
   align-items: start;
 }
-.layout.no-findings {
-  grid-template-columns: minmax(0, 1fr);
+.layout.sidebar-open {
+  grid-template-columns: var(--sidebar) minmax(0, 1fr);
 }
 main {
   min-width: 0;
   padding: 8px 12px 0;
 }
 
-/* Findings sidebar: follows the viewport, scrolls internally. */
-#findings {
+/* Sidebar: always present, follows the viewport. Collapsed it is a tag rail; expanded, a panel. */
+#sidebar {
   position: sticky;
   top: 0;
   height: 100vh;
-  overflow: auto;
   background: #fff;
   border-right: 1px solid var(--line);
+}
+#sidebar-panel {
+  height: 100%;
+  overflow: auto;
   padding: 8px 10px 16px;
 }
-.findings-head {
+#rail {
+  display: flex;
+  flex-direction: column;
+  /* Fits below the top bar before the page scrolls, so All tags stays visible. */
+  max-height: calc(100vh - 44px);
+  padding: 8px 6px;
+  gap: 6px;
+}
+#expand-sidebar {
+  align-self: flex-start;
+}
+#rail-tags {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--line);
+  padding: 0 0 6px;
+}
+.rail-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 1px 0;
+  padding: 3px 4px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  font-weight: 450;
+  text-align: left;
+}
+.rail-tag.active {
+  background: var(--selected);
+  border-color: var(--blue);
+  box-shadow: inset 3px 0 var(--blue);
+  font-weight: 600;
+}
+.rail-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#rail-all-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+}
+#rail-tip {
+  position: fixed;
+  z-index: 20;
+  transform: translateY(-50%);
+  max-width: 360px;
+  padding: 4px 8px;
+  border-radius: 3px;
+  background: var(--ink);
+  color: #fff;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+.sidebar-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
-.findings-tabs {
+.sidebar-tabs {
   display: flex;
   margin: 6px 0;
   border-bottom: 1px solid var(--line);
 }
-.findings-tabs button {
+.sidebar-tabs button {
   flex: 1;
   border: 0;
   border-radius: 0;
   background: transparent;
   border-bottom: 2px solid transparent;
+  padding: 4px 1px;
+  font-size: 12px;
+  white-space: nowrap;
 }
-.findings-tabs [aria-selected="true"] {
+.tab-count {
+  margin-left: 3px;
+  padding: 0 4px;
+  border-radius: 7px;
+  background: #e8f0f2;
+  color: #4f6778;
+  font-size: 10px;
+  font-weight: 600;
+}
+.sidebar-tabs [aria-selected="true"] {
   border-bottom-color: var(--red);
   color: var(--blue);
 }
-#findings input[type="search"] {
+#sidebar input[type="search"] {
   width: 100%;
 }
-#findings ul {
+#sidebar ul {
   list-style: none;
   padding: 0;
   margin: 4px 0;
@@ -762,6 +840,29 @@ main {
   line-height: 14px;
   border-radius: 3px;
 }
+.review-cell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 18px;
+}
+.review-add {
+  position: absolute;
+  right: 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  line-height: 16px;
+  font-size: 14px;
+  opacity: 0;
+  pointer-events: none;
+}
+.tabulator-cell:hover .review-add,
+.tabulator-cell:focus-within .review-add {
+  opacity: 1;
+  pointer-events: auto;
+}
 .note-marker {
   display: inline-flex;
   align-items: center;
@@ -986,6 +1087,19 @@ dialog::backdrop {
 }
 #detail:not([open]) {
   display: none;
+}
+#detail .dialog-heading {
+  align-items: flex-start;
+}
+#detail .dialog-heading > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.detail-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+  white-space: nowrap;
 }
 #detail-id,
 #record-hash {
