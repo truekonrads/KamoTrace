@@ -463,6 +463,54 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(self.call("/api/events", {"rules": ["rule-low"]})[1]["last_row"], 0)
         self.assertEqual(self.call("/api/detections")[1], {"run": None, "rules": []})
 
+    def test_large_detection_sidecar_preserves_all_rules_and_lists(self):
+        sidecar = Path(self.temp.name) / "bulk.detections.duckdb"
+        info = json.loads(self.store.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
+        run = {"schema_version": 1, "evidence_source_sha256": info["source_sha256"], "evidence_records": 5}
+        out = duckdb.connect(str(sidecar))
+        try:
+            out.execute("CREATE TABLE suzaku_run (metadata JSON)")
+            out.execute("INSERT INTO suzaku_run VALUES (?)", [json.dumps(run)])
+            # More than one transfer batch, with a partial final batch. Only the last rule links to event-2.
+            out.execute("""CREATE TABLE detections AS SELECT
+                CASE WHEN i = 8204 THEN 3 ELSE 1 END::BIGINT AS source_record,
+                'bulk-' || i AS rule_id, 'Synthetic 雲 ' || i AS rule_title,
+                'high' AS level, 3::TINYINT AS level_rank,
+                CASE WHEN i % 2 = 0 THEN [] ELSE ['Exec', 'Discovery'] END::VARCHAR[] AS tactics,
+                CASE WHEN i % 2 = 0 THEN NULL ELSE ['T1651'] END::VARCHAR[] AS technique_ids,
+                CASE WHEN i = 8192 THEN 'no_match' ELSE 'linked' END AS link_status
+                FROM range(8205) t(i)""")
+        finally:
+            out.close()
+        before = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+        store = Store(self.database, detections=sidecar)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def request(path, body=None):
+                req = Request(f"http://127.0.0.1:{server.server_port}" + path,
+                              data=json.dumps(body).encode() if body is not None else None,
+                              headers={"Content-Type": "application/json"})
+                with urlopen(req, timeout=15) as response:
+                    return json.load(response)
+
+            rules = {r["rule_id"]: r for r in request("/api/detections")["rules"]}
+            self.assertEqual(set(rules), {f"bulk-{i}" for i in range(8205) if i != 8192})
+            self.assertEqual((rules["bulk-8193"]["title"], rules["bulk-8193"]["tactics"],
+                              rules["bulk-8193"]["techniques"]), ("Synthetic 雲 8193", ["Exec", "Discovery"], ["T1651"]))
+            self.assertEqual((rules["bulk-8204"]["tactics"], rules["bulk-8204"]["techniques"]), ([], None))
+            rows = request("/api/events", {"rules": ["bulk-8204"]})["data"]
+            self.assertEqual([r["event_id"] for r in rows], ["event-2"])
+            self.assertEqual([d["rule_id"] for d in rows[0]["detections"]], ["bulk-8204"])
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+            store.connection.close()
+            store.reviews.close()
+        self.assertEqual(hashlib.sha256(sidecar.read_bytes()).hexdigest(), before)
+
     def test_enrichment_layers_geolite2_and_neutral_jsonl_by_priority(self):
         from mmdb_writer import MMDBWriter
         from netaddr import IPSet

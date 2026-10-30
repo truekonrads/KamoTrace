@@ -214,14 +214,20 @@ def load_detections(connection, path):
         if (run["evidence_source_sha256"], run["evidence_records"]) != evidence_identity(connection):
             raise ValueError(f"{path} was built for a different evidence database; rebuild it with `kamotrace suzaku`")
         logger.info("Reading linked Suzaku detection rows")
-        rows = sidecar.execute("""SELECT source_record, rule_id, rule_title, level, level_rank, tactics, technique_ids
-            FROM detections WHERE link_status = 'linked'""").fetchall()
+        total = sidecar.execute("SELECT count(*) FROM detections WHERE link_status = 'linked'").fetchone()[0]
+        logger.info("Copying %s linked Suzaku detections into the in-memory table", format(total, ","))
+        sidecar.execute("""SELECT source_record, rule_id, rule_title, level, level_rank, tactics, technique_ids
+            FROM detections WHERE link_status = 'linked'""")
+        # Transfer bounded column batches: executemany runs an insert per detection. Typed UNNEST
+        # preserves empty/NULL lists without dependencies or ATTACH (external access may be disabled).
+        while rows := sidecar.fetchmany(8192):
+            connection.execute("""INSERT INTO detections SELECT
+                unnest(?::BIGINT[]), unnest(?::VARCHAR[]), unnest(?::VARCHAR[]),
+                unnest(?::VARCHAR[]), unnest(?::TINYINT[]), unnest(?::VARCHAR[][]), unnest(?::VARCHAR[][])
+            """, list(zip(*rows)))
     finally:
         sidecar.close()
-    logger.info("Copying %s linked Suzaku detections into the in-memory table", format(len(rows), ","))
-    if rows:
-        connection.executemany("INSERT INTO detections VALUES (?,?,?,?,?,?,?)", rows)
-    logger.info("Loaded %s linked Suzaku detections in %.1fs", format(len(rows), ","), time.monotonic() - started)
+    logger.info("Loaded %s linked Suzaku detections in %.1fs", format(total, ","), time.monotonic() - started)
     return run
 
 
