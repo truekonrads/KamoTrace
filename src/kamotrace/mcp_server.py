@@ -2,11 +2,12 @@
 
 The browser server (`kamotrace serve`) stays the single owner of the read-only evidence database and the
 annotation sidecar. This process opens neither: every tool is a call to the browser's existing
-loopback REST API, so validation, Jakarta time handling, tag/note writes and their temp-table
+loopback REST API, so validation, timezone handling, tag/note writes and their temp-table
 refresh happen in one place and the browser and agents see each other's changes.
 """
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import hashlib
 import json
 from typing import Annotated, Any, Literal
@@ -21,14 +22,14 @@ from pydantic import BaseModel, Field
 
 BASE = "http://127.0.0.1:8765"
 NEW_TAG_COLOR = "#c45436"  # Same default as the browser's quick-tag colour picker.
-JAKARTA = timezone(timedelta(hours=7))
 OPENER = build_opener(ProxyHandler({}))  # Never route loopback evidence traffic through a system proxy.
 
 mcp = MCPServer("kamotrace", instructions="""\
 Search and annotate CloudTrail evidence held by a local, read-only KamoTrace browser.
 If Suzaku detections were imported, list_detections shows Sigma rules; filter with query.rules / min_level.
 Call describe_schema first for valid fields, operators, sort fields, page sizes and time bounds.
-Times are ISO 8601 with an offset; the browser displays Asia/Jakarta (+07:00). Ranges are
+Times are ISO 8601 with an offset; query.timezone selects local display and bucket boundaries
+(default UTC). describe_schema(timezone=...) lists supported IANA zones. Ranges are
 start-inclusive, end-exclusive. Totals and sorting cover the whole filtered result, not one page.
 Identity: tags and notes attach to record_sha256 (canonical hash of the original record; identical
 duplicate records share it). `id` is the record's 1-based position in the imported source and is
@@ -55,6 +56,7 @@ class Filter(BaseModel):
 
 
 class Query(BaseModel):
+    timezone: str = Field("UTC", description="IANA timezone for time_local filters, results and histogram boundaries.")
     search: str = Field("", description="Case-insensitive substring over the raw event JSON.")
     filters: list[Filter] = Field([], description="All filters must match (AND).")
     tags: list[str] = Field([], description="Events must carry every listed tag (AND).")
@@ -67,7 +69,7 @@ class Query(BaseModel):
         None, description="Only events with a Suzaku detection at or above this Sigma level.")
 
     def body(self):
-        return {"search": self.search, "filters": [f.model_dump() for f in self.filters], "tags": self.tags,
+        return {"timezone": self.timezone, "search": self.search, "filters": [f.model_dump() for f in self.filters], "tags": self.tags,
                 "annotation_id": self.note_id, "command_key": self.command_key, "start": self.start, "end": self.end,
                 "rules": self.rules, "min_level": self.min_level}
 
@@ -119,12 +121,13 @@ def tag_summary(slug):
 
 
 @mcp.tool(annotations=READ)
-def describe_schema() -> dict[str, Any]:
+def describe_schema(timezone: str = "UTC") -> dict[str, Any]:
     """Valid filter fields, operators, sort fields, page sizes, facet values, time bounds and existing tags."""
-    meta = call("/api/meta")
-    return {"events": meta["total"], "timezone": meta["timezone"], "read_only": meta["read_only"],
-            "first_event": datetime.fromtimestamp(meta["start_ms"] / 1000, JAKARTA).isoformat(),
-            "end_exclusive": datetime.fromtimestamp(meta["end_ms"] / 1000, JAKARTA).isoformat(),
+    meta = call("/api/meta", {"timezone": timezone})
+    zone = ZoneInfo(meta["timezone"])
+    return {"events": meta["total"], "timezone": meta["timezone"], "timezones": meta["timezones"], "read_only": meta["read_only"],
+            "first_event": datetime.fromtimestamp(meta["start_ms"] / 1000, zone).isoformat(),
+            "end_exclusive": datetime.fromtimestamp(meta["end_ms"] / 1000, zone).isoformat(),
             "fields": meta["fields"], "operators": meta["operators"], "sort_fields": meta["sort_fields"],
             "page_sizes": meta["page_sizes"], "facets": meta["facets"],
             # IP enrichment is a labelled lookup (country/city/asn/isp/ip_info), not evidence.
@@ -137,7 +140,7 @@ def describe_schema() -> dict[str, Any]:
 def search_events(query: Query | None = None, sort: list[Sort] | None = None,
                   page: Annotated[int, Field(ge=1)] = 1, size: Literal[25, 50, 100, 250, 500] = 100) -> dict[str, Any]:
     """Search CloudTrail events. Returns the full filtered total and one page of rows with their
-    record_sha256, tags and linked note IDs. Default sort is newest first; time_local is Jakarta time."""
+    record_sha256, tags and linked note IDs. Default sort is newest first; time_local uses query.timezone."""
     return search(query, sort, page, size)
 
 
@@ -151,7 +154,7 @@ def summarize_field(field: str, query: Query | None = None) -> dict[str, Any]:
 @mcp.tool(annotations=READ)
 def event_histogram(bucket_minutes: Annotated[int, Field(ge=1, le=525600)] = 1440,
                     query: Query | None = None) -> dict[str, Any]:
-    """Event counts per time bucket (Jakarta-aligned, empty buckets included, at most 2,000 buckets)."""
+    """Event counts per time bucket (query.timezone-aligned, empty buckets included, at most 2,000 buckets)."""
     result = call("/api/histogram", {**(query or Query()).body(), "bucket_minutes": bucket_minutes})
     return {"bucket_minutes": result["bucket_minutes"], "total": result["total"], "buckets": result["data"]}
 
@@ -198,9 +201,9 @@ def list_notes(search: Annotated[str, Field(description="Case-insensitive text t
 
 @mcp.tool(annotations=READ)
 def get_note(id: int, page: Annotated[int, Field(ge=1)] = 1,
-             size: Literal[25, 50, 100, 250, 500] = 100) -> dict[str, Any]:
+             size: Literal[25, 50, 100, 250, 500] = 100, timezone: str = "UTC") -> dict[str, Any]:
     """One note with a page of its linked events (oldest first). Use its `updated` for edit/delete."""
-    linked = search(Query(note_id=id), [Sort(field="time_local", dir="asc")], page, size)
+    linked = search(Query(note_id=id, timezone=timezone), [Sort(field="time_local", dir="asc")], page, size)
     return {**note(id), "linked": linked}
 
 
@@ -220,7 +223,7 @@ def create_note(body: Annotated[str, Field(min_length=1, max_length=30000, descr
             except ValueError:
                 raise ToolError("Time must be an ISO timestamp with a timezone") from None
             if parsed.tzinfo is None:
-                raise ToolError("Time must include a timezone; Jakarta is +07:00")
+                raise ToolError("Time must include a timezone offset")
             return int(parsed.timestamp() * 1000)
         # Same shape the browser stores, so "Reopen query" works for agent-written notes. Unset values
         # are omitted: the browser then uses the full time range instead of reading null as epoch 0.

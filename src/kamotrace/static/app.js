@@ -12,17 +12,63 @@ let meta,
   loadingFirst = true,
   summaryRequest = 0,
   updating = false,
-  latestQuery = 0;
+  latestQuery = 0,
+  latestApply = 0;
 const number = (n) => new Intl.NumberFormat("en-US").format(n);
-const local = (ms) => new Date(ms + 7 * 3600000).toISOString().slice(0, 19);
+const local = (ms) => {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: meta.timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    })
+      .formatToParts(new Date(ms))
+      .map((p) => [p.type, p.value]),
+  );
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
+};
 const shown = (ms) => local(ms).replace("T", " ");
-const epoch = (value) => Date.parse(value + "+07:00");
-const wibTime = (value) =>
+const epoch = (value) => {
+  const wall = Date.parse(value + "Z");
+  if (!Number.isFinite(wall)) return NaN;
+  const matches = new Set();
+  for (const delta of [-86400000, 0, 86400000]) {
+    const probe = wall + delta;
+    const offset = Date.parse(local(probe) + "Z") - probe;
+    const candidate = wall - offset;
+    if (local(candidate) === value) matches.add(candidate);
+  }
+  // Reject nonexistent or ambiguous DST wall times rather than silently shifting evidence ranges.
+  return matches.size === 1 ? [...matches][0] : NaN;
+};
+const inputTime = (ms) => {
+  if (epoch(local(ms)) === ms) return shown(ms);
+  const offset = (Date.parse(local(ms) + "Z") - ms) / 60000;
+  return (
+    shown(ms) +
+    (offset < 0 ? "-" : "+") +
+    String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0") +
+    ":" +
+    String(Math.abs(offset) % 60).padStart(2, "0")
+  );
+};
+const displayTime = (value) =>
   Number.isFinite(Date.parse(value))
-    ? shown(Date.parse(value)) + " WIB"
+    ? shown(Date.parse(value)) + " " + meta.timezone
     : "Unknown time";
-// 24-hour Jakarta text input: "YYYY-MM-DD HH:MM[:SS]" (a "T" separator is also accepted).
+// Explicit offsets also allow selecting either occurrence of a repeated DST hour.
 const parseInput = (value) => {
+  if (
+    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})$/.test(
+      value.trim(),
+    )
+  )
+    return Date.parse(value.trim().replace(" ", "T"));
   const m = /^\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(:\d{2})?\s*$/.exec(value);
   return m ? epoch(`${m[1]}T${m[2]}${m[3] || ":00"}`) : NaN;
 };
@@ -73,6 +119,7 @@ function normalize(state) {
   const start = Number(s.start),
     end = Number(s.end);
   return {
+    timezone: meta.timezones.includes(s.timezone) ? s.timezone : meta.timezone,
     start: Number.isFinite(start) ? start : meta.start_ms,
     end: Number.isFinite(end) ? end : meta.end_ms,
     search: typeof s.search === "string" ? s.search : "",
@@ -93,12 +140,35 @@ function normalize(state) {
   };
 }
 
-function apply(state, push = true) {
+async function apply(state, push = true) {
+  const requestId = ++latestApply;
   const next = normalize(state);
   if (!(next.start < next.end)) {
     error("Choose a valid time range: start must be before the exclusive end.");
     return;
   }
+  if (next.timezone !== meta.timezone) {
+    try {
+      const result = await request("/api/meta", { timezone: next.timezone });
+      if (requestId !== latestApply) return;
+      meta = result;
+    } catch (e) {
+      if (requestId !== latestApply) return;
+      error(e.message);
+      $("timezone").value = meta.timezone;
+      return;
+    }
+    localStorage.setItem("timezone", meta.timezone);
+    noteEvents.clear();
+    document.querySelectorAll("dialog[open]").forEach((d) => d.close());
+    if (commandKey) openCommand(commandKey, true);
+  }
+  $("timezone").value = meta.timezone;
+  $("start").setAttribute("aria-label", `From (inclusive), ${meta.timezone}`);
+  $("end").setAttribute("aria-label", `Until (exclusive), ${meta.timezone}`);
+  $("coverage").textContent =
+    `${number(meta.total)} events · ${local(meta.start_ms).slice(0, 10)} to ${local(meta.end_ms).slice(0, 10)} ${meta.timezone}`;
+  timeline();
   if (push && JSON.stringify(next) !== JSON.stringify(applied)) {
     queryHistory.splice(historyPos + 1);
     queryHistory.push(next);
@@ -125,8 +195,9 @@ function go(step) {
 
 function query() {
   return {
-    start: local(applied.start) + "+07:00",
-    end: local(applied.end) + "+07:00",
+    timezone: applied.timezone,
+    start: new Date(applied.start).toISOString(),
+    end: new Date(applied.end).toISOString(),
     search: applied.search,
     tags: applied.tags,
     annotation_id: applied.annotation_id,
@@ -139,8 +210,8 @@ function query() {
 
 function syncInputs() {
   $("search").value = applied.search;
-  $("start").value = shown(applied.start);
-  $("end").value = shown(applied.end);
+  $("start").value = inputTime(applied.start);
+  $("end").value = inputTime(applied.end);
   updating = true;
   $("time-slider").noUiSlider.set([applied.start, applied.end]);
   updating = false;
@@ -174,7 +245,9 @@ function draftState() {
 function runDraft() {
   const d = draft();
   if (!Number.isFinite(d.start) || !Number.isFinite(d.end)) {
-    error("Times must use YYYY-MM-DD HH:MM:SS (24-hour, Jakarta).");
+    error(
+      `Use YYYY-MM-DD HH:MM:SS in ${meta.timezone}. For repeated DST times, include an offset (e.g. -04:00); nonexistent times are invalid.`,
+    );
     return;
   }
   const pending = filterEditorValue();
@@ -232,7 +305,7 @@ function renderScopes() {
     out = [];
   const full = s.start === meta.start_ms && s.end === meta.end_ms;
   out.push(
-    chip(`${shown(s.start)} → ${shown(s.end)} WIB`, {
+    chip(`${shown(s.start)} → ${shown(s.end)} ${meta.timezone}`, {
       kind: "time",
       title: full
         ? "Whole export. Click to adjust the time range."
@@ -381,8 +454,8 @@ function addFilter(field, op, value) {
 // ---- SSM commands (JSON-backed in memory; grouped by account + region + command ID) ----------
 function commandQuery() {
   return {
-    start: local(applied.start) + "+07:00",
-    end: local(applied.end) + "+07:00",
+    start: new Date(applied.start).toISOString(),
+    end: new Date(applied.end).toISOString(),
     search: $("command-search").value,
   };
 }
@@ -412,7 +485,7 @@ function sheetCell(cell) {
   const row = cell.getRow().getData();
   const value =
     cell.getField() === "requested_ms" && cell.getValue() !== null
-      ? shown(cell.getValue()) + " WIB"
+      ? shown(cell.getValue()) + " " + meta.timezone
       : cell.getValue();
   $("sheet-cell-title").textContent = cell.getColumn().getDefinition().title;
   $("sheet-cell-context").textContent =
@@ -515,7 +588,7 @@ function createCommandSheet() {
         },
         cellClick: () => {},
       }),
-      column("Requested (WIB)", "requested_ms", 150, {
+      column("Requested (local)", "requested_ms", 150, {
         formatter: (cell) => {
           const text = document.createElement("div");
           text.className = "sheet-value";
@@ -651,7 +724,7 @@ async function loadCommands(more = false) {
       button.dataset.key = row.key;
       button.setAttribute("aria-pressed", String(commandKey === row.key));
       const title = document.createElement("strong");
-      title.textContent = `${row.requested_ms === null ? "Unknown time" : shown(row.requested_ms)} WIB · ${row.status}`;
+      title.textContent = `${row.requested_ms === null ? "Unknown time" : shown(row.requested_ms)} ${meta.timezone} · ${row.status}`;
       const id = document.createElement("code");
       id.textContent = row.command_id;
       const info = document.createElement("span");
@@ -667,8 +740,8 @@ async function loadCommands(more = false) {
   }
 }
 
-async function openCommand(key) {
-  if (commandSheet) commandLayout(false);
+async function openCommand(key, keepLayout = false) {
+  if (commandSheet && !keepLayout) commandLayout(false);
   const token = ++commandDetailRequest;
   try {
     const command = await request("/api/ssm-detail", { key });
@@ -766,7 +839,7 @@ async function openCommand(key) {
           evidenceText(
             section,
             `${name} · ${detail.Status} · response ${detail.ResponseCode ?? "unknown"}`,
-            `Start: ${wibTime(detail.ExecutionStartDateTime)}\nEnd: ${wibTime(detail.ExecutionEndDateTime)}`,
+            `Start: ${displayTime(detail.ExecutionStartDateTime)}\nEnd: ${displayTime(detail.ExecutionEndDateTime)}`,
           );
           evidenceText(
             section,
@@ -802,7 +875,7 @@ async function openCommand(key) {
     for (const event of command.events) {
       const button = document.createElement("button");
       button.className = "linked-event";
-      button.textContent = `${shown(Date.parse(event.event_time))} WIB · ${event.operation} · ${event.error || "No API error"}\n${event.identity} · ${event.source_ip}\n${event.event_id} · ${event.source}`;
+      button.textContent = `${shown(Date.parse(event.event_time))} ${meta.timezone} · ${event.operation} · ${event.error || "No API error"}\n${event.identity} · ${event.source_ip}\n${event.event_id} · ${event.source}`;
       button.onclick = async () => {
         if (event.id !== null) await detail({ id: event.id });
         else {
@@ -1017,6 +1090,7 @@ async function linkedEvents(note, target) {
       noteEvents.set(
         note.id,
         await request("/api/events", {
+          timezone: meta.timezone,
           annotation_id: note.id,
           size: 25,
           sorters: [{ field: "time_local", dir: "asc" }],
@@ -1083,7 +1157,7 @@ function renderNotes() {
       title.textContent = noteTitle(note);
       const info = document.createElement("span");
       info.className = "hint";
-      info.textContent = `#${note.id} · ${number(note.events)} events · ${shown(Date.parse(note.updated)).slice(0, 16)} WIB`;
+      info.textContent = `#${note.id} · ${number(note.events)} events · ${shown(Date.parse(note.updated)).slice(0, 16)} ${meta.timezone}`;
       head.append(title, info);
       head.onclick = () => {
         if (expandedNotes.has(note.id)) expandedNotes.delete(note.id);
@@ -1601,7 +1675,8 @@ function paintSelection() {
       : `${hours.toFixed(1)} hours`;
   document.querySelectorAll("#timeline .bar").forEach((bar) => {
     const ms = Number(bar.dataset.ms);
-    bar.style.opacity = ms + 86400000 > start && ms < end ? "1" : ".22";
+    bar.style.opacity =
+      Number(bar.dataset.endMs) > start && ms < end ? "1" : ".22";
   });
 }
 
@@ -1727,7 +1802,7 @@ async function detail(row) {
     const data = await request(`/api/events/${row.id}`);
     detailRow = row.record_sha256 ? row : null;
     $("detail-id").textContent =
-      `${data.event_id} · ${row.time_local ? row.time_local + " WIB" : ""}`;
+      `${data.event_id} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
     $("detail-provenance").textContent =
       "Original DuckDB evidence JSON preserves numeric precision. Treat request/response contents as sensitive.";
     eventCommandLinks(data.ssm_commands);
@@ -1899,7 +1974,7 @@ function timeline() {
     gap = width / meta.histogram.length;
   const [svg, element] = svgBuilder(width, 46);
   meta.histogram.forEach((r, i) => {
-    const ms = epoch(r.day + "T00:00:00"),
+    const ms = r.start_ms,
       height = (r.total / max) * 32;
     const bar = element("rect", {
       x: i * gap + 1,
@@ -1908,6 +1983,7 @@ function timeline() {
       height,
       class: "bar",
       "data-ms": ms,
+      "data-end-ms": r.end_ms,
       tabindex: 0,
       role: "button",
       "aria-label": `${r.day}: ${r.total} events; select this day`,
@@ -1915,7 +1991,7 @@ function timeline() {
     const title = document.createElementNS(svg.namespaceURI, "title");
     title.textContent = `${r.day}: ${number(r.total)} events; ${r.ssm} SSM commands/sessions`;
     bar.append(title);
-    const choose = () => range(ms, ms + 86400000);
+    const choose = () => range(ms, r.end_ms);
     bar.addEventListener("click", choose);
     bar.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
@@ -1966,7 +2042,7 @@ function frequency(data, context) {
   }
   const ctx =
     context && !context.error
-      ? new Map(context.data.map((r) => [r.bucket_start_local, r.events]))
+      ? new Map(context.data.map((r) => [r.start_ms, r.events]))
       : null;
   const filteredPeak = Math.max(0, ...data.data.map((r) => r.events));
   const peak = Math.max(filteredPeak, ...(ctx ? ctx.values() : []));
@@ -2012,7 +2088,7 @@ function frequency(data, context) {
     const x = left + i * stepWidth,
       w = Math.max(0.6, stepWidth - (stepWidth > 4 ? 1 : 0));
     if (ctx) {
-      const c = ctx.get(row.bucket_start_local) || 0;
+      const c = ctx.get(row.start_ms) || 0;
       element("rect", {
         x,
         y: base - (c ? Math.max(1, scale(c)) : 0),
@@ -2032,14 +2108,12 @@ function frequency(data, context) {
       tabindex: 0,
       role: "button",
       "data-index": i,
-      "aria-label": `${row.bucket_start_local} WIB: ${row.events} events; narrow to this bucket`,
+      "aria-label": `${row.bucket_start_local} ${meta.timezone}: ${row.events} events; narrow to this bucket`,
     });
     const title = document.createElementNS(svg.namespaceURI, "title");
     title.textContent =
-      `${row.bucket_start_local} WIB: ${number(row.events)} selected events` +
-      (ctx
-        ? ` of ${number(ctx.get(row.bucket_start_local) || 0)} in context`
-        : "") +
+      `${row.bucket_start_local} ${meta.timezone}: ${number(row.events)} selected events` +
+      (ctx ? ` of ${number(ctx.get(row.start_ms) || 0)} in context` : "") +
       ` (${data.bucket_minutes} minute bucket; boundary buckets may be partial)`;
     bar.append(title);
     bar.addEventListener("keydown", (event) => {
@@ -2104,10 +2178,8 @@ function frequency(data, context) {
 }
 
 function pickBuckets(data, a, b) {
-  const start = epoch(data.data[a].bucket_start_local.replace(" ", "T"));
-  const end =
-    epoch(data.data[b].bucket_start_local.replace(" ", "T")) +
-    data.bucket_minutes * 60000;
+  const start = data.data[a].start_ms;
+  const end = data.data[b].end_ms;
   range(Math.max(start, applied.start), Math.min(end, applied.end));
 }
 
@@ -2211,6 +2283,16 @@ function noteCell(cell) {
 
 async function init() {
   meta = await request("/api/meta");
+  const preferred = localStorage.getItem("timezone");
+  if (meta.timezones.includes(preferred))
+    meta = await request("/api/meta", { timezone: preferred });
+  for (const zone of meta.timezones)
+    $("timezone").append(new Option(zone, zone));
+  $("timezone").value = meta.timezone;
+  $("start").setAttribute("aria-label", `From (inclusive), ${meta.timezone}`);
+  $("end").setAttribute("aria-label", `Until (exclusive), ${meta.timezone}`);
+  $("timezone").onchange = () =>
+    apply({ ...applied, timezone: $("timezone").value });
   applied = normalize({});
   queryHistory.push(applied);
   historyPos = 0;
@@ -2369,7 +2451,7 @@ async function init() {
     }
   };
   $("coverage").textContent =
-    `${number(meta.total)} events · ${local(meta.start_ms).slice(0, 10)} to ${local(meta.end_ms).slice(0, 10)} WIB`;
+    `${number(meta.total)} events · ${local(meta.start_ms).slice(0, 10)} to ${local(meta.end_ms).slice(0, 10)} ${meta.timezone}`;
   timeline();
   noUiSlider.create($("time-slider"), {
     start: [meta.start_ms, meta.end_ms],
@@ -2386,8 +2468,8 @@ async function init() {
     ],
   });
   $("time-slider").noUiSlider.on("slide", (values) => {
-    $("start").value = shown(Number(values[0]));
-    $("end").value = shown(Number(values[1]));
+    $("start").value = inputTime(Number(values[0]));
+    $("end").value = inputTime(Number(values[1]));
     paintSelection();
   });
   $("time-slider").noUiSlider.on("change", (values) => {
@@ -2524,6 +2606,7 @@ async function init() {
           ),
           $("show-context").checked
             ? request("/api/histogram", {
+                timezone: selection.timezone,
                 start: selection.start,
                 end: selection.end,
                 bucket_minutes,
@@ -2634,7 +2717,7 @@ async function init() {
         headerTooltip: "Suzaku detections: most severe level and match count",
         formatter: detectionCell,
       },
-      textColumn("Time (WIB)", "time_local", 150),
+      textColumn("Local time", "time_local", 150),
       textColumn("Operation", "event_name", 180),
       textColumn("AWS service", "event_source", 170),
       textColumn("Identity", "identity", 330),

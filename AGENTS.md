@@ -89,7 +89,7 @@ only reads them.
 - Keep loopback binding, Host/Origin checks, CSP, parameter binding and sort/field
   allowlists. Do not introduce an arbitrary-SQL, arbitrary-path or network-fetch
   endpoint. Server startup paths come from CLI arguments, not browser requests.
-- All displayed time and bucket boundaries use Asia/Jakarta (UTC+7); ranges are
+- Displayed time and bucket boundaries use the selected IANA timezone (default UTC); ranges are
   start-inclusive/end-exclusive. Counts, sorting and prevalence apply to the
   entire filtered selection, not just loaded rows. SSM search matches commands
   and keeps their system/plugin results together.

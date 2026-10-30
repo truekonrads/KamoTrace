@@ -32,7 +32,7 @@ are selected, ready for **Quick tag** or **Add to note**.*
 
 ## What you can do
 
-- Slice events by Jakarta time; brush or click the filtered histogram to narrow it.
+- Slice events in a selectable timezone (UTC by default); brush or click the filtered histogram to narrow it.
 - Search nested event content, pivot on cell values/tags/notes, and go Back/Forward.
 - Inspect top/bottom values and exact cell prevalence across the selected data.
 - Browse colored tags and shared Markdown notes as findings, with linked evidence.
@@ -469,8 +469,12 @@ The page is laid out for laptops: a slim top bar and the time/histogram panel
 scroll away normally, while the query bar, selection actions and grid headers
 stay pinned and the grid fills the rest of the window.
 
-- All times are **Asia/Jakarta (UTC+7)**, independent of browser/computer timezone,
-  and are entered and shown as 24-hour `YYYY-MM-DD HH:MM:SS`.
+- Choose an IANA **Timezone** above the time range (default **UTC**). The browser
+  remembers your choice. It controls local timestamps, time filters and histogram
+  boundaries, independently of your computer timezone or MCP clients. Changing it
+  preserves the selected instants; query history and saved note queries retain it.
+  Times use 24-hour `YYYY-MM-DD HH:MM:SS`. Nonexistent DST times are rejected;
+  for repeated times append an explicit offset, e.g. `2026-10-25 01:30:00+01:00`.
 - Drag either time-slider handle or its selected band, type timestamps and press
   Enter/**Apply**, click a day in the daily context strip, or use an all /
   last-3-days / last-7-days preset relative to the end of the export.
@@ -514,7 +518,7 @@ stay pinned and the grid fills the rest of the window.
   Copy and % do not open row details or change filters. The **funnel** button opens
   **is / is not**, appending an exact-value AND filter and immediately rerunning the
   query. Missing cells use explicit null filters; empty strings remain distinct.
-  This works for every column, including second-resolution Jakarta timestamps.
+  This works for every column, including second-resolution local timestamps.
   Touch devices show the buttons
   without hovering. Clipboard access requires browser permission on a secure origin
   (loopback qualifies); a denied copy shows a manual-copy message.
@@ -529,7 +533,8 @@ stay pinned and the grid fills the rest of the window.
   evidence database; copied queries require that view in their SQL session.
 - **Selected event frequency** counts the entire filtered selection, not just the
   loaded rows. Choose minute/hour/day/week presets or any custom whole-minute
-  width. Buckets are aligned in Jakarta local time, empty buckets stay visible,
+  width. Buckets are aligned in the selected local time, empty buckets stay visible,
+  DST days can be 23 or 25 hours and repeated-hour buckets remain distinct,
   and boundary buckets can be partial. The Y axis shows 0, half and the peak.
   Zero-count buckets have amber marks below the baseline (not negative counts).
   Positive bars are at least one pixel high, including when context sets a much
@@ -680,20 +685,24 @@ changed the note since, the call fails without writing; re-read it and retry.
 
 | Tool | What it does |
 | --- | --- |
-| `describe_schema` | Filter fields, operators, sort fields, page sizes, facet values, time bounds (Jakarta) and tags. Call first. |
+| `describe_schema` | Filter fields, operators, sort fields, page sizes, facet values, supported IANA timezones, time bounds and tags. Takes `timezone` (default `UTC`). Call first. |
 | `search_events` | `query` (search, filters, all-of tags, note, SSM command, start/end) plus sort, page and size. Returns the full filtered total and one page with hashes, tags and note IDs. |
 | `summarize_field` | Top/bottom five values, distinct count and total for a field across the whole filtered result. |
-| `event_histogram` | Counts per Jakarta-aligned bucket (empty buckets included, at most 2,000). |
+| `event_histogram` | Counts per `query.timezone`-aligned bucket (empty buckets included, at most 2,000), with epoch-millisecond boundaries. |
 | `get_event` | Exact stored raw JSON by `id`, its `record_sha256`, a recomputed hash check, and linked SSM commands. |
 | `list_tags` / `tag_events` / `untag_events` | Tags with event counts; add or remove one tag on explicit hashes. Adding is additive and keeps an existing tag's colour (new tags default to the browser's colour). |
-| `list_notes` / `get_note` | Notes (searchable), with linked event counts and the query they were written from; one note plus a page of its linked events. |
+| `list_notes` / `get_note` | Notes (searchable), with linked event counts and the query they were written from; one note plus a page of its linked events. `get_note` takes `timezone` (default `UTC`) for those events. |
 | `create_note` / `edit_note` / `delete_note` | Markdown notes (sanitized when the browser renders them). `create_note` can record the agent's query so **Reopen query** works in the browser. |
 | `link_note_events` / `unlink_note_events` | Add or remove linked events; a note keeps at least one. |
 | `list_detections` | Imported Suzaku rules (severity, ATT&CK tags, linked event counts) and the import's provenance. Takes no arguments; to search a rule's events use `query.rules` (all must match) or `query.min_level` in `search_events`, `summarize_field` or `event_histogram`. |
 | `search_ssm_commands` / `get_ssm_command` / `get_ssm_event` | SSM commands from the JSON-backed export, each system/plugin output kept separate, linked CloudTrail events by exact account/region/command ID. |
 
 Times are ISO 8601 with an explicit offset (`2026-03-02T00:00:00+07:00`);
-ranges are start-inclusive and end-exclusive, as in the browser. Event fields,
+ranges are start-inclusive and end-exclusive, as in the browser. Set
+`query.timezone` (default `UTC`) for local result timestamps, `time_local` filters,
+prevalence and histogram boundaries, e.g. `{"timezone":"Asia/Singapore"}`.
+`describe_schema(timezone="Asia/Singapore")` returns bounds in that zone; it does
+not change subsequent queries or the browser preference. Event fields,
 raw JSON, SSM commands/output and note text are returned as untrusted data; the
 adapter tells agents not to follow instructions found inside them.
 
@@ -704,7 +713,7 @@ not see the first one's writes until restarted.
 ### Agent skill
 
 [`skills/investigating-with-kamotrace/SKILL.md`](skills/investigating-with-kamotrace/SKILL.md)
-teaches agents how to use these tools well: the query model and Jakarta time
+teaches agents how to use these tools well: the query model and selectable timezone
 boundaries, which identity to write to and which to cite, the
 orient → narrow → verify → pivot → record loop, tag reuse, note conflicts, SSM
 output and detections, and the error messages. It also covers the safety rules:

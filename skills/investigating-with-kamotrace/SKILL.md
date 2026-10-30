@@ -104,9 +104,14 @@ takes the same `query` object. **Everything combines with AND.**
 - `rules` (Suzaku rule IDs, from `list_detections`), all of which must match;
   `min_level` is at least that Sigma level.
 - **Time:** ISO 8601 **with an offset**. `start` is inclusive and `end` is
-  exclusive. The analyst reads Asia/Jakarta time (+07:00), and `time_local` in
-  results is Jakarta time, so use `+07:00` days: a Jakarta day is
-  `[D T00:00:00+07:00, D+1 T00:00:00+07:00)`, which is not the same as the UTC day.
+  exclusive. Set `query.timezone` to an IANA zone (default `UTC`), such as
+  `{"timezone":"Asia/Singapore"}`. It controls `time_local` results/filters,
+  prevalence and histogram boundaries. Call `describe_schema(timezone="Asia/Singapore")`
+  for bounds in that zone and supported `timezones`; this does not set a global
+  preference. Pass the zone on each query. The browser chooses independently.
+  A Singapore day is `[D T00:00:00+08:00, D+1 T00:00:00+08:00)`.
+  DST offsets can differ between start and end. Histogram `start_ms`/`end_ms`
+  are exact instants; use them when pivoting, especially during repeated hours.
 - Totals, sorting, prevalence and histograms always cover the **whole filtered
   result**, not just the page you fetched. The default sort is newest first.
   Pages hold 25/50/100/250/500 rows, and `last_page` tells you when to stop.
@@ -133,7 +138,7 @@ takes the same `query` object. **Everything combines with AND.**
 6. **Record.** Tag the specific events (see below) and write a note that links
    them, with the query that produced them.
 7. **Report** to the analyst: what you found, and what is observed versus
-   inferred. Cite Jakarta time, `event_id` and `record_sha256`, and name the
+   inferred. Cite local time with its timezone, `event_id` and `record_sha256`, and name the
    tags and note IDs you created.
 
 ## Tags
@@ -152,13 +157,15 @@ takes the same `query` object. **Everything combines with AND.**
 
 - Notes are Markdown findings linked to one or more events. The browser renders
   them sanitized. Write for the analyst: a short title line, what happened,
-  evidence (`event_id`, Jakarta time, actor, source), what is inferred, and next
+  evidence (`event_id`, time with timezone, actor, source), what is inferred, and next
   steps. Start agent-written notes with something like
   `**Agent note**` so the analyst can tell who wrote them.
 - `create_note(body, hashes, query?)`: pass the `query` you used, so the
   analyst can reopen exactly that result from the note in the browser.
 - `list_notes(search)` finds notes. `get_note(id)` returns the note, its
-  current `updated` stamp and a page of its linked events.
+  current `updated` stamp and a page of its linked events. Set
+  `get_note(id, timezone="Asia/Singapore")` to display those events in that zone
+  (default `UTC`).
 - `edit_note` and `delete_note` need the current `updated` value. If someone
   else changed the note since (for example the analyst, in the browser), the
   call fails and nothing is changed: re-read with `get_note`, merge, and retry.
@@ -201,6 +208,7 @@ Available only when the analyst loaded an SSM export.
 | `Cannot reach the CloudTrail browser` | Ask the analyst to start `kamotrace serve` (and check the port) |
 | `Unknown filter field or operator` | Re-check `describe_schema().fields` / `operators` |
 | `Time must include a timezone` | Add an offset, e.g. `+07:00` |
+| `Unknown timezone` | Choose an IANA name from `describe_schema().timezones`, e.g. `UTC` or `Asia/Singapore` |
 | `Tags must be lowercase hyphen-separated slugs` | Fix the slug, e.g. `Lateral Movement` → `lateral-movement` |
 | `Unknown event hash` | Use `record_sha256` from results, not `id` or `event_id` |
 | `This note changed since it was loaded` | `get_note`, merge your change into the current text, retry with the new `updated` |

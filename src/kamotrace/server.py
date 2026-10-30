@@ -1,6 +1,6 @@
 """Local, read-only CloudTrail browser. Run with: kamotrace serve --database events.duckdb"""
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -12,13 +12,14 @@ import sqlite3
 import threading
 import time
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, available_timezones
 
 import duckdb
 
 
 ROOT = Path(__file__).resolve().parent
 FIELDS = {
-    "time_local": "Time (WIB)",
+    "time_local": "Local time",
     "event_name": "Operation", "event_source": "AWS service", "identity": "Identity",
     "source_ip": "Source IP", "country": "Country", "key_id": "Access key ID",
     "target": "Target instance", "error_code": "Error code", "identity_type": "Identity type",
@@ -30,6 +31,14 @@ SORT_FIELDS = {*FIELDS, "time_local", "id"}
 OPERATORS = {"eq", "neq", "in", "contains", "not_contains", "empty", "not_empty", "missing", "not_missing"}
 PAGE_SIZES = (25, 50, 100, 250, 500)
 LEVELS = ("informational", "low", "medium", "high", "critical")  # Suzaku/Sigma severity order
+TIMEZONES = sorted(available_timezones() - {"localtime"})
+
+
+def query_timezone(body):
+    zone = body.get("timezone", "UTC")
+    if not isinstance(zone, str) or zone not in TIMEZONES:
+        raise ValueError("Unknown timezone; choose an IANA timezone from metadata.timezones")
+    return zone
 
 
 def parse_time(value):
@@ -38,13 +47,14 @@ def parse_time(value):
     except (AttributeError, TypeError, ValueError):
         raise ValueError("Time must be an ISO timestamp with a timezone") from None
     if parsed.tzinfo is None:
-        raise ValueError("Time must include a timezone; Jakarta is +07:00")
+        raise ValueError("Time must include a timezone offset")
     return parsed
 
 
 def build_query(body):
     """Only allowlisted SQL fragments; all user values remain bound parameters."""
-    conditions, params = [], []
+    conditions, params = [], [query_timezone(body)]
+    source = "(SELECT * REPLACE (strftime(event_time AT TIME ZONE ?, '%Y-%m-%d %H:%M:%S') AS time_local) FROM browse_events)"
     start, end = body.get("start"), body.get("end")
     if start:
         parse_time(start)
@@ -135,8 +145,8 @@ def build_query(body):
     where = "\nWHERE " + "\n  AND ".join(conditions) if conditions else ""
     sql = ("SELECT id, record_sha256, time_local, event_name, event_source, identity, source_ip, country,\n"
            "       identity_type, key_id, target, document_name, error_code, region, isp, city, asn, ip_info, user_agent, event_id\n"
-           "FROM browse_events" + where + "\nORDER BY " + ", ".join(ordering) + "\nLIMIT ? OFFSET ?")
-    return sql, params + [size, (page - 1) * size], "SELECT count(*) FROM browse_events" + where, params, size
+           "FROM " + source + where + "\nORDER BY " + ", ".join(ordering) + "\nLIMIT ? OFFSET ?")
+    return sql, params + [size, (page - 1) * size], "SELECT count(*) FROM " + source + where, params, size
 
 
 class Store:
@@ -180,7 +190,7 @@ class Store:
         self.connection.execute("""
             CREATE TEMP VIEW browse_events AS
             SELECT e.source_record AS id, e.record_sha256, e.event_id, e.event_time,
-                strftime(e.event_time AT TIME ZONE 'Asia/Jakarta', '%Y-%m-%d %H:%M:%S') AS time_local,
+                strftime(e.event_time AT TIME ZONE 'UTC', '%Y-%m-%d %H:%M:%S') AS time_local,
                 e.event_source, e.event_name, e.source_ip, e.identity_type,
                 coalesce(e.identity_arn, e.user_identity->>'$.userName',
                     e.user_identity->>'$.principalId', e.user_identity->>'$.invokedBy', '(unattributed)') AS identity,
@@ -311,13 +321,18 @@ class Store:
         names = [column[0] for column in result.description]
         return [dict(zip(names, row)) for row in result.fetchall()]
 
-    def metadata(self):
+    def metadata(self, body=None):
+        zone = query_timezone(body or {})
         bounds = self.rows("""SELECT count(*) AS total, min(epoch_ms(event_time)) AS start_ms,
             max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""")[0]
-        histogram = self.rows("""SELECT strftime(event_time AT TIME ZONE 'Asia/Jakarta', '%Y-%m-%d') AS day,
+        histogram = self.rows("""SELECT strftime(event_time AT TIME ZONE ?, '%Y-%m-%d') AS day,
             count(*) AS total, count(*) FILTER (WHERE event_source='ssm.amazonaws.com'
             AND event_name IN ('SendCommand','StartSession')) AS ssm
-            FROM browse_events GROUP BY 1 ORDER BY 1""")
+            FROM browse_events GROUP BY 1 ORDER BY 1""", [zone])
+        for row in histogram:
+            day = datetime.fromisoformat(row["day"]).replace(tzinfo=ZoneInfo(zone))
+            row["start_ms"] = int(day.timestamp() * 1000)
+            row["end_ms"] = int((day + timedelta(days=1)).timestamp() * 1000)
         facets = {field: [r["value"] for r in self.rows(
             f"SELECT DISTINCT {field} AS value FROM browse_events WHERE {field} IS NOT NULL ORDER BY 1")]
             for field in ("event_name", "event_source", "country", "identity_type", "error_code", "document_name")}
@@ -325,7 +340,11 @@ class Store:
                 "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
                 "levels": LEVELS, "detections_loaded": self.suzaku_run is not None,
                 "enrichment": self.enrichment_run,
-                "timezone": "Asia/Jakarta", "database": "cloudtrail.duckdb", "read_only": True}
+                "timezone": zone, "timezones": TIMEZONES, "database": "cloudtrail.duckdb", "read_only": True}
+
+    def timezone_metadata(self, body):
+        with self.lock:
+            return self.metadata(body)
 
     def query(self, body):
         sql, params, count_sql, count_params, size = build_query(body)
@@ -342,6 +361,7 @@ class Store:
                 "sql": sql, "params": params, "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
     def histogram(self, body):
+        zone = query_timezone(body)
         width = body.get("bucket_minutes", 1440)
         if not str(width).isdigit() or not 1 <= int(width) <= 525600:
             raise ValueError("Bucket width must be 1 to 525,600 whole minutes")
@@ -351,24 +371,37 @@ class Store:
         _, _, count_sql, params, _ = build_query({**body, "start": start, "end": end})
         if (parse_time(end) - parse_time(start)).total_seconds() / (minutes * 60) > 2000:
             raise ValueError("More than 2,000 buckets: choose a larger bucket or a shorter time range")
-        interval = f"{minutes} minutes"
-        # Bucket the local timestamp, not UTC, so daily boundaries are Jakarta midnight.
-        # generate_series keeps empty buckets visible; the matching CTE uses exactly the grid filters.
+        # Enumerate wall-clock boundaries, retaining both folds and skipping nonexistent times.
+        # Sorting their real instants gives 23/25-hour days and distinct repeated-hour buckets.
+        tz = ZoneInfo(zone)
+        first, until = parse_time(start), parse_time(end)
+        step = timedelta(minutes=minutes)
+        anchor = datetime(2000, 1, 3)  # Same Monday origin as DuckDB time_bucket for minute intervals.
+        low = first.astimezone(tz).replace(tzinfo=None) - timedelta(days=2)
+        high = until.astimezone(tz).replace(tzinfo=None) + timedelta(days=2) + step
+        wall = anchor + ((low - anchor) // step) * step
+        edges = set()
+        while wall <= high:
+            for fold in (0, 1):
+                instant = wall.replace(tzinfo=tz, fold=fold)
+                if instant.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None) == wall:
+                    edges.add(int(instant.timestamp() * 1000))
+            wall += step
+        edges = sorted(edges)
+        ranges = [(a, b) for a, b in zip(edges, edges[1:])
+                  if a < until.timestamp() * 1000 and b > first.timestamp() * 1000]
+        if len(ranges) > 2000:
+            raise ValueError("More than 2,000 buckets: choose a larger bucket or a shorter time range")
         sql = """WITH matching AS (
-        """ + count_sql.replace("SELECT count(*)", "SELECT event_time", 1) + """
-        ), counts AS (
-            SELECT time_bucket(?::INTERVAL, event_time AT TIME ZONE 'Asia/Jakarta') AS bucket,
-                   count(*) AS events FROM matching GROUP BY 1
+        """ + count_sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS event_ms", 1) + """
         ), buckets AS (
-            SELECT bucket FROM generate_series(
-                time_bucket(?::INTERVAL, ?::TIMESTAMPTZ AT TIME ZONE 'Asia/Jakarta'),
-                time_bucket(?::INTERVAL, (?::TIMESTAMPTZ - INTERVAL '1 microsecond') AT TIME ZONE 'Asia/Jakarta'),
-                ?::INTERVAL) AS series(bucket)
+            SELECT unnest(?::BIGINT[]) AS start_ms, unnest(?::BIGINT[]) AS end_ms
         )
-        SELECT strftime(b.bucket, '%Y-%m-%d %H:%M:%S') AS bucket_start_local,
-               coalesce(c.events, 0) AS events
-        FROM buckets b LEFT JOIN counts c USING (bucket) ORDER BY b.bucket"""
-        bound = params + [interval, interval, start, interval, end, interval]
+        SELECT strftime(make_timestamptz(b.start_ms * 1000) AT TIME ZONE ?, '%Y-%m-%d %H:%M:%S') AS bucket_start_local,
+               b.start_ms, b.end_ms, count(m.event_ms) AS events
+        FROM buckets b LEFT JOIN matching m ON m.event_ms >= b.start_ms AND m.event_ms < b.end_ms
+        GROUP BY b.start_ms, b.end_ms ORDER BY b.start_ms"""
+        bound = params + [[a for a, _ in ranges], [b for _, b in ranges], zone]
         with self.lock:
             rows = self.rows(sql, bound)
         return {"data": rows, "total": sum(r["events"] for r in rows),
@@ -491,7 +524,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return
-        if self.path not in ("/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event"):
+        if self.path not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -501,7 +534,7 @@ class Handler(SimpleHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object")
-            operation = {"/api/events": self.store.query, "/api/histogram": self.store.histogram,
+            operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]

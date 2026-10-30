@@ -198,9 +198,20 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual(await tool("list_detections"), {"run": None, "rules": []})
                 schema = await tool("describe_schema")
                 self.assertIn("not_missing", schema["operators"])
-                self.assertEqual(schema["first_event"], "2026-10-24T23:59:59+07:00")
+                self.assertEqual(schema["timezone"], "UTC")
+                self.assertEqual(schema["first_event"], "2026-10-24T16:59:59+00:00")
+                singapore = await tool("describe_schema", timezone="Asia/Singapore")
+                self.assertEqual(singapore["first_event"], "2026-10-25T00:59:59+08:00")
+                self.assertIn("America/New_York", singapore["timezones"])
+                local_query = {"timezone": "Asia/Singapore", "filters": [
+                    {"field": "time_local", "op": "eq", "value": "2026-10-25 00:59:59"}]}
+                local_result = await tool("search_events", query=local_query)
+                self.assertEqual([e["event_id"] for e in local_result["events"]], ["event-0"])
+                self.assertEqual((await tool("summarize_field", field="time_local", query=local_query))["top"],
+                                 [{"value": "2026-10-25 00:59:59", "events": 1}])
+                self.assertEqual((await tool("event_histogram", query=local_query))["total"], 1)
                 # Jakarta day 2026-10-25: 16:59:59Z is inside, 17:00:00Z is the exclusive end.
-                day = {"start": "2026-10-25T00:00:00+07:00", "end": "2026-10-26T00:00:00+07:00",
+                day = {"timezone": "Asia/Jakarta", "start": "2026-10-25T00:00:00+07:00", "end": "2026-10-26T00:00:00+07:00",
                        "filters": [{"field": "event_name", "op": "eq", "value": "SendCommand"}]}
                 found = await tool("search_events", query=day, sort=[{"field": "time_local", "dir": "asc"}])
                 self.assertEqual((found["total"], [e["event_id"] for e in found["events"]]), (2, ["event-2", "event-3"]))
@@ -219,6 +230,7 @@ class BrowserContract(unittest.TestCase):
                 listed = {n["id"]: n for n in rest("/api/reviews")["annotations"]}[created["id"]]
                 start_ms = datetime(2026, 10, 24, 17, tzinfo=timezone.utc).timestamp() * 1000
                 self.assertEqual((listed["body"], listed["context"]["start"], listed["events"]), ("Agent **note**", start_ms, 1))
+                self.assertEqual(listed["context"]["timezone"], "Asia/Jakarta")
                 edited = await tool("edit_note", id=created["id"], body="Edited", updated=created["updated"])
                 stale = await tool("edit_note", id=created["id"], body="Lost update", updated=created["updated"])
                 self.assertEqual(stale[0], "error")
@@ -230,13 +242,17 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual((await tool("unlink_note_events", id=created["id"], hashes=hashes[:1]))[0], "error")
                 note = await tool("get_note", id=created["id"])
                 self.assertEqual((note["body"], note["linked"]["total"], note["updated"]), ("Edited", 1, unlinked["updated"]))
+                singapore_note = await tool("get_note", id=created["id"], timezone="Asia/Singapore")
+                self.assertEqual(singapore_note["linked"]["events"][0]["time_local"], "2026-10-25 09:02:03")
                 self.assertGreater(unlinked["updated"], edited["updated"])
 
                 for name, arguments, message in (
                         ("search_events", {"query": {"filters": [{"field": "raw_event", "op": "eq"}]}}, "Unknown filter field"),
                         ("search_events", {"size": 7}, ""), ("tag_events", {"tag": "Bad Tag", "hashes": hashes}, "lowercase"),
                         ("tag_events", {"tag": "x", "hashes": ["not-an-event"]}, "Unknown event hash"),
-                        ("search_events", {"query": {"start": "2026-10-25T00:00:00"}}, "timezone")):
+                        ("search_events", {"query": {"start": "2026-10-25T00:00:00"}}, "timezone"),
+                        ("describe_schema", {"timezone": "not/a-zone"}, "Unknown timezone"),
+                        ("search_events", {"query": {"timezone": "not/a-zone"}}, "Unknown timezone")):
                     result = await tool(name, **arguments)
                     self.assertEqual(result[0], "error", (name, arguments))
                     self.assertIn(message, result[1])
@@ -518,7 +534,7 @@ class BrowserContract(unittest.TestCase):
             self.assertEqual(self.call("/api/ssm-sheet", body)[0], 400)
 
     def test_time_slice_and_full_dataset_sort_pagination(self):
-        body = {"start": "2026-10-25T00:00:00+07:00", "end": "2026-10-26T00:00:00+07:00",
+        body = {"timezone": "Asia/Jakarta", "start": "2026-10-25T00:00:00+07:00", "end": "2026-10-26T00:00:00+07:00",
                 "sorters": [{"field": "time_local", "dir": "asc"}]}
         status, data = self.call("/api/events", body)
         self.assertEqual(status, 200)
@@ -529,7 +545,10 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(empty["data"], [])
         self.assertEqual(empty["last_row"], 3)
         _, meta = self.call("/api/meta")
-        self.assertEqual([r["total"] for r in meta["histogram"]], [1, 3, 1])
+        self.assertEqual(meta["timezone"], "UTC")
+        self.assertEqual([r["total"] for r in meta["histogram"]], [2, 3])
+        _, local_meta = self.call("/api/meta", {"timezone": "Asia/Jakarta"})
+        self.assertEqual([r["total"] for r in local_meta["histogram"]], [1, 3, 1])
 
     def test_combined_filters_and_literal_search(self):
         filters = [{"field": "event_name", "op": "in", "value": "SendCommand, StartSession"},
@@ -565,7 +584,7 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(self.call("/api/events/999999")[0], 404)
 
     def test_column_frequencies_use_full_filtered_selection(self):
-        body = {"field": "event_name", "start": "2026-10-25T00:00:00+07:00",
+        body = {"timezone": "Asia/Jakarta", "field": "event_name", "start": "2026-10-25T00:00:00+07:00",
                 "end": "2026-10-26T00:00:00+07:00", "search": "I-EXAMPLE",
                 "filters": [{"field": "country", "op": "eq", "value": "Germany"}],
                 "page": 2, "size": 25}
@@ -596,7 +615,7 @@ class BrowserContract(unittest.TestCase):
             ("error_code", "neq", "", 5),
             ("error_code", "missing", "", 5),
             ("error_code", "not_missing", "", 0),
-            ("time_local", "eq", "2026-10-25 00:00:00", 1),
+            ("time_local", "eq", "2026-10-24 17:00:00", 1),
         ]:
             with self.subTest(field=field, op=op, value=value):
                 status, data = self.call("/api/events", {"filters": [
@@ -622,21 +641,56 @@ class BrowserContract(unittest.TestCase):
                          {"total": 0, "events": 0})
         self.assertEqual(self.call("/api/column-values", {**body, "value": []})[0], 400)
 
+    def test_timezone_selection_and_dst_bucket_ranges(self):
+        for zone, local in (("UTC", "2026-10-24 16:59:59"),
+                            ("Asia/Singapore", "2026-10-25 00:59:59"),
+                            ("Asia/Kathmandu", "2026-10-24 22:44:59")):
+            body = {"timezone": zone, "filters": [{"field": "time_local", "op": "eq", "value": local}]}
+            status, result = self.call("/api/events", body)
+            self.assertEqual(status, 200, result)
+            self.assertEqual([r["event_id"] for r in result["data"]], ["event-0"])
+            self.assertEqual(self.call("/api/column-values", {**body, "field": "time_local", "value": local}),
+                             (200, {"total": 1, "events": 1}))
+        for endpoint in ("/api/events", "/api/histogram", "/api/column-values", "/api/meta"):
+            for bad in ("not/a-zone", "UTC'; DROP TABLE events; --", None, []):
+                self.assertEqual(self.call(endpoint, {"timezone": bad, "field": "time_local"})[0], 400)
+
+        zone = "Europe/London"
+        body = {"timezone": zone, "start": "2026-10-25T00:30:00Z", "end": "2026-10-25T01:45:00Z",
+                "bucket_minutes": 60}
+        status, histogram = self.call("/api/histogram", body)
+        self.assertEqual(status, 200, histogram)
+        self.assertEqual([r["bucket_start_local"] for r in histogram["data"]], ["2026-10-25 01:00:00"] * 2)
+        self.assertEqual([r["events"] for r in histogram["data"]], [0, 1])
+        self.assertEqual([r["start_ms"] for r in histogram["data"]], [1792886400000, 1792890000000])
+        for row in histogram["data"]:
+            bounds = {k: datetime.fromtimestamp(row[k + "_ms"] / 1000, timezone.utc).isoformat()
+                      for k in ("start", "end")}
+            self.assertEqual(self.call("/api/events", {"timezone": zone, **bounds})[1]["last_row"], row["events"])
+        for start, end, hours, total in (("2026-03-29T00:00:00Z", "2026-03-29T23:00:00Z", 23, 0),
+                                         ("2026-10-24T23:00:00Z", "2026-10-26T00:00:00Z", 25, 3)):
+            _, daily = self.call("/api/histogram", {"timezone": zone, "start": start, "end": end})
+            self.assertEqual(len(daily["data"]), 1)
+            row = daily["data"][0]
+            self.assertEqual((row["end_ms"] - row["start_ms"]) / 3600000, hours)
+            self.assertEqual(row["events"], total)
+
     def test_histogram_uses_all_filters_local_buckets_and_zero_fills(self):
-        body = {"start": "2026-10-25T00:00:00+07:00", "end": "2026-10-27T00:00:00+07:00",
+        body = {"timezone": "Asia/Jakarta", "start": "2026-10-25T00:00:00+07:00", "end": "2026-10-27T00:00:00+07:00",
                 "bucket_minutes": 1440, "filters": [
                     {"field": "event_name", "op": "in", "value": "SendCommand,StartSession"},
                     {"field": "country", "op": "eq", "value": "Germany"}]}
         status, daily = self.call("/api/histogram", body)
         self.assertEqual(status, 200)
-        self.assertEqual(daily["data"], [
+        self.assertEqual([{k: r[k] for k in ("bucket_start_local", "events")} for r in daily["data"]], [
             {"bucket_start_local": "2026-10-25 00:00:00", "events": 2},
             {"bucket_start_local": "2026-10-26 00:00:00", "events": 0}])
         self.assertEqual(daily["total"], 2)
         _, custom = self.call("/api/histogram", {
+            "timezone": "Asia/Jakarta",
             "start": "2026-10-25T08:00:00+07:00", "end": "2026-10-25T11:00:00+07:00",
             "bucket_minutes": 90})
-        self.assertEqual(custom["data"], [
+        self.assertEqual([{k: r[k] for k in ("bucket_start_local", "events")} for r in custom["data"]], [
             {"bucket_start_local": "2026-10-25 07:30:00", "events": 1},
             {"bucket_start_local": "2026-10-25 09:00:00", "events": 0},
             {"bucket_start_local": "2026-10-25 10:30:00", "events": 0}])

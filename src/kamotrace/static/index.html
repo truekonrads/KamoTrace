@@ -100,14 +100,17 @@
         <section class="time-panel" aria-label="Time range and histograms">
           <div class="time-row">
             <strong>Time</strong>
-            <span class="hint">WIB · UTC+7 · [from, until)</span>
+            <label
+              >Timezone<select id="timezone" aria-label="Timezone"></select
+            ></label>
+            <span class="hint">[from, until)</span>
             <label
               >From<input
                 id="start"
                 class="time-input"
                 spellcheck="false"
                 placeholder="YYYY-MM-DD HH:MM:SS"
-                aria-label="From (inclusive), Jakarta time"
+                aria-label="From (inclusive), UTC"
             /></label>
             <label
               >until<input
@@ -115,7 +118,7 @@
                 class="time-input"
                 spellcheck="false"
                 placeholder="YYYY-MM-DD HH:MM:SS"
-                aria-label="Until (exclusive), Jakarta time"
+                aria-label="Until (exclusive), UTC"
             /></label>
             <button id="apply-time">Apply</button>
             <span id="range-duration" class="hint"></span>
@@ -330,12 +333,13 @@
             <details>
               <summary>Coverage and limitations</summary>
               <p class="hint">
-                The time range above filters command requested time (WIB).
-                CloudTrail field/tag filters do not apply here. Output is
-                collected evidence, may be truncated, and is never executed.
-                Spreadsheet: one row per system/plugin output record; commands
-                repeat for each system and search keeps a command's systems
-                together. Click a cell to read/copy its full value.
+                The time range above filters command requested time in the
+                selected timezone. CloudTrail field/tag filters do not apply
+                here. Output is collected evidence, may be truncated, and is
+                never executed. Spreadsheet: one row per system/plugin output
+                record; commands repeat for each system and search keeps a
+                command's systems together. Click a cell to read/copy its full
+                value.
               </p>
               <ul id="command-limitations"></ul>
             </details>
