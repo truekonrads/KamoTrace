@@ -25,8 +25,9 @@ and tags are saved in a separate sidecar.
 *A synthetic case from the [end-to-end example](#end-to-end-example). The query
 is scoped to the attacker's user agent. It shows alice's leaked key (red
 `C` = `compromised-key`) creating the `svc-backup` user (purple `B`), which then
-stops CloudTrail and opens access. The Sigma column shows Suzaku severities,
-and the Findings sidebar lists the notes an agent wrote over MCP. Three events
+stops CloudTrail and opens access. The Sigma column shows Suzaku severities;
+CreateUser and CreateAccessKey carry a critical multi-event correlation rule.
+The Findings sidebar lists the notes an agent wrote over MCP. Three events
 are selected, ready for **Quick tag** or **Add to note**.*
 
 ## What you can do
@@ -85,6 +86,8 @@ kamotrace import --source event_history.json --database case.duckdb
 
 The importer preserves nested JSON and numeric precision, hashes every record,
 records the source file's hash, and refuses to overwrite an existing database.
+A UTF-8 byte-order mark is fine. One database holds one export file; for several
+regions or S3 trail logs (`.json.gz`) see [docs/BUGS.md](docs/BUGS.md).
 
 **4. Add Sigma detections (optional).** Download Suzaku once, then run it on the
 same export ([details](#suzaku-detections)):
@@ -311,6 +314,8 @@ hover) and linked event count. Click a rule to add it to the query as a
 `Sigma: <rule>` scope; several rule scopes must all match, like tags. The grid's
 **Sigma** column shows the most severe level and the match count on one line;
 click it for the full rule list. The inspector lists an event's detections too.
+A correlation rule appears on each of its member events. A note saved by an
+agent with a minimum level reopens with a removable `Sigma ≥ <level>` scope.
 Detections are leads, not findings: tag or annotate what you confirm.
 
 ## IP enrichment
@@ -460,6 +465,8 @@ stay pinned and the grid fills the rest of the window.
   are not part of the history.
 - Search performs a case-insensitive **literal substring search of the entire
   raw event**, including nested requests/responses. `%` and `_` are not wildcards.
+  Type values as they appear: quotes and backslashes match as written
+  (`C:\Windows\Temp`, `-c "iex`), even though the raw JSON stores them escaped.
   Press `/` to focus it.
 - **+ Filter** adds filters for operation, service, identity, IP, country, access
   key ID, target, errors, document, etc. Filters combine with AND. `is one of`
@@ -772,15 +779,17 @@ in the container by hand, on synthetic data.
 
 Tests use synthetic records and a disposable database built through the bundled importer,
 real HTTP requests, asymmetric Jakarta-midnight boundaries, combined filters,
-literal search, sorting, invalid input, cross-origin rejection, exact JSON
+literal search (including quotes and backslashes), sorting, invalid input,
+cross-origin rejection, BOM-prefixed inputs, sidecar-to-evidence binding, exact JSON
 integers, local histogram boundaries/custom widths/empty buckets, and a database
 SHA-256 before/after check. Coverage also includes annotation/tag persistence,
 stale note edit/delete rejection, SSM account/region linkage, multiple
 systems/plugins, missing/combined output, spreadsheet search/sorting, and a
 real stdio MCP client session (search, tag/untag, note create/edit/link/unlink,
 invalid input, raw-hash check) whose writes are checked through the browser API,
-and Suzaku import (exact eventID/region/time linkage, unmatched rows kept but not
-shown, rule AND filters, minimum level, refusal to overwrite) against the
+and Suzaku import (exact eventID/region/time linkage, correlation rows linked to
+every member or not at all, unmatched rows kept but not shown, rule AND filters,
+minimum level, refusal to overwrite) against the
 DuckDB schema Suzaku 3.0.0 writes.
 They never modify the real CloudTrail evidence database. For contributor
 architecture and evidence-handling rules, see [AGENTS.md](AGENTS.md).
