@@ -599,6 +599,60 @@ class DownloadContract(unittest.TestCase):
         self.run_cli(*options, "--progress", "off", bounds=False)
         self.assertEqual((self.folder / "cloudtrail.json").read_bytes(), expected)
 
+    def test_cloudtrail_and_ssm_of_one_region_run_concurrently(self):
+        # Both services' first calls wait until the other is in flight; sequential services time out.
+        barrier = [threading.Barrier(2, timeout=10)]
+        denied = []
+        command = {"CommandId": "33333333-3333-3333-3333-333333333333", "RequestedDateTime": self.start,
+                   "DocumentName": "AWS-RunShellScript"}
+
+        class CloudTrail:  # Thread-safe stand-ins: Stubber's FIFO responses cannot be answered concurrently.
+            def lookup_events(fake, StartTime, EndTime, MaxResults, NextToken=None):
+                if barrier[0]:
+                    barrier[0].wait()
+                return {"Events": [self.event("overlap", "2026-10-01T12:00:00Z")]}
+
+        class SSM:
+            def list_commands(fake, Filters, MaxResults, NextToken=None):
+                if barrier[0]:
+                    barrier[0].wait()
+                if denied:
+                    raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "synthetic"}}, "ListCommands")
+                return {"Commands": [command]}
+
+            def list_command_invocations(fake, CommandId, Details, MaxResults, NextToken=None):
+                return {"CommandInvocations": []}
+
+            def describe_sessions(fake, State, Filters, MaxResults, NextToken=None):
+                return {"Sessions": []}
+
+        self.clients["cloudtrail", "us-east-1"] = CloudTrail()
+        self.clients["ssm", "us-east-1"] = SSM()
+
+        def exports():
+            ssm = json.loads((self.folder / "ssm.json").read_text())
+            ssm.pop("coverage")  # Holds the completion time.
+            return (self.folder / "cloudtrail.json").read_bytes(), ssm
+
+        self.identity()
+        self.run_cli("--progress", "off")
+        expected = exports()
+        self.assertEqual([item["record"]["CommandId"] for item in expected[1]["commands"]], [command["CommandId"]])
+
+        # An SSM failure is reported as itself and leaves the collection incomplete; resume completes it identically.
+        self.folder = self.folder.parent / "ssm-denied-then-resumed"
+        barrier[0] = None
+        denied.append(True)
+        self.identity()
+        _, error = self.run_cli("--progress", "off", status=1)
+        self.assertIn("AccessDeniedException", error)
+        self.assertNotIn("stopped by another worker", error)
+        self.assertFalse(json.loads((self.folder / "manifest.json").read_text())["complete"])
+        denied.clear()
+        self.identity()
+        self.run_cli("--progress", "off")
+        self.assertEqual(exports(), expected)
+
     def test_invalid_range_is_rejected_before_aws_access(self):
         for options in [("--start", "2026-10-02"), ("--start", "2026-10-01T12:00:00"),
                         ("--regions", "all", "us-east-1")]:

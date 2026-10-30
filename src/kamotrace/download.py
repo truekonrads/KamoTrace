@@ -448,12 +448,16 @@ class Collector:
                     with target.open("rb") as source:
                         digest = hashlib.file_digest(source, "sha256").hexdigest()
                 if not saved or digest != saved[0]:
+                    if self.stopped.is_set():
+                        raise Stopped("collection stopped by another worker")
                     response = self.client("s3", region).get_object(Bucket=bucket, Key=key, IfMatch=item["ETag"])
                     temporary = target.with_suffix(".part")
                     checksum = hashlib.sha256()
                     with response["Body"] as body, temporary.open("wb") as output:
                         transferred = 0
                         for block in iter(lambda: body.read(1 << 20), b""):
+                            if self.stopped.is_set():  # A large transcript must not delay stopping.
+                                raise Stopped("collection stopped by another worker")
                             output.write(block)
                             checksum.update(block)
                             transferred += len(block)
@@ -599,19 +603,21 @@ def main(argv=None):
         document = {"account_id": identity["Account"], "commands": [], "invocations": [],
                     "invocation_details": [], "sessions": [], "coverage": manifest}
         logs = {}
-        # Regions have separate API quotas, so they run concurrently; each collects into its own part.
+        # API quotas are per service and Region, so every Region's CloudTrail and SSM run concurrently.
+        # SSM collects into its Region's own part; CloudTrail only into the checkpoint's events table.
         parts = {name: ({key: [] for key in ("commands", "invocations", "invocation_details", "sessions")}, {})
                  for name in regions}
 
-        def collect(selected_region):
-            if "cloudtrail" in args.services:
+        def collect(job):
+            selected_region, service = job
+            if service == "cloudtrail":
                 collector.cloudtrail(selected_region)
-                progress.tick(f"{selected_region}: CloudTrail complete", done=1)
-            if "ssm" in args.services:
+            else:
                 collector.ssm(selected_region, *parts[selected_region], args.session_s3, args.session_log_group)
-                progress.tick(f"{selected_region}: SSM complete", done=1)
-        progress.idle()  # Setup messages give way to the Region workers' lines.
-        collector.parallel(collect, regions, len(regions))
+            progress.tick(f"{selected_region}: {'CloudTrail' if service == 'cloudtrail' else 'SSM'} complete", done=1)
+        progress.idle()  # Setup messages give way to the workers' lines.
+        jobs = [(name, service) for name in regions for service in settings["services"]]
+        collector.parallel(collect, jobs, len(jobs))
         for selected_region in regions:  # Merge in region order so exports do not depend on timing.
             region_document, region_logs = parts[selected_region]
             for key, records in region_document.items():

@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 import zipfile
@@ -128,8 +129,31 @@ class AutoContract(unittest.TestCase):
         sdk = Session(aws_access_key_id="synthetic", aws_secret_access_key="synthetic", region_name="us-east-1")
         clients = {name: sdk.client(name, region_name="us-east-1") for name in ("sts", "ec2", "cloudtrail", "ssm")}
         stubs = {name: self.stack.enter_context(Stubber(client)) for name, client in clients.items()}
+        # CloudTrail and SSM run concurrently: the first run's planned CloudTrail failure waits until SSM
+        # has finished, so FIFO stubs stay deterministic and the resume must reuse SSM's saved pages.
+        ssm_done, gated = threading.Event(), [True]
+
+        class Gate:
+            def __init__(self, client):
+                self.client = client
+
+            def __getattr__(self, name):
+                return getattr(self.client, name)
+
+            def lookup_events(self, **request):
+                if gated[0] and request["StartTime"] == batches[3][0]:
+                    ssm_done.wait(10)
+                return self.client.lookup_events(**request)
+
+            def describe_sessions(self, **request):
+                try:
+                    return self.client.describe_sessions(**request)
+                finally:
+                    if request["State"] == "History":
+                        ssm_done.set()
+        gates = {name: Gate(clients[name]) for name in ("cloudtrail", "ssm")}
         session = Mock(region_name="us-east-1")
-        session.client.side_effect = lambda service, region_name, **kw: clients[service]
+        session.client.side_effect = lambda service, region_name, **kw: gates.get(service, clients[service])
         self.stack.enter_context(patch("kamotrace.download.boto3.Session", return_value=session))
         self.stack.enter_context(patch("kamotrace.download.clock.sleep"))
         self.stack.enter_context(patch("kamotrace.download.WINDOW_WORKERS", 1))  # Stubber answers in FIFO order.
@@ -166,7 +190,14 @@ class AutoContract(unittest.TestCase):
             lookup(index)
         stubs["cloudtrail"].add_client_error("lookup_events", "ExpiredTokenException", expected_params={
             "StartTime": batches[3][0], "EndTime": batches[3][1], "MaxResults": 50})
+        stubs["ssm"].add_response("list_commands", {"Commands": []}, {"Filters": [
+            {"key": "InvokedBefore", "value": "2026-10-30T06:00:01Z"}], "MaxResults": 50})
+        for state in ("Active", "History"):
+            stubs["ssm"].add_response("describe_sessions", {"Sessions": []}, {"State": state, "Filters": [
+                {"key": "InvokedBefore", "value": "2026-10-30T06:00:01Z"}], "MaxResults": 100})
         _, log = self.run_auto(target, status=1)
+        gated[0] = False
+        stubs["ssm"].assert_no_pending_responses()
         self.assertIn("stopped during download", log)
         self.assertIn("rerun the same command", log)
         self.assertIn("maximum available history", log)
@@ -186,12 +217,7 @@ class AutoContract(unittest.TestCase):
         identity()
         for index in range(3, 90):
             lookup(index)
-        stubs["ssm"].add_response("list_commands", {"Commands": []}, {"Filters": [
-            {"key": "InvokedBefore", "value": "2026-10-30T06:00:01Z"}], "MaxResults": 50})
-        for state in ("Active", "History"):
-            stubs["ssm"].add_response("describe_sessions", {"Sessions": []}, {"State": state, "Filters": [
-                {"key": "InvokedBefore", "value": "2026-10-30T06:00:01Z"}], "MaxResults": 100})
-        out, log = self.run_auto(target)
+        out, log = self.run_auto(target)  # SSM's pages replay from the checkpoint: no SSM stubs remain.
         self.assertEqual(self.requests, fetched)  # Installed tools are reused, not downloaded again.
         self.assertIn("Removed abandoned staging folder .case.duckdb.killed.staging", log)
         self.assertFalse(abandoned.exists())

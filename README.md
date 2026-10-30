@@ -147,11 +147,14 @@ Rerun the **same command and destination** after interruption or renewing your
 login. SQLite checkpoints commit every API page and cursor, including empty
 pages. CloudTrail is split into daily batches; expired cursors restart only
 their batch and duplicate event IDs are removed within each region. Regions are
-collected concurrently, and two daily batches per region run at once; they share
-that region's pace of at most one LookupEvents call start every 0.55 s (AWS allows
-two per second per account and region, shared with other tools using the same
-account). Output order does not depend on timing. The first failure stops all
-workers after their in-flight call and is reported. SDK retries
+collected concurrently, and within each region CloudTrail and SSM run at the same
+time (their API quotas are separate), so SSM history near its 30-day limit is not
+left waiting behind a long CloudTrail download. Two daily CloudTrail batches per
+region run at once; they share that region's pace of at most one LookupEvents call
+start every 0.55 s (AWS allows two per second per account and region, shared with
+other tools using the same account). Output order does not depend on timing. The
+first failure, including a missing SSM, S3, CloudWatch Logs or KMS permission, stops
+all workers after their in-flight call or S3 block and is reported. SDK retries
 handle transient failures/throttling. Interrupted S3 objects restart, while
 completed objects are reused only when both their saved ETag and local SHA-256
 match. Conflicting ETags across listings stop collection without replacing the
