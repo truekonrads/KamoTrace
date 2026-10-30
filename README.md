@@ -127,6 +127,14 @@ kamotrace download --profile investigation --dest C:\cases\example\download --re
   tick logs when redirected. Force `bar`, `log` (batch/headless), or `off`.
   Progress goes to stderr; the bar measures completed region/service work, not
   a guessed event total. Page/cache counts and S3 transfer ticks show activity.
+  Below the bar, each busy worker has its own line.
+  The CloudTrail ETA is rough: it counts remaining daily batches in each region at
+  that region's own measured pace, and reports the slowest region. Batches replayed
+  from the checkpoint are ignored. A day with unusually high activity can take far
+  longer than the days before it. Until every unfinished region has measured at
+  least two batches over 10 seconds, the bar shows `estimating`. AWS gives no page totals, so
+  SSM has no ETA (`SSM ETA unknown`). When CloudTrail finishes, the ETA becomes
+  its elapsed time.
   CloudTrail page updates include the requested UTC range: each daily batch can
   contain multiple API pages of up to 50 events, not one date range per page.
   Set `$env:KAMOTRACE_NO_EMOJI = "1"` in PowerShell, or

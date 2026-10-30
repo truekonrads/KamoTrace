@@ -35,6 +35,9 @@ LIMITATIONS = [
 # so two workers keep a slow (high-latency) connection near that limit without exceeding it.
 LOOKUP_INTERVAL = 0.55
 WINDOW_WORKERS = 2
+# Show a CloudTrail ETA only after every unfinished Region has this much of its own AWS pace measured.
+ETA_MIN_WINDOWS = 2
+ETA_MIN_SECONDS = 10
 
 
 class Stopped(RuntimeError):
@@ -81,15 +84,69 @@ def atomic_json(path, value):
         output.write(encode(value) + "\n")
 
 
+def minutes(seconds):
+    if seconds < 60:
+        return "<1m"
+    hours, rest = divmod(round(seconds / 60), 60)
+    return f"{hours}h{rest:02d}m" if hours else f"{rest}m"
+
+
+def rough(seconds):
+    """Round an estimate coarsely; finer figures would claim precision it does not have."""
+    step = 60 if seconds < 600 else 300 if seconds < 3600 else 900
+    return "<1m" if seconds < 60 else "~" + minutes(round(seconds / step) * step)
+
+
 class Progress:
-    """Region/service completion is known; AWS page totals are not."""
+    """Region/service completion and CloudTrail daily window totals are known; AWS page totals are not."""
     def __init__(self, mode):
         self.mode = ("bar" if sys.stderr.isatty() else "log") if mode == "auto" else mode
         self.emoji = not os.environ.get("KAMOTRACE_NO_EMOJI")
         self.done, self.total, self.pages, self.cached = 0, 0, 0, 0
         self.last_bytes_tick = 0
-        self.bar_drawn = False
+        self.drawn = 0  # Bar rows on screen: the summary plus one per busy worker.
+        self.lines = {}  # Worker thread -> its latest message.
         self.lock = threading.RLock()  # Region workers share counters and the terminal.
+        self.started = clock.monotonic()
+        # Region -> [windows, completed, fetched from AWS, first fetched window's start]; None without CloudTrail.
+        self.windows, self.ssm, self.cloudtrail_done = None, False, None
+        self.local = threading.local()  # The window a worker thread is collecting.
+
+    def plan(self, regions, windows, ssm):
+        self.windows = {region: [windows, 0, 0, None] for region in regions} if windows else None
+        self.ssm = ssm
+
+    def window_started(self):
+        self.local.began, self.local.fetched = clock.monotonic(), False
+
+    def window_done(self, region):
+        with self.lock:
+            entry = self.windows[region]
+            entry[1] += 1
+            if self.local.fetched:  # Windows replayed from the checkpoint say nothing about AWS pace.
+                entry[2] += 1
+                entry[3] = min(entry[3] or self.local.began, self.local.began)
+            if all(total == completed for total, completed, _, _ in self.windows.values()):
+                self.cloudtrail_done = clock.monotonic()
+
+    def eta(self):
+        """Slowest region's remaining windows at its own observed pace; regions run concurrently."""
+        parts = []
+        if self.cloudtrail_done:
+            parts.append(f"CloudTrail done in {minutes(self.cloudtrail_done - self.started)}")
+        elif self.windows:
+            now, longest = clock.monotonic(), 0
+            for total, completed, fetched, began in self.windows.values():
+                if completed == total:
+                    continue
+                if fetched < ETA_MIN_WINDOWS or now - began < ETA_MIN_SECONDS:
+                    longest = None
+                    break
+                longest = max(longest, (total - completed) * (now - began) / fetched)
+            parts.append("CloudTrail ETA estimating" if longest is None else f"CloudTrail ETA {rough(longest)} (rough)")
+        if self.ssm and self.done < self.total:
+            parts.append("SSM ETA unknown")
+        return "; ".join(parts)
 
     def tick(self, message, done=0, page=None):
         """Report message; done counts finished region/services, page is a page's cached flag."""
@@ -98,9 +155,13 @@ class Progress:
             if page is not None:
                 self.pages += 1
                 self.cached += page
+                if not page:
+                    self.local.fetched = True
             if self.mode == "off":
                 return
+            eta = self.eta()
             counts = f"{self.done}/{self.total} region/services | {self.pages} pages ({self.cached} cached)"
+            counts += f" | {eta}" if eta else ""
             if self.mode == "log":
                 print(f"{iso(datetime.now(timezone.utc))} {counts} | {message}", file=sys.stderr, flush=True)
             else:
@@ -111,14 +172,30 @@ class Progress:
                     track = "🦆" * ducks + "-" * (width - 2 * ducks)
                 else:
                     track = "#" * filled + "-" * (width - filled)
-                counts = f"{self.done}/{self.total} jobs {self.pages} pages ({self.cached} cached)"
-                columns = max(1, shutil.get_terminal_size().columns - 1)
+                # ETA precedes page counts so a narrow terminal truncates the less useful part.
+                counts = f"{self.done}/{self.total} jobs " + (f"| {eta} | " if eta else "") + \
+                    f"{self.pages} pages ({self.cached} cached)"
+                size = shutil.get_terminal_size()
+                columns = max(1, size.columns - 1)
                 summary = f"[{track}] {counts}"
                 summary_columns = max(1, columns - (ducks if self.emoji else 0))
-                prefix = "\r\033[1A" if self.bar_drawn else "\r"
-                print(prefix + "\033[2K" + summary[:summary_columns] + "\n\r\033[2K" + message[:columns],
+                # One line per busy worker, sorted so a Region's lines stay together, oldest window first.
+                self.lines[threading.get_ident()] = message
+                details = sorted(self.lines.values())
+                limit = max(1, size.lines - 2)  # Never scroll the block; scrolled lines cannot be redrawn.
+                if len(details) > limit:
+                    details = details[:limit - 1] + [f"... {len(details) - limit + 1} more workers"]
+                rows = [summary[:summary_columns]] + [detail[:columns] for detail in details]
+                # Return to the block's first line, redraw it, and clear lines left by finished workers.
+                prefix = f"\r\033[{self.drawn - 1}A" if self.drawn > 1 else "\r"
+                print(prefix + "\n".join("\r\033[2K" + row for row in rows) + "\033[J",
                       end="", file=sys.stderr, flush=True)
-                self.bar_drawn = True
+                self.drawn = len(rows)
+
+    def idle(self):
+        """The calling worker finished its task; drop its line at the next redraw."""
+        with self.lock:
+            self.lines.pop(threading.get_ident(), None)
 
     def transferred(self, size):
         with self.lock:
@@ -129,7 +206,7 @@ class Progress:
 
     def close(self):
         with self.lock:
-            if self.mode == "bar" and self.bar_drawn:
+            if self.mode == "bar" and self.drawn:
                 print(file=sys.stderr)
             self.mode = "off"
 
@@ -171,8 +248,14 @@ class Collector:
 
     def parallel(self, function, items, workers):
         """Run function(item) concurrently; the first failure or Ctrl+C stops every worker and is raised."""
+        def run(item):
+            try:
+                return function(item)
+            finally:
+                self.progress.idle()
+
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = [pool.submit(function, item) for item in items]
+            futures = [pool.submit(run, item) for item in items]
             try:
                 pending = futures
                 while pending and not self.stopped.is_set():
@@ -257,19 +340,22 @@ class Collector:
         stamp = value if isinstance(value, datetime) else timestamp(value)
         return (self.start is None or self.start <= stamp) and stamp <= self.end
 
-    def cloudtrail(self, region):
+    def windows(self):
         lower = self.start if self.start is not None else self.end - timedelta(days=90)
         windows = []
         while True:
             upper = min(lower + timedelta(days=1), self.end)
             windows.append((lower, upper))
             if upper == self.end:
-                break
+                return windows
             lower = upper
+
+    def cloudtrail(self, region):
         # Oldest first: with default bounds the oldest window is the next to expire from Event History.
-        self.parallel(lambda window: self.window(region, *window), windows, WINDOW_WORKERS)
+        self.parallel(lambda window: self.window(region, *window), self.windows(), WINDOW_WORKERS)
 
     def window(self, region, lower, upper):
+        self.progress.window_started()
         self.progress.tick(f"{region}: CloudTrail batch {iso(lower)} to {iso(upper)}")
         for page in self.pages("cloudtrail", region, "lookup_events", {
                 "StartTime": lower, "EndTime": upper, "MaxResults": 50}):
@@ -279,6 +365,7 @@ class Collector:
                         # Keep original JSON; shared inclusive batch boundaries deduplicate by ID.
                         self.db.execute("INSERT OR IGNORE INTO events VALUES (?,?,?)",
                                         (region, event["EventId"], event["CloudTrailEvent"]))
+        self.progress.window_done(region)
 
     def cloudwatch(self, region, group, prefix, logs):
         events = {}
@@ -459,6 +546,7 @@ def main(argv=None):
         else:
             regions = settings["regions"]
         progress.total = len(regions) * len(settings["services"])
+        progress.plan(regions, len(collector.windows()) if "cloudtrail" in args.services else 0, "ssm" in args.services)
         manifest = {**settings, "resolved_regions": regions, "complete": False, "limitations": LIMITATIONS}
         atomic_json(folder / "manifest.json", manifest)
         (folder / "logs").mkdir(exist_ok=True)
@@ -476,6 +564,7 @@ def main(argv=None):
             if "ssm" in args.services:
                 collector.ssm(selected_region, *parts[selected_region], args.session_s3, args.session_log_group)
                 progress.tick(f"{selected_region}: SSM complete", done=1)
+        progress.idle()  # Setup messages give way to the Region workers' lines.
         collector.parallel(collect, regions, len(regions))
         for selected_region in regions:  # Merge in region order so exports do not depend on timing.
             region_document, region_logs = parts[selected_region]

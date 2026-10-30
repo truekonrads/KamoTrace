@@ -1,4 +1,5 @@
 """Public download CLI contracts against AWS SDK-validated synthetic responses (no AWS access)."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -84,11 +85,105 @@ class DownloadContract(unittest.TestCase):
                     progress.close()
                 summary, detail = first.split("\n")
                 self.assertIn("2/6 jobs 3 pages (0 cached)", summary)
-                self.assertEqual(detail, "\r\033[2K" + message)
+                self.assertEqual(detail, "\r\033[2K" + message + "\033[J")
                 self.assertLessEqual(len(summary.replace("\r\033[2K", "")) + summary.count("🦆"), 119)
                 update_summary, update_detail = stderr.getvalue()[len(first):].split("\n", 1)
-                self.assertTrue(update_summary.startswith("\r\033[1A\033[2K"))
-                self.assertEqual(update_detail, "\r\033[2KDone\n")
+                self.assertTrue(update_summary.startswith("\r\033[1A\r\033[2K"))
+                self.assertEqual(update_detail, "\r\033[2KDone\033[J\n")
+
+    def test_progress_bar_shows_one_line_per_busy_worker(self):
+        stderr = io.StringIO()
+
+        def frames():
+            return [frame.split("\n") for frame in stderr.getvalue().split("\033[J")[:-1]]
+
+        # Workers stay alive until the end: an exited thread's identifier may be reused.
+        pool = ThreadPoolExecutor(max_workers=5)
+        self.addCleanup(pool.shutdown)
+        idle = [threading.Event() for _ in range(5)]
+        workers = iter(range(5))
+
+        def tick(message, then_idle=False):
+            ticked, worker = threading.Event(), next(workers)
+
+            def work():
+                progress.tick(message)
+                if then_idle:
+                    progress.idle()
+                ticked.set()
+                idle[worker].wait()  # Occupy this thread so later ticks come from other threads.
+            pool.submit(work)
+            ticked.wait()
+
+        self.addCleanup(lambda: [event.set() for event in idle])
+        with redirect_stderr(stderr):
+            progress = Progress("bar")
+            progress.total = 2
+            tick("us-east-1: lookup_events 2026-10-02 page 1 saved")
+            tick("us-east-1: lookup_events 2026-10-01 page 7 saved", then_idle=True)
+            tick("ap-southeast-1: describe_sessions page 1 saved")
+            tick("us-east-1: lookup_events 2026-10-03 page 1 saved")
+        first, second, third, fourth = frames()
+        self.assertEqual(len(first), 1 + 1)
+        self.assertEqual(second, ["\r\033[1A\r\033[2K" + second[0].split("\r\033[2K")[-1],
+                                  "\r\033[2Kus-east-1: lookup_events 2026-10-01 page 7 saved",
+                                  "\r\033[2Kus-east-1: lookup_events 2026-10-02 page 1 saved"])
+        # The finished worker's line is gone; lines are grouped by Region, then oldest window.
+        self.assertTrue(third[0].startswith("\r\033[2A\r\033[2K"))
+        self.assertEqual([line.removeprefix("\r\033[2K") for line in third[1:]],
+                         ["ap-southeast-1: describe_sessions page 1 saved",
+                          "us-east-1: lookup_events 2026-10-02 page 1 saved"])
+        self.assertEqual(len(fourth), 1 + 3)
+        # More workers than terminal rows collapse into a count instead of scrolling the bar away.
+        with redirect_stderr(stderr), patch("kamotrace.download.shutil.get_terminal_size",
+                                            return_value=os.terminal_size((200, 4))):
+            tick("us-west-2: lookup_events 2026-10-01 page 1 saved")
+        fifth = frames()[-1]
+        self.assertTrue(fifth[0].startswith("\r\033[3A\r\033[2K"))
+        self.assertEqual([line.removeprefix("\r\033[2K") for line in fifth[1:]],
+                         ["ap-southeast-1: describe_sessions page 1 saved", "... 3 more workers"])
+
+    def test_eta_uses_slowest_region_pace_and_ignores_checkpoint_replays(self):
+        now = [0.0]
+        stderr = io.StringIO()
+        with patch("kamotrace.download.clock.monotonic", lambda: now[0]), redirect_stderr(stderr):
+            progress = Progress("log")
+            progress.total = 6
+            progress.plan(["quiet", "busy", "resumed"], 10, ssm=True)
+
+            def window(region, seconds, cached=False):
+                progress.window_started()
+                now[0] += seconds
+                progress.tick("page", page=cached)
+                progress.window_done(region)
+
+            self.assertEqual(progress.eta(), "CloudTrail ETA estimating; SSM ETA unknown")
+            for _ in range(6):  # Replayed from the checkpoint in no time.
+                window("resumed", 0, cached=True)
+            for _ in range(10):
+                window("quiet", 1)
+            window("busy", 49)
+            # One measured window is not a pace, and the resumed Region has none yet.
+            self.assertEqual(progress.eta(), "CloudTrail ETA estimating; SSM ETA unknown")
+            window("busy", 50)
+            window("resumed", 6)
+            # Six instant checkpoint replays must not count as measured AWS pace.
+            self.assertEqual(progress.eta(), "CloudTrail ETA estimating; SSM ETA unknown")
+            window("resumed", 6)
+            # busy: 8 left at 111 s / 2 windows = 444 s, slower than resumed's 2 left at 6 s each.
+            # An aggregate rate (14 fetched windows in 111 s) would claim about a minute.
+            self.assertEqual(progress.eta(), "CloudTrail ETA ~7m (rough); SSM ETA unknown")
+            now[0] += 3000  # A stalled Region lengthens its own estimate: 8 × 3111 / 2 s.
+            self.assertEqual(progress.eta(), "CloudTrail ETA ~3h30m (rough); SSM ETA unknown")
+            for _ in range(8):
+                window("busy", 30)
+            window("resumed", 6)
+            window("resumed", 6)
+            self.assertEqual(progress.eta(), "CloudTrail done in 56m; SSM ETA unknown")
+            progress.tick("SSM complete", done=6)
+            self.assertEqual(progress.eta(), "CloudTrail done in 56m")
+        self.assertIn("6/6 region/services | 30 pages (6 cached) | CloudTrail done in 56m | SSM complete",
+                      stderr.getvalue())
 
     def test_optional_bounds_collect_available_history_warn_and_resume_fixed_snapshot(self):
         now = [self.end]
@@ -172,6 +267,8 @@ class DownloadContract(unittest.TestCase):
         stub.add_client_error("lookup_events", "ExpiredToken", expected_params={**params, "NextToken": "old"})
         _, log = self.run_cli("--services", "cloudtrail", "--progress", "log", status=1)
         self.assertIn("page 1 saved", log)
+        self.assertIn("1 pages (0 cached) | CloudTrail ETA estimating |", log)
+        self.assertNotIn("SSM", log)
         self.assertIn("lookup_events 2026-10-01T00:00:00Z to 2026-10-01T23:59:59.999999Z page 1 saved", log)
         self.assertNotIn("requesting", log)
         self.assertNotIn("\r", log)
@@ -186,7 +283,7 @@ class DownloadContract(unittest.TestCase):
         self.assertIn("[" + "🦆" * 10 + "]", bar)
         self.assertNotIn("#", bar)
         self.assertIn("lookup_events 2026-10-01T00:00:00Z to 2026-10-01T23:59:59.999999Z page 3 saved", bar)
-        self.assertIn("1/1 jobs", bar)
+        self.assertIn("1/1 jobs | CloudTrail done in <1m | ", bar)
         self.assertNotIn("requesting", bar)
         source = self.folder / "cloudtrail.json"
         records = simplejson.loads(source.read_text(), use_decimal=True)["Records"]
