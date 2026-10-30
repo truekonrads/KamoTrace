@@ -19,6 +19,7 @@ from botocore.stub import Stubber
 import simplejson
 
 from kamotrace.cli import main
+from kamotrace.download import Progress
 from kamotrace.importer import build
 from kamotrace.server import Store
 
@@ -32,6 +33,7 @@ class DownloadContract(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.dict(os.environ, {"KAMOTRACE_NO_EMOJI": ""}))
+        self.stack.enter_context(patch("kamotrace.download.shutil.get_terminal_size", return_value=os.terminal_size((200, 24))))
         self.folder = Path(self.stack.enter_context(tempfile.TemporaryDirectory())) / "download"
         sdk = Session(aws_access_key_id="synthetic", aws_secret_access_key="synthetic", region_name="us-east-1")
         self.clients, self.stubs = {}, {}
@@ -62,6 +64,27 @@ class DownloadContract(unittest.TestCase):
                            *(["--start", "2026-10-01", "--end", "2026-10-01"] if bounds else []), *options])
         self.assertEqual(result, status, stderr.getvalue())
         return stdout.getvalue(), stderr.getvalue()
+
+    def test_progress_bar_uses_two_rows_and_replaces_previous_update(self):
+        for emoji in (True, False):
+            with self.subTest(emoji=emoji), patch.dict(os.environ, {"KAMOTRACE_NO_EMOJI": "" if emoji else "1"}), \
+                    patch("kamotrace.download.shutil.get_terminal_size", return_value=os.terminal_size((120, 24))):
+                stderr = io.StringIO()
+                message = "us-east-1: lookup_events 2026-10-01T00:00:00Z to 2026-10-01T23:59:59.999999Z page 3 saved"
+                with redirect_stderr(stderr):
+                    progress = Progress("bar")
+                    progress.total, progress.done, progress.pages = 6, 2, 3
+                    progress.tick(message)
+                    first = stderr.getvalue()
+                    progress.tick("Done")
+                    progress.close()
+                summary, detail = first.split("\n")
+                self.assertIn("2/6 jobs 3 pages (0 cached)", summary)
+                self.assertEqual(detail, "\r\033[2K" + message)
+                self.assertLessEqual(len(summary.replace("\r\033[2K", "")) + summary.count("🦆"), 119)
+                update_summary, update_detail = stderr.getvalue()[len(first):].split("\n", 1)
+                self.assertTrue(update_summary.startswith("\r\033[1A\033[2K"))
+                self.assertEqual(update_detail, "\r\033[2KDone\n")
 
     def test_optional_bounds_collect_available_history_warn_and_resume_fixed_snapshot(self):
         now = [self.end]
@@ -145,6 +168,7 @@ class DownloadContract(unittest.TestCase):
         stub.add_client_error("lookup_events", "ExpiredToken", expected_params={**params, "NextToken": "old"})
         _, log = self.run_cli("--services", "cloudtrail", "--progress", "log", status=1)
         self.assertIn("page 1 saved", log)
+        self.assertIn("lookup_events 2026-10-01T00:00:00Z to 2026-10-01T23:59:59.999999Z page 1 saved", log)
         self.assertNotIn("requesting", log)
         self.assertNotIn("\r", log)
         self.assertFalse(json.loads((self.folder / "manifest.json").read_text())["complete"])
@@ -155,6 +179,9 @@ class DownloadContract(unittest.TestCase):
         stub.add_response("lookup_events", {"Events": [last, outside]}, {**params, "NextToken": "final"})
         _, bar = self.run_cli("--services", "cloudtrail", "--progress", "bar")
         self.assertIn("🦆", bar)
+        self.assertIn("[" + "🦆" * 10 + "]", bar)
+        self.assertNotIn("#", bar)
+        self.assertIn("lookup_events 2026-10-01T00:00:00Z to 2026-10-01T23:59:59.999999Z page 3 saved", bar)
         self.assertIn("1/1 jobs", bar)
         self.assertNotIn("requesting", bar)
         source = self.folder / "cloudtrail.json"
@@ -175,6 +202,7 @@ class DownloadContract(unittest.TestCase):
         self.identity()
         _, auto_log = self.run_cli("--services", "cloudtrail")
         self.assertIn("page 1 cached", auto_log)
+        self.assertIn("lookup_events 2026-10-01T00:00:00Z to 2026-10-01T23:59:59.999999Z page 1 cached", auto_log)
         self.assertNotIn("\r", auto_log)
         self.assertNotIn("🦆", auto_log)
         self.identity()
@@ -382,8 +410,10 @@ class DownloadContract(unittest.TestCase):
                                  (dt("2026-10-02T00:00:00Z"), dt("2026-10-02T00:00:01Z"))]:
                 self.stubs["cloudtrail", region].add_response("lookup_events", {"Events": [boundary]},
                     {"StartTime": lower, "EndTime": upper, "MaxResults": 50})
-        self.run_cli("--regions", "all", "--start", "2026-10-01T08:00:00+08:00",
-                     "--end", "2026-10-02T08:00:01+08:00", "--services", "cloudtrail")
+        _, log = self.run_cli("--regions", "all", "--start", "2026-10-01T08:00:00+08:00",
+                             "--end", "2026-10-02T08:00:01+08:00", "--services", "cloudtrail")
+        self.assertIn("lookup_events 2026-10-01T00:00:00Z to 2026-10-02T00:00:00Z page 1 saved", log)
+        self.assertIn("lookup_events 2026-10-02T00:00:00Z to 2026-10-02T00:00:01Z page 1 saved", log)
         records = json.loads((self.folder / "cloudtrail.json").read_text())["Records"]
         self.assertEqual(len(records), 2)  # Dedup within a region, not across regions.
         before = (self.folder / "manifest.json").read_bytes()

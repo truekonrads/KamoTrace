@@ -103,10 +103,12 @@ kamotrace download --profile investigation --dest C:\cases\example\download --re
   Output names become `cloudtrail.json.gz`, `ssm.json.gz` and `logs/*.json.gz`;
   original S3 object bytes are preserved; the manifest and checkpoint are not compressed.
   Both `import` and `serve --ssm-export` read gzip directly.
-- `--progress auto` (default) shows a moving 🦆 bar in terminals and UTC timestamped
+- `--progress auto` (default) fills the terminal bar with 🦆 emojis and shows UTC timestamped
   tick logs when redirected. Force `bar`, `log` (batch/headless), or `off`.
   Progress goes to stderr; the bar measures completed region/service work, not
   a guessed event total. Page/cache counts and S3 transfer ticks show activity.
+  CloudTrail page updates include the requested UTC range: each daily batch can
+  contain multiple API pages of up to 50 events, not one date range per page.
   Set `$env:KAMOTRACE_NO_EMOJI = "1"` in PowerShell, or
   `KAMOTRACE_NO_EMOJI=1` in your shell environment, for an ASCII-only bar.
   Any nonempty value disables emoji; logs always use plain text.

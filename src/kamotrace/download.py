@@ -78,6 +78,7 @@ class Progress:
         self.emoji = not os.environ.get("KAMOTRACE_NO_EMOJI")
         self.done, self.total, self.pages, self.cached = 0, 0, 0, 0
         self.last_bytes_tick = 0
+        self.bar_drawn = False
 
     def tick(self, message):
         if self.mode == "off":
@@ -89,14 +90,18 @@ class Progress:
             width = 20
             filled = width * self.done // self.total if self.total else 0
             if self.emoji:
-                marker = min(filled, width - 2)
-                track = "#" * marker + "🦆" + "-" * (width - marker - 2)
+                ducks = max(1, filled // 2)
+                track = "🦆" * ducks + "-" * (width - 2 * ducks)
             else:
                 track = "#" * filled + "-" * (width - filled)
             counts = f"{self.done}/{self.total} jobs {self.pages} pages ({self.cached} cached)"
-            line = f"[{track}] {counts} | {message}"
-            columns = max(1, shutil.get_terminal_size().columns - 1 - int(self.emoji))
-            print("\r" + line[:columns].ljust(columns), end="", file=sys.stderr, flush=True)
+            columns = max(1, shutil.get_terminal_size().columns - 1)
+            summary = f"[{track}] {counts}"
+            summary_columns = max(1, columns - (ducks if self.emoji else 0))
+            prefix = "\r\033[1A" if self.bar_drawn else "\r"
+            print(prefix + "\033[2K" + summary[:summary_columns] + "\n\r\033[2K" + message[:columns],
+                  end="", file=sys.stderr, flush=True)
+            self.bar_drawn = True
 
     def transferred(self, size):
         now = clock.monotonic()
@@ -105,7 +110,7 @@ class Progress:
             self.last_bytes_tick = now
 
     def close(self):
-        if self.mode == "bar":
+        if self.mode == "bar" and self.bar_drawn:
             print(file=sys.stderr)
         self.mode = "off"
 
@@ -146,6 +151,9 @@ class Collector:
         result_token = result_token or token
         index, cursor, restarted = 0, None, False
         seen = set()
+        context = f"{region}: {operation}"
+        if service == "cloudtrail":
+            context += f" {iso(parameters['StartTime'])} to {iso(parameters['EndTime'])}"
         while True:
             cached = self.db.execute("SELECT response FROM pages WHERE job=? AND page=?", (job, index)).fetchone()
             if cached:
@@ -170,7 +178,7 @@ class Collector:
                             self.db.execute("DELETE FROM pages WHERE job=?", (job,))
                         index, cursor, restarted = 0, None, True
                         seen.clear()
-                        self.progress.tick(f"{region}: {operation} cursor expired; restarting pagination")
+                        self.progress.tick(f"{context} cursor expired; restarting pagination")
                         continue
                     raise
                 response.pop("ResponseMetadata", None)
@@ -178,7 +186,7 @@ class Collector:
                     self.db.execute("INSERT INTO pages VALUES (?,?,?)", (job, index, encode(response)))
             self.progress.pages += 1
             self.progress.cached += bool(cached)
-            self.progress.tick(f"{region}: {operation} page {index + 1} {'cached' if cached else 'saved'}")
+            self.progress.tick(f"{context} page {index + 1} {'cached' if cached else 'saved'}")
             yield response
             following = response.get(result_token)
             if not following:
