@@ -44,6 +44,7 @@ class BrowserContract(unittest.TestCase):
                 "awsRegion": "ap-southeast-3", "eventCategory": "Management", "readOnly": False,
                 "userIdentity": {"type": "IAMUser", "arn": "arn:aws:iam::123:user/alice", "accessKeyId": "AKIAEXAMPLE"},
                 "requestParameters": {"number": 9007199254740993, "instanceId": "i-example"}})
+        events[1]["userAgent"] = 'powershell -c "& C:\\Temp\\a.ps1"'  # Stored JSON-escaped as \" and \\
         for index in (0, 2, 3):
             events[index]["recipientAccountId"] = "123" if index != 3 else "different-account"
             events[index]["responseElements"] = {"command": {"commandId": "command-multi"}}
@@ -266,12 +267,18 @@ class BrowserContract(unittest.TestCase):
             ("2026-10-25 01:02:03", "Low rule", "low", "SendCommand", "ap-southeast-3", "event-2", [], [], "rule-low"),
             # Same eventID, wrong region / wrong instant: must not link to event-3.
             ("2026-10-25 16:59:59", "Low rule", "low", "SendCommand", "us-east-1", "event-3", [], [], "rule-low"),
-            ("2026-10-25 17:00:00", "Low rule", "low", "SendCommand", "ap-southeast-3", "event-3", [], [], "rule-low")])
+            ("2026-10-25 17:00:00", "Low rule", "low", "SendCommand", "ap-southeast-3", "event-3", [], [], "rule-low"),
+            # Correlation rows: member eventIDs joined by " ¦ ", stamped with the latest member's time.
+            ("2026-10-25 01:02:03", "Chain", "critical", "SendCommand", "ap-southeast-3", "event-2 ¦ event-0", [], [], "rule-chain"),
+            ("2026-10-25 01:02:03", "Chain", "critical", "SendCommand", "ap-southeast-3", "event-0 ¦ event-missing", [], [], "rule-chain"),
+            ("2026-10-25 01:02:03", "Chain", "critical", "SendCommand", "ap-southeast-3", "event-0 ¦ event-4", [], [], "rule-chain")])
         out.execute("INSERT INTO suzaku_meta VALUES (1, '3.0.0', 'aws-ct-timeline', 'UTC', 'abc', 2)")
         out.close()
         sidecar = root / "events.detections.duckdb"
         run = import_timeline(self.database, timeline, sidecar)
-        self.assertEqual((run["linked_rows"], run["no_match_rows"], run["suzaku_version"]), (3, 2, "3.0.0"))
+        # The partial chain (a member is missing) and the one with a member after its time do not link.
+        self.assertEqual((run["linked_rows"], run["no_match_rows"], run["ambiguous_rows"], run["suzaku_version"]),
+                         (4, 4, 0, "3.0.0"))
         with self.assertRaises(FileExistsError):
             import_timeline(self.database, timeline, sidecar)
         store = Store(self.database, detections=sidecar)
@@ -279,11 +286,13 @@ class BrowserContract(unittest.TestCase):
             ids = lambda body: [r["event_id"] for r in store.query({**body, "sorters": [{"field": "time_local", "dir": "asc"}]})["data"]]
             self.assertEqual(ids({"rules": ["rule-low"]}), ["event-0", "event-2"])
             self.assertEqual(ids({"rules": ["rule-low", "rule-high"]}), ["event-0"])  # every rule must match
-            self.assertEqual(ids({"min_level": "medium"}), ["event-0"])
+            self.assertEqual(ids({"min_level": "medium"}), ["event-0", "event-2"])
+            self.assertEqual(ids({"rules": ["rule-chain"]}), ["event-0", "event-2"])  # every member event
             row = store.query({"rules": ["rule-high"]})["data"][0]
-            self.assertEqual([(d["rule_id"], d["level"]) for d in row["detections"]], [("rule-high", "high"), ("rule-low", "low")])
-            self.assertEqual(row["detections"][0]["techniques"], ["T1651"])
-            self.assertEqual({r["rule_id"]: r["events"] for r in store.detections_list()["rules"]}, {"rule-high": 1, "rule-low": 2})
+            self.assertEqual([(d["rule_id"], d["level"]) for d in row["detections"]],
+                             [("rule-chain", "critical"), ("rule-high", "high"), ("rule-low", "low")])
+            self.assertEqual(row["detections"][1]["techniques"], ["T1651"])
+            self.assertEqual({r["rule_id"]: r["events"] for r in store.detections_list()["rules"]}, {"rule-chain": 2, "rule-high": 1, "rule-low": 2})
             with self.assertRaises(ValueError):
                 store.query({"min_level": "severe"})
         finally:
@@ -299,7 +308,8 @@ class BrowserContract(unittest.TestCase):
         root = Path(self.temp.name) / "enrichment"
         (root / "geolite2").mkdir(parents=True)
         source = root / "events.json"
-        source.write_text(json.dumps({"Records": [{"eventID": f"e{i}", "eventTime": "2026-10-24T01:00:00Z",
+        # With a UTF-8 byte-order mark, as Windows PowerShell 5.1 writes; the JSONL below has one too.
+        source.write_text("\ufeff" + json.dumps({"Records": [{"eventID": f"e{i}", "eventTime": "2026-10-24T01:00:00Z",
             "eventName": "GetCallerIdentity", "eventSource": "sts.amazonaws.com", "sourceIPAddress": ip,
             "awsRegion": "us-east-1", "userIdentity": {"type": "IAMUser"}}
             for i, ip in enumerate(["192.0.2.10", "198.51.100.7", "2001:db8::1", "ec2.amazonaws.com"])]}), encoding="utf-8")
@@ -313,7 +323,7 @@ class BrowserContract(unittest.TestCase):
             writer.insert_network(IPSet(["192.0.2.0/24", "198.51.100.0/24"]), data)
             writer.to_db_file(str(root / "geolite2" / f"GeoLite2-{kind}.mmdb"))
         spur = root / "spur.jsonl"
-        spur.write_text("\n".join(json.dumps(r) for r in [
+        spur.write_text("\ufeff" + "\n".join(json.dumps(r) for r in [
             {"ip": "198.51.100.7", "country": "Germany", "attributes": {"proxy_score": 92, "tunnel": "vpn-example"}},
             {"ip": "2001:0db8:0000::1", "as_org": "IPv6 Example", "attributes": {"residential": False}},
             {"ip": "203.0.113.99", "country": "Unused"}]), encoding="utf-8")
@@ -356,6 +366,32 @@ class BrowserContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different evidence database"):
             Store(self.database, output)
 
+    def test_get_suzaku_installs_only_verified_safe_archives(self):
+        import zipfile
+        from kamotrace.get_suzaku import install, installed
+        tools = Path(self.temp.name) / "tools"
+        tools.mkdir()
+        def archive(name, members):
+            path = tools.parent / name
+            with zipfile.ZipFile(path, "w") as bundle:
+                for member, data in members.items():
+                    bundle.writestr(member, data)
+            return path, "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        good, digest = archive("suzaku-3.0.0-lin-x64-gnu.zip", {"suzaku-3.0.0-lin-x64-gnu": "binary", "rules/a.yml": "x"})
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            install(good, "sha256:" + "0" * 64, "3.0.0", "lin-x64-gnu", tools)
+        evil, evil_digest = archive("evil.zip", {"suzaku-x": "binary", "../outside.txt": "x"})
+        with self.assertRaisesRegex(RuntimeError, "unsafe path"):
+            install(evil, evil_digest, "3.0.1", "lin-x64-gnu", tools)
+        self.assertFalse((tools.parent / "outside.txt").exists())
+        self.assertIsNone(installed(tools))  # Failed installs leave nothing behind
+        newer, newer_digest = archive("suzaku-3.10.0.zip", {"suzaku-3.10.0-lin-x64-gnu": "binary"})
+        install(good, digest, "3.0.0", "lin-x64-gnu", tools)
+        install(newer, newer_digest, "3.10.0", "lin-x64-gnu", tools)
+        # Versions compare numerically (3.10 > 3.9 > 3.0), and only verified installs are listed.
+        self.assertEqual(installed(tools), tools / "suzaku-3.10.0" / "suzaku-3.10.0-lin-x64-gnu")
+        self.assertEqual(sorted(p.name for p in tools.iterdir()), ["suzaku-3.0.0", "suzaku-3.10.0"])
+
     def test_older_annotation_sidecar_is_migrated_additively(self):
         import sqlite3
         path = Path(self.temp.name) / "old.sqlite3"
@@ -373,6 +409,12 @@ class BrowserContract(unittest.TestCase):
         finally:
             store.connection.close()
             store.reviews.close()
+        # Opening it binds the sidecar to this evidence; another case's database is refused.
+        source = Path(self.temp.name) / "other.json"
+        source.write_text(json.dumps({"Records": [{"eventID": "x", "eventTime": "2026-10-24T00:00:00Z"}]}), encoding="utf-8")
+        build(source, Path(self.temp.name) / "other.duckdb")
+        with self.assertRaisesRegex(ValueError, "different evidence database"):
+            Store(Path(self.temp.name) / "other.duckdb", annotations=path)
 
     def test_ssm_groups_systems_plugins_enrichment_and_exact_event_links(self):
         status, result = self.call("/api/ssm", {})
@@ -457,6 +499,11 @@ class BrowserContract(unittest.TestCase):
         for literal in ["%' OR 1=1 --", "_", "<script>"]:
             _, empty = self.call("/api/events", {"search": literal})
             self.assertEqual(empty["last_row"], 0)
+        # Quotes and backslashes are found as typed, not only in their JSON-escaped form.
+        for literal in ['-c "& C:\\temp\\A.ps1"', "C:\\Temp\\a.ps1", '"&']:
+            _, found = self.call("/api/events", {"search": literal})
+            self.assertEqual([r["event_id"] for r in found["data"]], ["event-1"], literal)
+        self.assertEqual(found["data"][0]["user_agent"], 'powershell -c "& C:\\Temp\\a.ps1"')
 
     def test_validation_and_same_origin_boundary(self):
         for body in [{"sorters": [{"field": "time_local;DROP TABLE events", "dir": "asc"}]},

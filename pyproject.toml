@@ -28,4 +28,4 @@ build-backend = "hatchling.build"
 packages = ["src/kamotrace"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/kamotrace", "tests", "README.md", "AGENTS.md", "LICENSE"]
+include = ["src/kamotrace", "tests", "skills", "README.md", "AGENTS.md", "LICENSE"]

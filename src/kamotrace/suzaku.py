@@ -57,27 +57,38 @@ def import_timeline(database, timeline, output, replace=False, source=None, labe
         if meta["timestamp_tz"] != "UTC":
             raise ValueError("Suzaku timestamps are not UTC; rerun Suzaku without -l/--localtime")
         source_sha256, records = evidence_identity(connection, "ev")
-        # Exact linkage: same eventID, region and instant. A detection links only when those
-        # match exactly one canonical record (identical duplicate records share a hash and all link).
+        # Exact linkage by eventID. A single-event row must also match region and instant. A correlation
+        # row lists its members' eventIDs (and regions) joined by " ¦ " with the latest member's time, so
+        # each member must match one of those regions at or before that time. A row links only when every
+        # member matches exactly one canonical record (identical duplicate records share a hash and all link).
         connection.execute("""
             CREATE TABLE detections AS
             WITH t AS (
-                SELECT row_number() OVER () AS suzaku_row, *, timezone('UTC', "Timestamp") AS event_time
+                SELECT row_number() OVER () AS suzaku_row, *, timezone('UTC', "Timestamp") AS event_time,
+                    list_distinct(string_split(EventID, ' ¦ ')) AS ids, string_split(AwsRegion, ' ¦ ') AS regions
                 FROM tl.timeline
+            ), p AS (
+                SELECT suzaku_row, unnest(ids) AS member_id, len(ids) AS members, regions, event_time, AwsRegion
+                FROM t
             ), m AS (
-                SELECT t.suzaku_row, e.source_record, e.record_sha256,
-                    count(DISTINCT e.record_sha256) OVER (PARTITION BY t.suzaku_row) AS hashes
-                FROM t JOIN ev.events e ON e.event_id = t.EventID
-                    AND e.aws_region IS NOT DISTINCT FROM t.AwsRegion AND e.event_time = t.event_time
+                SELECT p.suzaku_row, p.member_id, p.members, e.source_record, e.record_sha256,
+                    count(DISTINCT e.record_sha256) OVER (PARTITION BY p.suzaku_row, p.member_id) AS hashes
+                FROM p JOIN ev.events e ON e.event_id = p.member_id AND CASE WHEN p.members = 1
+                    THEN e.aws_region IS NOT DISTINCT FROM p.AwsRegion AND e.event_time = p.event_time
+                    ELSE list_contains(p.regions, e.aws_region) AND e.event_time <= p.event_time END
+            ), complete AS (
+                SELECT suzaku_row FROM m GROUP BY suzaku_row, members
+                HAVING count(DISTINCT member_id) FILTER (WHERE hashes = 1) = members
             ), links AS (
                 -- One row per linked evidence record; unlinked Suzaku rows are kept once, for the record.
-                SELECT suzaku_row, source_record, record_sha256, 'linked' AS link_status FROM m WHERE hashes = 1
+                SELECT suzaku_row, source_record, record_sha256, 'linked' AS link_status
+                FROM m WHERE suzaku_row IN (SELECT suzaku_row FROM complete)
                 UNION ALL
                 SELECT suzaku_row, NULL, NULL,
-                    CASE WHEN suzaku_row IN (SELECT suzaku_row FROM m) THEN 'ambiguous' ELSE 'no_match' END
-                FROM t WHERE suzaku_row NOT IN (SELECT suzaku_row FROM m WHERE hashes = 1)
+                    CASE WHEN suzaku_row IN (SELECT suzaku_row FROM m WHERE hashes > 1) THEN 'ambiguous' ELSE 'no_match' END
+                FROM t WHERE suzaku_row NOT IN (SELECT suzaku_row FROM complete)
             )
-            SELECT t.suzaku_row, l.source_record, l.record_sha256, l.link_status,
+            SELECT t.suzaku_row, l.source_record, l.record_sha256, l.link_status, len(t.ids) AS members,
                 t.RuleID AS rule_id, t.RuleTitle AS rule_title, t.Level::VARCHAR AS level,
                 list_position(?, t.Level::VARCHAR) - 1 AS level_rank, t.RuleAuthor AS rule_author,
                 coalesce(t.Tactics, []) AS tactics, coalesce(t.TechniqueIDs, []) AS technique_ids,
@@ -157,17 +168,23 @@ def load_detections(connection, path):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace suzaku", description=__doc__.splitlines()[0])
     parser.add_argument("--database", type=Path, required=True, help="Evidence DuckDB built by `kamotrace import`")
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--timeline", type=Path, help="Existing `suzaku aws-ct-timeline -t duckdb` output (.duckdb)")
-    group.add_argument("--suzaku", type=Path, help="Suzaku executable to run on --source")
+    group.add_argument("--suzaku", type=Path,
+                       help="Suzaku executable to run on --source (default: the copy from `kamotrace get-suzaku`)")
     parser.add_argument("--source", type=Path, help="CloudTrail export (file or folder) the database was imported from")
     parser.add_argument("--rules", type=Path, help="Suzaku rules folder (default: Suzaku's ./rules)")
     parser.add_argument("--min-level", choices=LEVELS, help="Minimum Sigma level for Suzaku to load")
     parser.add_argument("--output", type=Path, help="Detections sidecar (default: <database>.detections.duckdb)")
     parser.add_argument("--replace", action="store_true", help="Replace an existing detections sidecar")
     args = parser.parse_args(argv)
+    if not args.timeline and not args.suzaku:
+        from .get_suzaku import installed, tools_folder
+        args.suzaku = installed()
+        if args.suzaku is None:
+            parser.error(f"no Suzaku in {tools_folder()}: run `kamotrace get-suzaku`, or pass --suzaku or --timeline")
     if args.suzaku and not args.source:
-        parser.error("--suzaku needs --source")
+        parser.error("running Suzaku needs --source (the export you imported), or pass --timeline")
     if (args.rules or args.min_level) and not args.suzaku:
         parser.error("--rules/--min-level only apply when running --suzaku")
     for path in (args.database, args.timeline, args.suzaku, args.source):
@@ -181,6 +198,8 @@ def main(argv=None):
             work, timeline = run_suzaku(args.suzaku, args.source, args.rules, args.min_level)
         run = import_timeline(args.database, timeline, output, args.replace, args.source,
                               "(temporary output of the Suzaku run, deleted)" if work else None)
+    except (FileExistsError, ValueError, RuntimeError) as error:  # Without a KamoTrace traceback
+        parser.error(str(error))
     finally:
         if work:
             work.cleanup()

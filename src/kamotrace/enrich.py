@@ -28,7 +28,7 @@ def canonical_ip(value):
 def read_jsonl(path):
     """Validate a provider-neutral JSONL file. Returns {canonical ip: (fields..., attributes)}."""
     rows = {}
-    with path.open(encoding="utf-8") as stream:
+    with path.open(encoding="utf-8-sig") as stream:  # -sig: Windows tools often write a BOM
         for number, line in enumerate(stream, 1):
             if not line.strip():
                 continue

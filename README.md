@@ -1,4 +1,9 @@
-# KamoTrace
+![KamoTrace: a duck follows its tracks through the waves into a storm cloud full of yokai](docs/kamotrace-banner.jpg)
+
+# <img src="docs/kamotrace-icon.png" alt="" width="40" height="40"> KamoTrace
+
+*Kamo* (鴨) is Japanese for duck. KamoTrace follows the tracks (跡) through your
+CloudTrail logs.
 
 KamoTrace is a local, read-only investigation browser for AWS CloudTrail. Load
 an export into DuckDB from the command line, optionally add
@@ -15,6 +20,15 @@ HTML/JavaScript. No Node build, Docker, database server, account, cloud upload
 or runtime CDN is required. The evidence database is opened **read-only**; notes
 and tags are saved in a separate sidecar.
 
+![KamoTrace investigating a leaked access key: the attack chain filtered by user agent, tagged events with Sigma levels, and an agent's notes in the Findings sidebar](docs/kamotrace-investigation.png)
+
+*A synthetic case from the [end-to-end example](#end-to-end-example). The query
+is scoped to the attacker's user agent. It shows alice's leaked key (red
+`C` = `compromised-key`) creating the `svc-backup` user (purple `B`), which then
+stops CloudTrail and opens access. The Sigma column shows Suzaku severities,
+and the Findings sidebar lists the notes an agent wrote over MCP. Three events
+are selected, ready for **Quick tag** or **Add to note**.*
+
 ## What you can do
 
 - Slice events by Jakarta time; brush or click the filtered histogram to narrow it.
@@ -28,51 +42,109 @@ and tags are saved in a separate sidecar.
 - Let local AI agents search, tag/untag and write notes through an MCP adapter
   that shares the running browser's state.
 
-Jump to [Quick start](#quick-start), [Suzaku detections](#suzaku-detections),
+Jump to the [end-to-end example](#end-to-end-example), [Suzaku detections](#suzaku-detections),
 [IP enrichment](#ip-enrichment),
 [CloudTrail workflow](#cloudtrail-workflow),
 [findings: tags and notes](#findings-tags-and-notes), [SSM views](#ssm-command-browser-desktop),
 [agent access (MCP)](#agent-access-mcp) or [storage and backups](#storage-and-backups).
 
-## Quick start
+## End-to-end example
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/).
-Install the `kamotrace` command from a checkout (or from a built wheel):
+A walkthrough from a CloudTrail download to an agent writing findings. The
+outputs shown come from running it on the synthetic case in the screenshot
+above: alice's access key is used from a VPN exit at 01:12 WIB, creates a
+`svc-backup` admin user, and that user stops CloudTrail, runs an SSM command
+and opens a bucket to the world. (Prefer containers? The same steps work in
+[Docker](#docker).)
 
-```powershell
-uv tool install C:\path\to\KamoTrace
-```
-
-From a checkout you can also skip installing and prefix every command with
-`uv run` (for example `uv run kamotrace serve ...`).
-
-Loading data is a command-line step; the browser never imports files. Import an
-AWS CloudTrail event-history JSON export (a top-level `Records` array):
+**1. Install.** Requires Python 3.11+ and
+[uv](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```powershell
-kamotrace import --source C:\evidence\event_history.json --database C:\evidence\case.duckdb
+uv tool install C:\path\to\KamoTrace     # from a checkout or a built wheel
 ```
 
-The importer preserves nested JSON and numeric precision, verifies every canonical
-record hash, records source-file provenance, and refuses to overwrite an existing
-database. It stages records in an automatically cleaned OS temporary directory.
-Use a private local disk for both the source and temporary directory: events may
-contain secrets.
+(From a checkout you can instead prefix every command with `uv run`.)
 
-Optionally add Suzaku detections (see [Suzaku detections](#suzaku-detections)):
+**2. Download the evidence.** In the AWS console open **CloudTrail → Event
+history**, set the time range (up to the last 90 days of management events) and
+choose **Download events → Download as JSON**. You get `event_history.json`
+with a top-level `Records` array. A download covers one region and up to
+200,000 events. Keep it on a private local disk: events can contain secrets.
+
+**3. Import it** into a new, read-only evidence database. Loading data is always
+a command-line step; the browser never imports files.
 
 ```powershell
-kamotrace suzaku --database C:\evidence\case.duckdb --suzaku C:\tools\suzaku\suzaku-3.0.0-win-x64.exe --source C:\evidence\event_history.json
+mkdir C:\cases\acme; cd C:\cases\acme
+kamotrace import --source event_history.json --database case.duckdb
+```
+```text
+"records": 320,  "all_record_hashes_verified": true,  "source_sha256": "...", ...
 ```
 
-Start the browser server:
+The importer preserves nested JSON and numeric precision, hashes every record,
+records the source file's hash, and refuses to overwrite an existing database.
+
+**4. Add Sigma detections (optional).** Download Suzaku once, then run it on the
+same export ([details](#suzaku-detections)):
 
 ```powershell
-kamotrace serve --database C:\evidence\case.duckdb
+kamotrace get-suzaku
+kamotrace suzaku --database case.duckdb --source event_history.json
+```
+```text
+"suzaku_version": "3.0.0",  "linked_rows": 300,  "no_match_rows": 0,  "ambiguous_rows": 0
 ```
 
-Open **http://127.0.0.1:8765** on the same computer and leave the server running.
-It listens on loopback only. Access from a different computer requires a trusted
+**5. Enrich source IPs (optional).** Use MaxMind GeoLite2 and/or your own
+provider's data as JSONL, highest priority first ([details](#ip-enrichment)):
+
+```powershell
+kamotrace enrich --database case.duckdb --jsonl spur.jsonl --geolite2 C:\geoip
+```
+
+**6. Investigate in the browser.**
+
+```powershell
+kamotrace serve --database case.duckdb
+```
+
+Open **http://127.0.0.1:8765**. The histogram shows the burst on 25 October,
+and the **Detections** tab lists the Suzaku rules that fired. The **Source IP**
+column summary (**≡** in its header) shows two rare addresses next to the
+office IP. Hover one in the grid, click its funnel button and choose **is** to
+pivot to it; **Back** returns. Select events with the checkboxes, tag them with **Quick tag**, and
+write a Markdown note with **Add to note**. The **Findings** sidebar lists tags,
+notes and rules as things you can browse and reopen.
+
+**7. Let an agent help.** Install the
+[agent skill](#agent-skill) and register the MCP adapter while `serve` runs:
+
+```powershell
+Copy-Item -Recurse C:\path\to\KamoTrace\skills\investigating-with-kamotrace $HOME\.claude\skills\
+claude mcp add kamotrace -- kamotrace mcp --url http://127.0.0.1:8765
+```
+
+Then ask, for example: *"Use KamoTrace to check whether any access key was used
+from somewhere unusual, follow what it did, and tag and note what you can
+confirm."* In the run behind the screenshot, the agent:
+
+1. called `describe_schema`, `list_detections` and
+   `summarize_field("source_ip")`, which showed 198.51.100.7 and 203.0.113.50 as
+   rare against the office IP;
+2. searched alice's access key (`key_id` equals her key ID) with `source_ip`
+   not equal to the office IP 192.0.2.10, found 7 events and checked one raw
+   record's hash with `get_event`;
+3. tagged them `compromised-key` and wrote a note with the query attached, separating
+   what it observed from what it inferred;
+4. pivoted to `identity contains svc-backup` (8 events), tagged `backdoor-user`,
+   `defense-evasion` and `impact`, and wrote a second note.
+
+Refresh the browser to review the agent's tags and notes, and change or delete
+any you disagree with: you and the agent share one set of findings.
+
+Leave the server running while you work. It listens on loopback only. Access from a different computer requires a trusted
 port forward or another explicitly secured arrangement. It is deliberately not
 exposed on the LAN or Internet and is not a multi-user production service. Host
 and Origin checks protect loopback access; there is no arbitrary-SQL API. Do not
@@ -83,7 +155,8 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | Command | Purpose |
 | --- | --- |
 | `kamotrace import --source FILE --database NEW.duckdb` | Build a new evidence database from a CloudTrail `Records` JSON export |
-| `kamotrace suzaku --database DB (--timeline FILE \| --suzaku EXE --source FILE)` | Import Suzaku detections into `<database>.detections.duckdb` |
+| `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
+| `kamotrace suzaku --database DB (--source FILE [--suzaku EXE] \| --timeline FILE)` | Run or import Suzaku detections into `<database>.detections.duckdb` |
 | `kamotrace enrich --database DB (--geolite2 FOLDER \| --jsonl FILE)...` | Add offline IP enrichment into `<database>.enrichment.duckdb` |
 | `kamotrace serve --database DB [options]` | Start the browser UI on `127.0.0.1` |
 | `kamotrace mcp --url http://127.0.0.1:8765` | Stdio MCP adapter for agents, backed by a running `serve` |
@@ -100,6 +173,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `--detections PATH` | Suzaku detections sidecar | `<database stem>.detections.duckdb` if present |
 | `--ssm-export PATH` | Consolidated SSM command/output JSON | None; optional |
 | `--port NUMBER` | Local listening port | `8765` |
+| `--bind ADDRESS` | Listening address; only for containers (see [Docker](#docker)) | `127.0.0.1` (`0.0.0.0` in the image) |
 
 Paths are relative to your terminal's current folder unless absolute. Quote
 paths containing spaces. A path that does not exist stops startup with an error.
@@ -117,15 +191,83 @@ Only code, synthetic tests and third-party browser assets belong in this
 repository. Databases, `event_history*.json`, enrichment JSONL, `.mmdb` files and
 the `data/` directory are gitignored; keep evidence outside the repository.
 
+## Docker
+
+The image contains KamoTrace and all its Python dependencies. It does not
+contain Suzaku (AGPL-3.0) or MaxMind GeoLite2 data (EULA): `get-suzaku`
+downloads Suzaku into a persistent `/tools` volume, and you mount your own
+GeoLite2 folder. Build it from a checkout:
+
+```powershell
+docker build -t kamotrace C:\path\to\KamoTrace
+```
+
+Put the export (and optional `spur.jsonl`, SSM export) in a case folder and
+mount it at `/case`. Every command is `docker run ... kamotrace <command>`:
+
+```powershell
+docker run --rm -v C:\case:/case kamotrace import --source /case/event_history.json --database /case/case.duckdb
+docker run --rm -v kamotrace-tools:/tools kamotrace get-suzaku
+docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace suzaku --database /case/case.duckdb --source /case/event_history.json
+docker run --rm -v C:\case:/case -v C:\geoip:/geoip:ro kamotrace enrich --database /case/case.duckdb --geolite2 /geoip
+docker run --rm --name kamotrace -p 127.0.0.1:8765:8765 -v C:\case:/case kamotrace serve --database /case/case.duckdb
+```
+
+Then open **http://127.0.0.1:8765**. Sidecars (notes/tags, detections,
+enrichment) are written beside the database in the case folder, so stop the
+container before backing it up. The evidence database is still opened read-only.
+
+Inside the container the server must listen on all interfaces
+(`KAMOTRACE_BIND=0.0.0.0`) so Docker can publish the port. **Always publish it
+as `-p 127.0.0.1:PORT:PORT`**: there is no authentication, and a plain
+`-p 8765:8765` exposes the evidence to your network. The Host/Origin checks stay
+on, which means the host and container port must be the same; for another port
+use `--port 8766 -p 127.0.0.1:8766:8766`. Other containers on the same Docker
+network can also reach the port; don't attach the container to shared
+networks.
+
+Agents connect with the MCP adapter inside the running container (no extra
+port). For Claude Code:
+
+```powershell
+claude mcp add kamotrace -- docker exec -i kamotrace kamotrace mcp --url http://127.0.0.1:8765
+```
+
+or in a JSON MCP client configuration:
+
+```json
+{"mcpServers": {"kamotrace": {"command": "docker",
+  "args": ["exec", "-i", "kamotrace", "kamotrace", "mcp", "--url", "http://127.0.0.1:8765"]}}}
+```
+
+On Linux, add `--user "$(id -u):$(id -g)"` to `docker run` so files in the case
+folder belong to you.
+
 ## Suzaku detections
 
 [Suzaku](https://yamato-security.github.io/suzaku/) (Yamato Security) is a
 Sigma-based threat-hunting and timeline tool for cloud logs. KamoTrace does not
-bundle it (Suzaku is AGPL-3.0); install it yourself and point KamoTrace at it.
-Supported input is Suzaku 3.x `aws-ct-timeline` DuckDB output (`suzaku_meta`
-schema version 1, UTC timestamps).
+bundle it (Suzaku is AGPL-3.0). Supported input is Suzaku 3.x `aws-ct-timeline`
+DuckDB output (`suzaku_meta` schema version 1, UTC timestamps).
 
-Either let KamoTrace run Suzaku on the same export you imported:
+The easiest way to get it is the download helper, which fetches the official
+release for your platform from
+[GitHub](https://github.com/Yamato-Security/suzaku/releases) (latest 3.x, or
+`--version 3.0.0`), checks the archive against GitHub's published SHA-256 and
+unpacks it, with its bundled Sigma rules, into `~/.kamotrace/tools` (or
+`$KAMOTRACE_TOOLS`, or `--dest`):
+
+```powershell
+kamotrace get-suzaku
+kamotrace suzaku --database C:\evidence\case.duckdb --source C:\evidence\event_history.json [--min-level low]
+```
+
+Without `--suzaku`, `kamotrace suzaku` runs the newest copy the helper
+installed. The checksum guards against a corrupted or altered download, not
+against a compromised release. Suzaku's licence and source are at its
+repository. Rerun `get-suzaku` to update; each version keeps its own folder.
+
+Or use your own Suzaku binary and rules:
 
 ```powershell
 kamotrace suzaku --database C:\evidence\case.duckdb --suzaku C:\tools\suzaku\suzaku-3.0.0-win-x64.exe --source C:\evidence\event_history.json [--rules C:\tools\suzaku\rules] [--min-level low]
@@ -143,11 +285,18 @@ are found), writes its output to a temporary folder and deletes it afterwards.
 
 How detections join KamoTrace's model:
 
-- Each Suzaku row is one event × rule match. It is linked to an evidence record
-  only when **eventID, AWS region and event time all match exactly**. Identical
+- Each ordinary Suzaku row is one event × rule match. It is linked to an evidence
+  record only when **eventID, AWS region and event time all match exactly**. Identical
   duplicate records (same canonical hash) all receive the match. Rows matching
   no record, or several different records, are kept in the sidecar as
   `no_match`/`ambiguous` and counted, but never shown on an event.
+- Suzaku 3 **correlation rules** (for example "IAM Persis Chain via User and
+  Access Key Creation") report several events in one row: their eventIDs and
+  regions joined by ` ¦ `, stamped with the latest member's time. Each member
+  links by its exact eventID, within one of the listed regions and no later
+  than that time. The row links to all its member events only when every
+  member matches exactly one record; otherwise it is kept unlinked like any
+  other row.
 - Output goes to a separate `<database stem>.detections.duckdb`. The evidence
   database is attached read-only and never modified. An existing sidecar is
   only replaced with `--replace`.
@@ -185,7 +334,8 @@ kamotrace enrich --database C:\evidence\case.duckdb --geolite2 C:\geoip
 kamotrace enrich --database C:\evidence\case.duckdb --jsonl C:\evidence\spur.jsonl --geolite2 C:\geoip --replace
 ```
 
-`--geolite2` and `--jsonl` can each be repeated. **Order is priority:** for
+Give `--geolite2` at most once; `--jsonl` can be repeated (with distinct file
+names, since the name is the label). **Order is priority:** for
 country, city, ASN and network, the first source given that has a value wins.
 Extra `attributes` from every source are kept, prefixed with the source label.
 The label is `geolite2` or the JSONL file name without its extension (`spur`),
@@ -281,6 +431,10 @@ Tag and annotate selected events from the bar above the grid:
   new note also stores the browser query it was written from (as inert JSON that
   is re-validated when reopened); older sidecars gain that column automatically
   and their existing notes simply have no saved query.
+- The first time a sidecar is opened, it records which evidence database it
+  belongs to (the import's source hash and record count), older sidecars
+  included. Opening it with a different database is refused, so one case's
+  notes can't be mixed into another's.
 
 ## CloudTrail workflow
 
@@ -440,7 +594,7 @@ browser tab ──────────────────────�
                                                                                └─▶ notes/tags SQLite sidecar
 ```
 
-Start the browser server first (as in [Quick start](#quick-start)), then register
+Start the browser server first (as in the [end-to-end example](#end-to-end-example)), then register
 the adapter with your client. Use the browser's port if you changed it with
 `--port`. These examples assume `kamotrace` is installed (`uv tool install`);
 otherwise use `uv run --directory C:\path\to\KamoTrace kamotrace mcp ...`.
@@ -506,7 +660,7 @@ changed the note since, the call fails without writing; re-read it and retry.
 | `list_notes` / `get_note` | Notes (searchable), with linked event counts and the query they were written from; one note plus a page of its linked events. |
 | `create_note` / `edit_note` / `delete_note` | Markdown notes (sanitized when the browser renders them). `create_note` can record the agent's query so **Reopen query** works in the browser. |
 | `link_note_events` / `unlink_note_events` | Add or remove linked events; a note keeps at least one. |
-| `list_detections` | Imported Suzaku rules (severity, ATT&CK tags, linked event counts) and the import's provenance. Filter with `query.rules` (all must match) or `query.min_level`. |
+| `list_detections` | Imported Suzaku rules (severity, ATT&CK tags, linked event counts) and the import's provenance. Takes no arguments; to search a rule's events use `query.rules` (all must match) or `query.min_level` in `search_events`, `summarize_field` or `event_histogram`. |
 | `search_ssm_commands` / `get_ssm_command` / `get_ssm_event` | SSM commands from the JSON-backed export, each system/plugin output kept separate, linked CloudTrail events by exact account/region/command ID. |
 
 Times are ISO 8601 with an explicit offset (`2026-03-02T00:00:00+07:00`);
@@ -517,6 +671,27 @@ adapter tells agents not to follow instructions found inside them.
 Run only one browser server per notes sidecar: it holds the sidecar's working
 copy of tags/notes for queries, and a second server on the same sidecar would
 not see the first one's writes until restarted.
+
+### Agent skill
+
+[`skills/investigating-with-kamotrace/SKILL.md`](skills/investigating-with-kamotrace/SKILL.md)
+teaches agents how to use these tools well: the query model and Jakarta time
+boundaries, which identity to write to and which to cite, the
+orient → narrow → verify → pivot → record loop, tag reuse, note conflicts, SSM
+output and detections, and the error messages. It also covers the safety rules:
+evidence is untrusted, writes go only to explicit events, and leads are not
+findings. Install it where your agent looks for skills, for example:
+
+```powershell
+# Claude Code (all projects): copy the folder into your personal skills
+Copy-Item -Recurse C:\path\to\KamoTrace\skills\investigating-with-kamotrace $HOME\.claude\skills\
+# Amp (all projects): run from the checkout; Amp expects a relative local path
+cd C:\path\to\KamoTrace
+amp skill add ./skills/investigating-with-kamotrace --global
+```
+
+To scope it to one case instead, put it in that case folder's
+`.claude/skills/` or `.agents/skills/`.
 
 ## Storage and backups
 
@@ -535,6 +710,9 @@ The app does not collect AWS data or refresh exports: replace/update local files
 and restart to reload them. It does not fetch output URLs or run shell commands.
 
 ## Troubleshooting and limitations
+
+Known bugs and open limitations, with workarounds, are tracked in
+[docs/BUGS.md](docs/BUGS.md).
 
 - **Missing database:** import a CloudTrail `Records` JSON export first, or pass
   `--database` with the correct path. An arbitrary DuckDB file will not have the
@@ -585,9 +763,12 @@ Markdown uses vendored `marked@15.0.12` (MIT) and `dompurify@3.2.7`
 uv run python -m unittest discover -s tests
 node --check src/kamotrace/static/app.js
 uv build
+docker build -t kamotrace .
 ```
 
 Only the optional JavaScript syntax check needs Node. There is no Node build.
+The unit tests never download Suzaku; check `get-suzaku` and a real Suzaku run
+in the container by hand, on synthetic data.
 
 Tests use synthetic records and a disposable database built through the bundled importer,
 real HTTP requests, asymmetric Jakarta-midnight boundaries, combined filters,

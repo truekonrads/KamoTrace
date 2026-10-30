@@ -1,0 +1,8 @@
+# Only the package sources go into the image; never evidence, sidecars or local environments.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+src/**/__pycache__

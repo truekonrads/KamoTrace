@@ -91,7 +91,7 @@ def call(path, body=None):
             message = None
         raise ToolError(message or f"Browser server returned HTTP {error.code}") from None
     except URLError as error:
-        raise ToolError(f"Cannot reach the CloudTrail browser at {BASE} ({error.reason}); start server.py first") from None
+        raise ToolError(f"Cannot reach the CloudTrail browser at {BASE} ({error.reason}); start `kamotrace serve` first") from None
 
 
 def rows(result):

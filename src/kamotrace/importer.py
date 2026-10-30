@@ -19,6 +19,13 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def records(stream):
+    """CloudTrail Records from a binary stream, skipping a UTF-8 byte-order mark (common on Windows)."""
+    if stream.read(3) != b"\xef\xbb\xbf":
+        stream.seek(0)
+    return ijson.items(stream, "Records.item")
+
+
 def build(source, database):
     source = source.resolve()
     database = database.resolve()
@@ -33,7 +40,7 @@ def build(source, database):
         staged = Path(temp) / "records.jsonl"
         count = 0
         with source.open("rb") as stream, staged.open("w", encoding="utf-8", newline="\n") as output:
-            for count, record in enumerate(ijson.items(stream, "Records.item"), 1):
+            for count, record in enumerate(records(stream), 1):
                 if not isinstance(record, dict):
                     raise ValueError(f"Record {count} is not an object")
                 output.write(json.dumps(record, ensure_ascii=False, use_decimal=True,
@@ -95,7 +102,7 @@ def build(source, database):
                 "SELECT source_record, record_sha256 FROM raw_events ORDER BY source_record"
             ).fetchall())
             with source.open("rb") as stream:
-                for ordinal, record in enumerate(ijson.items(stream, "Records.item"), 1):
+                for ordinal, record in enumerate(records(stream), 1):
                     canonical = json.dumps(record, ensure_ascii=False, use_decimal=True,
                                            allow_nan=False, separators=(",", ":"))
                     expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()

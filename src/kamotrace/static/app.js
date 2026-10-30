@@ -86,6 +86,8 @@ function normalize(state) {
     rules: (Array.isArray(s.rules) ? s.rules : []).filter(
       (r) => typeof r === "string",
     ),
+    // Agents can save a minimum Sigma level with a note; keep it so Reopen query matches their result.
+    min_level: meta.levels.includes(s.min_level) ? s.min_level : null,
     command_key: typeof s.command_key === "string" ? s.command_key : null,
     command_label: typeof s.command_label === "string" ? s.command_label : null,
   };
@@ -129,6 +131,7 @@ function query() {
     tags: applied.tags,
     annotation_id: applied.annotation_id,
     rules: applied.rules,
+    min_level: applied.min_level,
     command_key: applied.command_key,
     filters: applied.filters,
   };
@@ -302,6 +305,15 @@ function renderScopes() {
       }),
     );
   }
+  if (s.min_level !== null)
+    out.push(
+      chip(`Sigma ≥ ${s.min_level}`, {
+        kind: "rule",
+        title: `Only events with a Suzaku detection at level ${s.min_level} or above.`,
+        onClick: () => findingsTab("detections"),
+        onRemove: () => apply({ ...s, min_level: null }),
+      }),
+    );
   if (s.command_key !== null)
     out.push(
       chip(`SSM command ${s.command_label || s.command_key}`, {
@@ -1457,6 +1469,7 @@ function scopeSummary(s) {
     parts.push(
       `Sigma ${detections.rules.find((d) => d.rule_id === r)?.title || r}`,
     );
+  if (s.min_level) parts.push(`Sigma ≥ ${s.min_level}`);
   if (s.command_key !== null)
     parts.push(`SSM command ${s.command_label || ""}`);
   return parts.join(" · ");

@@ -13,7 +13,14 @@ Package layout: `src/kamotrace/`, installed as the `kamotrace` command
 (`pyproject.toml`). Loading data and enrichment are CLI steps; the browser UI
 only reads them.
 
-- `cli.py`: `kamotrace import | suzaku | enrich | serve | mcp` dispatcher.
+- `cli.py`: `kamotrace import | get-suzaku | suzaku | enrich | serve | mcp` dispatcher.
+- `get_suzaku.py`: downloads the official Suzaku 3.x release for the platform,
+  verifies GitHub's published SHA-256, refuses unsafe archive paths, and installs
+  into `$KAMOTRACE_TOOLS` (default `~/.kamotrace/tools`), where `kamotrace suzaku`
+  finds it. Suzaku is fetched by the user at run time, never baked into the image.
+- `Dockerfile`: two-stage `uv sync --locked` image on Debian trixie (Suzaku's gnu
+  build needs glibc 2.39+). It sets `KAMOTRACE_BIND=0.0.0.0`; docs must always
+  publish `-p 127.0.0.1:PORT:PORT` with equal host/container ports.
 - `importer.py`: streaming CloudTrail JSON importer, canonical hashes and source
   provenance (`build_info`). Refuses to overwrite existing evidence databases.
 - `suzaku.py`: runs or imports Suzaku 3.x `aws-ct-timeline -t duckdb` output into
@@ -32,6 +39,9 @@ only reads them.
   browser and agents share one Store, its validation and its review temp tables.
   Add capabilities to `server.py`/`ssm.py` first; keep the adapter a thin mapping.
   Write tools take explicit `record_sha256` lists, never a whole query.
+- `skills/investigating-with-kamotrace/SKILL.md`: the end-user agent skill for
+  the MCP tools. When a tool, argument, operator, error message or identity rule
+  changes, update the skill too, and recheck its examples through a real MCP session.
 - `static/app.js`, `app.css`, `index.html`: desktop UI. Reuse the vendored
   Tabulator grid and noUiSlider rather than introducing a framework.
 - `static/vendor/`: unmodified third-party assets and their licenses.

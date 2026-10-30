@@ -9,7 +9,7 @@ class Commands:
     def __init__(self, path, connection):
         self.commands, self.events = {}, {}
         self.path = path
-        document = json.loads(path.read_text(encoding="utf-8")) if path else {}
+        document = json.loads(path.read_text(encoding="utf-8-sig")) if path else {}
         if path and (not isinstance(document, dict) or not isinstance(document.get("account_id"), str)
                      or any(not isinstance(document.get(k), list) for k in ("commands", "invocations", "invocation_details"))):
             raise ValueError("Expected an SSM command/session activity export with account_id, commands, invocations and invocation_details")

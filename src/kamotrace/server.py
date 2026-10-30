@@ -5,6 +5,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -59,8 +60,11 @@ def build_query(body):
     if not isinstance(search, str) or len(search) > 2000:
         raise ValueError("Search must be text, up to 2,000 characters")
     if search:
-        conditions.append("contains(lower(raw_event::VARCHAR), lower(?))")
-        params.append(search)
+        # raw_event is stored JSON text, where " and \ (and control characters) appear escaped, so also
+        # match the escaped form: `C:\Windows` is stored as `C:\\Windows`.
+        escaped = json.dumps(search, ensure_ascii=False)[1:-1]
+        conditions.append("(contains(lower(raw_event::VARCHAR), lower(?)) OR contains(lower(raw_event::VARCHAR), lower(?)))")
+        params += [search, escaped]
     filters = body.get("filters", [])
     if not isinstance(filters, list) or len(filters) > 20:
         raise ValueError("Use at most 20 filters")
@@ -130,7 +134,7 @@ def build_query(body):
         raise ValueError("Invalid page or page size")
     where = "\nWHERE " + "\n  AND ".join(conditions) if conditions else ""
     sql = ("SELECT id, record_sha256, time_local, event_name, event_source, identity, source_ip, country,\n"
-           "       identity_type, key_id, target, document_name, error_code, region, isp, city, asn, ip_info, event_id\n"
+           "       identity_type, key_id, target, document_name, error_code, region, isp, city, asn, ip_info, user_agent, event_id\n"
            "FROM browse_events" + where + "\nORDER BY " + ", ".join(ordering) + "\nLIMIT ? OFFSET ?")
     return sql, params + [size, (page - 1) * size], "SELECT count(*) FROM browse_events" + where, params, size
 
@@ -150,7 +154,18 @@ class Store:
                 hash TEXT NOT NULL, PRIMARY KEY(annotation_id, hash));
             CREATE TABLE IF NOT EXISTS tags(slug TEXT PRIMARY KEY, color TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS event_tags(hash TEXT NOT NULL, slug TEXT REFERENCES tags(slug), PRIMARY KEY(hash, slug));
+            CREATE TABLE IF NOT EXISTS sidecar_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        # Bind the sidecar to its evidence on first use (older sidecars too), so another case's notes
+        # can't be mixed in silently, as detections and enrichment sidecars already refuse.
+        from .suzaku import evidence_identity
+        identity = json.dumps(list(evidence_identity(self.connection)))
+        self.reviews.execute("INSERT OR IGNORE INTO sidecar_meta VALUES ('evidence', ?)", (identity,))
+        self.reviews.commit()
+        if self.reviews.execute("SELECT value FROM sidecar_meta WHERE key='evidence'").fetchone()[0] != identity:
+            self.reviews.close()
+            raise ValueError("This notes/tags sidecar belongs to a different evidence database; "
+                             "pass the right --annotations file or a new path")
         # Additive migration: older sidecars lack the query a note was written from.
         if "context" not in {r["name"] for r in self.reviews.execute("PRAGMA table_info(annotations)")}:
             self.reviews.execute("ALTER TABLE annotations ADD COLUMN context TEXT")
@@ -468,7 +483,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(detail or {"error": "Event not found"}, 200 if detail else 404)
         elif path.startswith("/api/"):
             self.respond({"error": "Not found"}, 404)
-        elif path in ("/", "/index.html", "/app.js", "/app.css") or path.startswith("/vendor/"):
+        elif path in ("/", "/index.html", "/app.js", "/app.css", "/favicon.png") or path.startswith("/vendor/"):
             super().do_GET()
         else:
             self.respond({"error": "Not found"}, 404)
@@ -504,6 +519,10 @@ def main(argv=None):
     parser.add_argument("--enrichment", type=Path,
                         help="IP enrichment from `kamotrace enrich` (default: <database>.enrichment.duckdb if present)")
     parser.add_argument("--port", type=int, default=8765)
+    # Containers must listen on all interfaces so Docker can publish the port; the image sets
+    # KAMOTRACE_BIND=0.0.0.0 and the README publishes it on the host's 127.0.0.1 only.
+    parser.add_argument("--bind", default=os.environ.get("KAMOTRACE_BIND", "127.0.0.1"),
+                        help="Listening address (default: 127.0.0.1, or $KAMOTRACE_BIND inside the container)")
     parser.add_argument("--annotations", type=Path, help="SQLite sidecar (default: beside the evidence database)")
     parser.add_argument("--ssm-export", type=Path, help="Local ssm_command_session_activity[.enriched].json export")
     parser.add_argument("--detections", type=Path,
@@ -513,9 +532,15 @@ def main(argv=None):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             parser.error(f"--{name.replace('_', '-')} not found: {path}")
-    store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
-                  args.ssm_export, args.detections and args.detections.resolve())
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), partial(Handler, store=store))
+    try:
+        store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
+                      args.ssm_export, args.detections and args.detections.resolve())
+    except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
+        parser.error(str(error))
+    server = ThreadingHTTPServer((args.bind, args.port), partial(Handler, store=store))
+    if args.bind != "127.0.0.1":
+        print(f"Listening on {args.bind}:{args.port}: anyone who can reach this port gets unauthenticated "
+              f"access. Publish it only as 127.0.0.1:{args.port}:{args.port}.", flush=True)
     detections = (f" | {store.suzaku_run['linked_rows']:,} Suzaku detections" if store.suzaku_run else "")
     print(f"KamoTrace: http://127.0.0.1:{args.port} | {store.meta['total']:,} events{detections} | read-only", flush=True)
     try:
