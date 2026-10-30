@@ -9,6 +9,7 @@ import io
 import os
 from pathlib import Path
 import shutil
+import statistics
 import sqlite3
 import sys
 import threading
@@ -35,9 +36,11 @@ LIMITATIONS = [
 # so two workers keep a slow (high-latency) connection near that limit without exceeding it.
 LOOKUP_INTERVAL = 0.55
 WINDOW_WORKERS = 2
-# Show a CloudTrail ETA only after every unfinished Region has this much of its own AWS pace measured.
-ETA_MIN_WINDOWS = 2
+# Show a CloudTrail ETA only after every unfinished Region has this much of its own AWS pace measured,
+# and project a running day from its own density only once this fraction of it is covered.
+ETA_MIN_PAGES = 10
 ETA_MIN_SECONDS = 10
+ETA_MIN_COVERAGE = 0.1
 
 
 class Stopped(RuntimeError):
@@ -109,42 +112,75 @@ class Progress:
         self.lock = threading.RLock()  # Region workers share counters and the terminal.
         self.started = clock.monotonic()
         # Region -> [windows, completed, fetched from AWS, first fetched window's start]; None without CloudTrail.
-        self.windows, self.ssm, self.cloudtrail_done = None, False, None
-        self.local = threading.local()  # The window a worker thread is collecting.
+        self.regions, self.ssm, self.cloudtrail_done = None, False, None
+        self.batches = {}  # Worker thread -> [Region, pages so far, fraction of its day covered or None].
 
     def plan(self, regions, windows, ssm):
-        self.windows = {region: [windows, 0, 0, None] for region in regions} if windows else None
+        # left: unfinished windows; sizes: finished windows' pages (checkpoint replays included, as
+        # sizes are real); fresh/since: pages fetched from AWS and when the first one arrived.
+        self.regions = {region: {"left": windows, "sizes": [], "fresh": 0, "since": None}
+                        for region in regions} if windows else None
         self.ssm = ssm
 
-    def window_started(self):
-        self.local.began, self.local.fetched = clock.monotonic(), False
-
-    def window_done(self, region):
+    def window_started(self, region):
         with self.lock:
-            entry = self.windows[region]
-            entry[1] += 1
-            if self.local.fetched:  # Windows replayed from the checkpoint say nothing about AWS pace.
-                entry[2] += 1
-                entry[3] = min(entry[3] or self.local.began, self.local.began)
-            if all(total == completed for total, completed, _, _ in self.windows.values()):
+            self.batches[threading.get_ident()] = [region, 0, None]
+
+    def covered(self, fraction):
+        """LookupEvents pages run newest first, so the oldest event so far shows how much of the day is done."""
+        with self.lock:
+            batch = self.batches[threading.get_ident()]
+            batch[2] = max(batch[2] or 0, min(fraction, 1))
+
+    def window_done(self):
+        with self.lock:
+            region, pages, _ = self.batches.pop(threading.get_ident())
+            entry = self.regions[region]
+            entry["left"] -= 1
+            entry["sizes"].append(pages)
+            if not any(entry["left"] for entry in self.regions.values()):
                 self.cloudtrail_done = clock.monotonic()
 
+    def remaining(self, now):
+        """Seconds for the slowest Region at its own fetch pace, or None while there is too little to go on."""
+        running = {}
+        for region, pages, fraction in self.batches.values():
+            running.setdefault(region, []).append((pages, fraction))
+        longest = 0
+        for region, entry in self.regions.items():
+            if not entry["left"]:
+                continue
+            if entry["fresh"] < ETA_MIN_PAGES or now - entry["since"] < ETA_MIN_SECONDS:
+                return None
+            # The median, so one unusually busy day does not make every remaining day look busy.
+            typical = statistics.median(entry["sizes"]) if len(entry["sizes"]) >= 2 else None
+            batches = running.get(region, [])
+            unstarted = entry["left"] - len(batches)
+            if unstarted and typical is None:
+                return None
+            pages = unstarted * (typical or 0)
+            for fetched, fraction in batches:
+                if fraction is not None and fraction >= ETA_MIN_COVERAGE:
+                    pages += fetched / fraction - fetched  # Extrapolate the day's own density.
+                elif typical is not None and fetched <= typical:
+                    pages += typical - fetched
+                else:
+                    return None  # Already larger than usual, too early in its day to project.
+            # The first fresh page's own fetch time precedes "since", so it is not counted.
+            longest = max(longest, pages * (now - entry["since"]) / (entry["fresh"] - 1))
+        return longest
+
     def eta(self):
-        """Slowest region's remaining windows at its own observed pace; regions run concurrently."""
         parts = []
-        if self.cloudtrail_done:
+        if self.cloudtrail_done is not None:
             parts.append(f"CloudTrail done in {minutes(self.cloudtrail_done - self.started)}")
-        elif self.windows:
-            now, longest = clock.monotonic(), 0
-            for total, completed, fetched, began in self.windows.values():
-                if completed == total:
-                    continue
-                if fetched < ETA_MIN_WINDOWS or now - began < ETA_MIN_SECONDS:
-                    longest = None
-                    break
-                longest = max(longest, (total - completed) * (now - began) / fetched)
-            parts.append("CloudTrail ETA estimating" if longest is None else f"CloudTrail ETA {rough(longest)} (rough)")
-        if self.ssm and self.done < self.total:
+        elif self.regions:
+            seconds = self.remaining(clock.monotonic())
+            parts.append("CloudTrail ETA estimating" if seconds is None else f"CloudTrail ETA {rough(seconds)} (rough)")
+        # SSM may run alongside CloudTrail, so finished jobs beyond finished CloudTrail Regions are SSM.
+        # A Region's CloudTrail counts as finished slightly before its job does, which only delays this.
+        ssm_done = self.done - sum(not entry["left"] for entry in self.regions.values()) if self.regions else self.done
+        if self.ssm and ssm_done < (len(self.regions) if self.regions else self.total):
             parts.append("SSM ETA unknown")
         return "; ".join(parts)
 
@@ -155,8 +191,13 @@ class Progress:
             if page is not None:
                 self.pages += 1
                 self.cached += page
-                if not page:
-                    self.local.fetched = True
+                batch = self.batches.get(threading.get_ident())
+                if batch:
+                    batch[1] += 1
+                    entry = self.regions[batch[0]]
+                    if not page:  # Checkpoint replays say nothing about AWS pace.
+                        entry["fresh"] += 1
+                        entry["since"] = entry["since"] or clock.monotonic()
             if self.mode == "off":
                 return
             eta = self.eta()
@@ -196,6 +237,7 @@ class Progress:
         """The calling worker finished its task; drop its line at the next redraw."""
         with self.lock:
             self.lines.pop(threading.get_ident(), None)
+            self.batches.pop(threading.get_ident(), None)  # A failed window.
 
     def transferred(self, size):
         with self.lock:
@@ -355,7 +397,7 @@ class Collector:
         self.parallel(lambda window: self.window(region, *window), self.windows(), WINDOW_WORKERS)
 
     def window(self, region, lower, upper):
-        self.progress.window_started()
+        self.progress.window_started(region)
         self.progress.tick(f"{region}: CloudTrail batch {iso(lower)} to {iso(upper)}")
         for page in self.pages("cloudtrail", region, "lookup_events", {
                 "StartTime": lower, "EndTime": upper, "MaxResults": 50}):
@@ -365,7 +407,11 @@ class Collector:
                         # Keep original JSON; shared inclusive batch boundaries deduplicate by ID.
                         self.db.execute("INSERT OR IGNORE INTO events VALUES (?,?,?)",
                                         (region, event["EventId"], event["CloudTrailEvent"]))
-        self.progress.window_done(region)
+            stamps = [event["EventTime"] for event in page.get("Events", [])]
+            if stamps and upper > lower:
+                oldest = min(value if isinstance(value, datetime) else timestamp(value) for value in stamps)
+                self.progress.covered((upper - oldest) / (upper - lower))
+        self.progress.window_done()
 
     def cloudwatch(self, region, group, prefix, logs):
         events = {}

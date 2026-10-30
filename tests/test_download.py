@@ -143,47 +143,73 @@ class DownloadContract(unittest.TestCase):
         self.assertEqual([line.removeprefix("\r\033[2K") for line in fifth[1:]],
                          ["ap-southeast-1: describe_sessions page 1 saved", "... 3 more workers"])
 
-    def test_eta_uses_slowest_region_pace_and_ignores_checkpoint_replays(self):
+    def test_eta_projects_running_busy_day_from_fresh_page_pace(self):
         now = [0.0]
         stderr = io.StringIO()
         with patch("kamotrace.download.clock.monotonic", lambda: now[0]), redirect_stderr(stderr):
             progress = Progress("log")
-            progress.total = 6
-            progress.plan(["quiet", "busy", "resumed"], 10, ssm=True)
+            progress.total = 4
+            progress.plan(["quiet", "busy"], 5, ssm=True)
 
-            def window(region, seconds, cached=False):
-                progress.window_started()
-                now[0] += seconds
-                progress.tick("page", page=cached)
-                progress.window_done(region)
+            def pages(count, seconds=0.5, cached=False, day=None):
+                for _ in range(count):
+                    now[0] += 0 if cached else seconds
+                    progress.tick("page", page=cached)
+                    if day:  # The running batch's oldest event so far, as a fraction of its day.
+                        batch[0] += 1
+                        progress.covered(batch[0] / day)
+
+            def window(region, count, cached=False):
+                progress.window_started(region)
+                pages(count, cached=cached)
+                progress.window_done()
 
             self.assertEqual(progress.eta(), "CloudTrail ETA estimating; SSM ETA unknown")
-            for _ in range(6):  # Replayed from the checkpoint in no time.
-                window("resumed", 0, cached=True)
-            for _ in range(10):
+            for _ in range(5):
                 window("quiet", 1)
-            window("busy", 49)
-            # One measured window is not a pace, and the resumed Region has none yet.
+            for _ in range(3):  # Resume: earlier busy days replay from the checkpoint at 20 pages each.
+                window("busy", 20, cached=True)
+            # A 2000-page day is running; 100 pages replay, then fresh pages arrive at 2 per second.
+            batch = [0]
+            progress.window_started("busy")
+            pages(100, cached=True, day=2000)
+            pages(20, day=2000)
+            # Ten seconds in, 6% of the day is covered and the batch is already bigger than usual.
             self.assertEqual(progress.eta(), "CloudTrail ETA estimating; SSM ETA unknown")
-            window("busy", 50)
-            window("resumed", 6)
-            # Six instant checkpoint replays must not count as measured AWS pace.
-            self.assertEqual(progress.eta(), "CloudTrail ETA estimating; SSM ETA unknown")
-            window("resumed", 6)
-            # busy: 8 left at 111 s / 2 windows = 444 s, slower than resumed's 2 left at 6 s each.
-            # An aggregate rate (14 fetched windows in 111 s) would claim about a minute.
-            self.assertEqual(progress.eta(), "CloudTrail ETA ~7m (rough); SSM ETA unknown")
-            now[0] += 3000  # A stalled Region lengthens its own estimate: 8 × 3111 / 2 s.
-            self.assertEqual(progress.eta(), "CloudTrail ETA ~3h30m (rough); SSM ETA unknown")
-            for _ in range(8):
-                window("busy", 30)
-            window("resumed", 6)
-            window("resumed", 6)
-            self.assertEqual(progress.eta(), "CloudTrail done in 56m; SSM ETA unknown")
-            progress.tick("SSM complete", done=6)
-            self.assertEqual(progress.eta(), "CloudTrail done in 56m")
-        self.assertIn("6/6 region/services | 30 pages (6 cached) | CloudTrail done in 56m | SSM complete",
+            pages(280, day=2000)
+            # 400 of an extrapolated 2000 pages (20% of the day): 1600 left, plus one unstarted day
+            # of 20 pages; 1620 pages at (300 - 1) pages / 149.5 s = 2/s is 810 s.
+            # Counting the 100 replayed pages as pace would claim ~10m; typical sizes alone would claim <1m.
+            self.assertEqual(progress.eta(), "CloudTrail ETA ~15m (rough); SSM ETA unknown")
+            now[0] += 600  # A stall slows the measured pace: 1620 × 749.5 / 299 s.
+            self.assertEqual(progress.eta(), "CloudTrail ETA ~1h15m (rough); SSM ETA unknown")
+            pages(1600, day=2000)
+            progress.window_done()
+            progress.window_started("busy")
+            pages(5)
+            # The median day (20 pages) sizes the last day; the 2000-page mean (515) would claim ~4m.
+            self.assertEqual(progress.eta(), "CloudTrail ETA <1m (rough); SSM ETA unknown")
+            pages(15)
+            progress.window_done()
+            self.assertEqual(progress.eta(), "CloudTrail done in 26m; SSM ETA unknown")
+            progress.tick("SSM complete", done=4)
+            self.assertEqual(progress.eta(), "CloudTrail done in 26m")
+        self.assertIn("4/4 region/services | 2085 pages (160 cached) | CloudTrail done in 26m | SSM complete",
                       stderr.getvalue())
+        # A Region's SSM and CloudTrail jobs run concurrently; either may finish first.
+        for ssm_first in (True, False):
+            with self.subTest(ssm_first=ssm_first), patch("kamotrace.download.clock.monotonic", lambda: 0.0):
+                progress = Progress("off")
+                progress.total = 2
+                progress.plan(["solo"], 1, ssm=True)
+                progress.window_started("solo")
+                if ssm_first:
+                    progress.tick("solo: SSM complete", done=1)
+                    self.assertEqual(progress.eta(), "CloudTrail ETA estimating")
+                else:
+                    progress.window_done()
+                    progress.tick("solo: CloudTrail complete", done=1)
+                    self.assertEqual(progress.eta(), "CloudTrail done in <1m; SSM ETA unknown")
 
     def test_optional_bounds_collect_available_history_warn_and_resume_fixed_snapshot(self):
         now = [self.end]
