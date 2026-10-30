@@ -1,12 +1,14 @@
 :root {
   font-family: "Segoe UI", Arial, sans-serif;
-  color: #172f43;
-  background: #eef3f6;
+  color: #123449;
+  background: #fff;
   font-size: 13px;
-  --blue: #236187;
-  --red: #b84441;
+  --blue: #21616b;
+  --red: #b84435;
   --amber: #a8650c;
-  --line: #d2dfe7;
+  --line: #9eb9c3;
+  --ink: #103b55;
+  --selected: #d9eeef;
   --sidebar: 268px;
 }
 * {
@@ -25,16 +27,16 @@ select {
 }
 button {
   background: #fff;
-  border: 1px solid #b8cbd7;
-  color: #214b67;
+  border: 1px solid #789ba9;
+  color: var(--ink);
   padding: 4px 9px;
-  border-radius: 4px;
+  border-radius: 2px;
   cursor: pointer;
   font-weight: 550;
 }
 button:hover {
-  background: #e9f3f9;
-  border-color: #7da3bc;
+  background: #e8f3f3;
+  border-color: var(--blue);
 }
 button:disabled {
   opacity: 0.45;
@@ -46,7 +48,7 @@ button:disabled {
   border-color: var(--blue);
 }
 .primary:hover {
-  background: #174b6c;
+  background: #174b53;
 }
 .primary.pulse {
   box-shadow: 0 0 0 3px #f2c66d;
@@ -65,8 +67,8 @@ button:disabled {
 input,
 select {
   padding: 4px 7px;
-  border: 1px solid #c0d0dc;
-  border-radius: 4px;
+  border: 1px solid #89a7b3;
+  border-radius: 2px;
   color: #193d55;
   background: #fff;
 }
@@ -74,7 +76,7 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 summary:focus-visible {
-  outline: 3px solid #67b5da;
+  outline: 3px solid #237c8b;
   outline-offset: 1px;
 }
 .hint {
@@ -109,8 +111,11 @@ h2 {
   gap: 16px;
   padding: 0 14px;
   height: 42px;
-  background: #fff;
-  border-bottom: 2px solid var(--blue);
+  color: #fff;
+  background-color: var(--ink);
+  /* Seigaiha: a small, quiet wave repeat confined to the navigation chrome. */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='24' viewBox='0 0 48 24'%3E%3Cg fill='none' stroke='%23265a70' stroke-width='.7'%3E%3Cpath d='M-24 24a24 24 0 0 1 48 0M-18 24a18 18 0 0 1 36 0M-12 24a12 12 0 0 1 24 0M-6 24a6 6 0 0 1 12 0M24 24a24 24 0 0 1 48 0M30 24a18 18 0 0 1 36 0M36 24a12 12 0 0 1 24 0M42 24a6 6 0 0 1 12 0'/%3E%3Cpath fill='%23103b55' d='M0 12a24 24 0 0 1 48 0'/%3E%3Cpath d='M6 12a18 18 0 0 1 36 0M12 12a12 12 0 0 1 24 0M18 12a6 6 0 0 1 12 0'/%3E%3C/g%3E%3C/svg%3E");
+  border-bottom: 2px solid var(--ink);
 }
 .brand {
   display: flex;
@@ -126,7 +131,7 @@ h1 {
 }
 #coverage {
   font-size: 11px;
-  color: #536d80;
+  color: #e1edf2;
   white-space: nowrap;
 }
 .workspace-tabs,
@@ -147,10 +152,24 @@ h1 {
   align-items: center;
   gap: 6px;
 }
+.topbar button {
+  border-color: #92b3c0;
+}
+.topbar button[aria-pressed="true"] {
+  background: var(--blue);
+  border-color: #aac9ce;
+  box-shadow: inset 0 -2px #e28b77;
+}
+.topbar button[aria-pressed="true"]:hover {
+  background: #174b53;
+}
+.topbar button:focus-visible {
+  outline-color: #fff;
+}
 .readonly {
-  border: 1px solid #b8d2c5;
-  color: #29654a;
-  background: #f1faf5;
+  border: 1px solid #aac9ce;
+  color: #fff;
+  background: #21616b;
   padding: 3px 8px;
   border-radius: 4px;
   font-size: 11px;
@@ -198,7 +217,7 @@ main {
   border-bottom: 2px solid transparent;
 }
 .findings-tabs [aria-selected="true"] {
-  border-bottom-color: var(--blue);
+  border-bottom-color: var(--red);
   color: var(--blue);
 }
 #findings input[type="search"] {
@@ -217,7 +236,7 @@ main {
   border-radius: 3px;
 }
 .tag-item.active {
-  background: #e3f0f8;
+  background: var(--selected);
   box-shadow: inset 3px 0 var(--blue);
 }
 .tag-name {
@@ -240,7 +259,7 @@ main {
   border: 1px solid var(--line);
   border-radius: 4px;
   margin: 6px 0;
-  background: #fbfdfe;
+  background: #fff;
 }
 .note-card.active {
   border-color: var(--blue);
@@ -296,7 +315,7 @@ main {
 .time-panel {
   background: white;
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 2px;
   padding: 6px 10px 4px;
 }
 .time-row,
@@ -365,7 +384,7 @@ main {
   fill: #5f7686;
 }
 .frequency-bar {
-  fill: #236187;
+  fill: var(--blue);
 }
 .frequency-bar.zero-bucket {
   fill: #a85d0a;
@@ -379,9 +398,9 @@ main {
   fill: #cddbe5;
 }
 .brush {
-  fill: #236187;
+  fill: var(--blue);
   fill-opacity: 0.15;
-  stroke: #236187;
+  stroke: var(--blue);
 }
 .chart-hint {
   margin: 0;
@@ -403,7 +422,7 @@ main {
   width: 8px;
   height: 8px;
   display: inline-block;
-  background: #7fa7c0;
+  background: #6895a2;
 }
 .red-dot {
   background: var(--red);
@@ -416,11 +435,11 @@ main {
   height: 46px;
 }
 #timeline rect.bar {
-  fill: #7fa7c0;
+  fill: #6895a2;
   cursor: pointer;
 }
 #timeline rect.bar:hover {
-  fill: #236187;
+  fill: var(--blue);
 }
 #time-slider {
   margin: 6px 8px 10px;
@@ -455,7 +474,7 @@ main {
   position: sticky;
   top: 0;
   z-index: 5;
-  background: #eef3f6;
+  background: #fff;
   padding: 6px 0 4px;
   box-shadow: 0 6px 6px -6px #19374a33;
 }
@@ -516,7 +535,7 @@ main {
   color: #6f4b4b;
 }
 .scope-time {
-  background: #e8f1f7;
+  background: #edf6f6;
 }
 .scope-note {
   border-color: #b98ac8;
@@ -588,7 +607,7 @@ main {
 .results {
   background: white;
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 2px;
   overflow: hidden;
 }
 .tabulator {
@@ -598,22 +617,23 @@ main {
   font-size: 12px;
 }
 .tabulator .tabulator-header {
-  background: #f1f6f9;
-  border-bottom: 1px solid #bdcfdc;
-  color: #25465d;
+  background: #edf4f5;
+  border-bottom: 1px solid #789ba9;
+  color: var(--ink);
   font-weight: 600;
 }
 .tabulator .tabulator-header .tabulator-col {
-  background: #f1f6f9;
+  background: #edf4f5;
   border-right: 1px solid #e1eaf0;
   padding: 1px 0;
 }
 .tabulator-row {
   border-bottom: 1px solid #e9eff3;
   min-height: 25px;
+  color: inherit;
 }
 .tabulator-row.tabulator-row-even {
-  background: #f8fbfd;
+  background: #f7fafb;
 }
 .tabulator-row .tabulator-cell {
   border-right: 0;
@@ -621,8 +641,11 @@ main {
   height: 25px;
 }
 .tabulator-row.tabulator-selectable:hover {
-  background: #e6f2f9;
+  background: var(--selected);
   cursor: pointer;
+}
+.tabulator-row:has(.tabulator-cell[tabulator-field="review"] input:checked) {
+  background: var(--selected);
 }
 .tabulator-row.ssm-row {
   box-shadow: inset 3px 0 var(--red);
@@ -676,7 +699,7 @@ main {
   top: -2px;
   display: flex;
   gap: 2px;
-  background: #e6f2f9;
+  background: var(--selected);
   opacity: 0;
   pointer-events: none;
 }
@@ -1199,7 +1222,7 @@ dialog::backdrop {
   color: #4f6778;
 }
 .command-entry[aria-pressed="true"] {
-  background: #e8f3fa;
+  background: var(--selected);
   border-color: var(--blue);
   box-shadow: inset 3px 0 var(--blue);
 }
