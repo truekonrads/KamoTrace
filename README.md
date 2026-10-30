@@ -72,6 +72,7 @@ gzip files and stdin; see [importing multiple files or a stream](#multiple-files
 Log in first using your normal AWS tooling (for example, `aws sso login --profile investigation`).
 KamoTrace uses boto3's existing credential chain, optionally selected with `--profile`;
 it does not perform an interactive login or save credentials. All AWS calls are read-only.
+The bundled SDK dependency includes CRT support for credentials created by `aws login`.
 
 ```powershell
 kamotrace download --profile investigation --dest C:\cases\example\download --regions all --start 2026-10-01 --end 2026-10-02
@@ -85,6 +86,16 @@ kamotrace download --profile investigation --dest C:\cases\example\download --re
   October 1 and 2 in full, through `2026-10-02T23:59:59.999999Z`.
   ISO timestamps must have `Z` or an offset, e.g. `2026-10-01T08:00:00+08:00`.
   This collection convention is separate from the viewer's end-exclusive filters.
+- Omit `--start` and `--end` to download the maximum available history through
+  collection start time. A warning is printed even with `--progress off`: CloudTrail
+  Event History retains only 90 days; SSM command/terminated session history generally
+  retains 30 days, though older active sessions may be available. Expired data cannot
+  be recovered, and collection can be large and slow. Either endpoint can also be
+  supplied alone: omitted start means all available history (CloudTrail queries the
+  90 days ending at the end time), and omitted end means collection start time.
+  The default end time is saved in the checkpoint and reused on resume, not advanced.
+  In the manifest, `start: null` means no requested lower bound; service retention
+  limits still apply.
 - Both CloudTrail and SSM are selected by default. Use `--services cloudtrail`
   or `--services ssm` to collect only one. The range selects event time,
   command request time or session start time, not sessions merely overlapping it.

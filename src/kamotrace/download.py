@@ -93,7 +93,7 @@ class Progress:
                 track = "#" * marker + "🦆" + "-" * (width - marker - 2)
             else:
                 track = "#" * filled + "-" * (width - filled)
-            counts = f"{self.done}/{self.total} jobs {self.pages}p/{self.cached} cached"
+            counts = f"{self.done}/{self.total} jobs {self.pages} pages ({self.cached} cached)"
             line = f"[{track}] {counts} | {message}"
             columns = max(1, shutil.get_terminal_size().columns - 1 - int(self.emoji))
             print("\r" + line[:columns].ljust(columns), end="", file=sys.stderr, flush=True)
@@ -154,7 +154,6 @@ class Collector:
                 request = dict(parameters)
                 if cursor:
                     request[token] = cursor
-                self.progress.tick(f"{region}: {operation} page {index + 1} requesting")
                 if service == "cloudtrail":
                     clock.sleep(0.55)  # LookupEvents permits two calls/second/account/region.
                 try:
@@ -192,10 +191,10 @@ class Collector:
     def selected(self, record, field):
         value = record[field]
         stamp = value if isinstance(value, datetime) else timestamp(value)
-        return self.start <= stamp <= self.end
+        return (self.start is None or self.start <= stamp) and stamp <= self.end
 
     def cloudtrail(self, region):
-        lower = self.start
+        lower = self.start if self.start is not None else self.end - timedelta(days=90)
         while True:
             upper = min(lower + timedelta(days=1), self.end)
             self.progress.tick(f"{region}: CloudTrail batch {iso(lower)} to {iso(upper)}")
@@ -267,8 +266,10 @@ class Collector:
 
     def ssm(self, region, document, logs, session_s3, session_groups):
         # Widen server-side filters to whole seconds, then enforce inclusive microsecond bounds locally.
-        filters = [{"key": "InvokedAfter", "value": iso(self.start.replace(microsecond=0) - timedelta(seconds=1))},
-                   {"key": "InvokedBefore", "value": iso(self.end.replace(microsecond=0) + timedelta(seconds=1))}]
+        filters = []
+        if self.start is not None:
+            filters.append({"key": "InvokedAfter", "value": iso(self.start.replace(microsecond=0) - timedelta(seconds=1))})
+        filters.append({"key": "InvokedBefore", "value": iso(self.end.replace(microsecond=0) + timedelta(seconds=1))})
         commands = {}
         for page in self.pages("ssm", region, "list_commands", {"Filters": filters, "MaxResults": 50}):
             for command in page.get("Commands", []):
@@ -325,8 +326,8 @@ def main(argv=None):
     parser.add_argument("--dest", required=True, type=Path, help="New private output directory, or same directory to resume")
     parser.add_argument("--profile", help="Existing AWS profile; otherwise use the normal SDK credential chain")
     parser.add_argument("--regions", nargs="+", required=True, help="Region names, or all enabled regions (space separated)")
-    parser.add_argument("--start", required=True, help="Inclusive ISO timestamp with offset, or YYYY-MM-DD at UTC midnight")
-    parser.add_argument("--end", required=True, help="Inclusive ISO timestamp with offset, or entire UTC date YYYY-MM-DD")
+    parser.add_argument("--start", help="Inclusive ISO timestamp with offset, or YYYY-MM-DD at UTC midnight; default: all available history")
+    parser.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date YYYY-MM-DD; default: collection start time")
     parser.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm"), default=["cloudtrail", "ssm"])
     parser.add_argument("--compress", action="store_true", help="Gzip generated CloudTrail, SSM and CloudWatch JSON exports (not original S3 objects)")
     parser.add_argument("--progress", choices=("auto", "bar", "log", "off"), default="auto",
@@ -338,8 +339,9 @@ def main(argv=None):
     collector = None
     progress = Progress(args.progress)
     try:
-        start, end = timestamp(args.start), timestamp(args.end, end=True)
-        if start > end:
+        start = timestamp(args.start) if args.start else None
+        end = timestamp(args.end, end=True) if args.end else datetime.now(timezone.utc)
+        if start is not None and start > end:
             raise ValueError("Start must not be after end")
         if "all" in args.regions and args.regions != ["all"]:
             raise ValueError("Use all alone, or explicit region names")
@@ -347,6 +349,11 @@ def main(argv=None):
             parsed = urlsplit(location)
             if parsed.scheme != "s3" or not parsed.netloc or parsed.query or parsed.fragment:
                 raise ValueError("--session-s3 must be s3://BUCKET/PREFIX")
+        if start is None:
+            print("Warning: no --start supplied; downloading maximum available history. "
+                  "CloudTrail Event History retains only 90 days; SSM history generally retains 30 days "
+                  "(older active sessions may be available). Expired data cannot be recovered. "
+                  "Collection may be large and take a long time.", file=sys.stderr, flush=True)
         session = boto3.Session(profile_name=args.profile)
         region = session.region_name or "us-east-1"
         progress.tick("Checking existing AWS login")
@@ -357,7 +364,7 @@ def main(argv=None):
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         collector = Collector(session, folder, start, end, progress, args.compress)
         settings = {"version": 1, "account_id": identity["Account"], "partition": identity["Arn"].split(":")[1],
-                    "start": iso(start), "end": iso(end), "regions": sorted(set(args.regions)),
+                    "start": iso(start) if start is not None else None, "end": iso(end), "regions": sorted(set(args.regions)),
                     "compress": args.compress,
                     "services": sorted(set(args.services)), "session_s3": sorted(set(args.session_s3)),
                     "session_log_groups": sorted(set(args.session_log_group))}
@@ -365,6 +372,11 @@ def main(argv=None):
         previous_settings = json.loads(previous[0]) if previous else None
         if previous_settings is not None:
             previous_settings.setdefault("compress", False)
+        if args.end is None:
+            settings["end_default"] = True
+            if previous_settings is not None and previous_settings.get("end_default"):
+                settings["end"] = previous_settings["end"]
+                collector.end = timestamp(settings["end"])
         if previous_settings is not None and previous_settings != settings:
             raise ValueError("Resume requires the same AWS account/partition, regions, range, services, compression and log locations; use a new destination")
         if not previous:

@@ -1,6 +1,6 @@
 """Public download CLI contracts against AWS SDK-validated synthetic responses (no AWS access)."""
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import gzip
 import hashlib
@@ -54,14 +54,77 @@ class DownloadContract(unittest.TestCase):
         self.stubs["sts", "us-east-1"].add_response("get_caller_identity", {
             "Account": account, "Arn": f"arn:aws:sts::{account}:assumed-role/reader/new-login", "UserId": "synthetic"}, {})
 
-    def run_cli(self, *options, status=0, tty=False):
+    def run_cli(self, *options, status=0, tty=False, bounds=True):
         stdout, stderr = io.StringIO(), io.StringIO()
         stderr.isatty = lambda: tty
         with redirect_stdout(stdout), redirect_stderr(stderr):
             result = main(["download", "--dest", str(self.folder), "--regions", "us-east-1",
-                           "--start", "2026-10-01", "--end", "2026-10-01", *options])
+                           *(["--start", "2026-10-01", "--end", "2026-10-01"] if bounds else []), *options])
         self.assertEqual(result, status, stderr.getvalue())
         return stdout.getvalue(), stderr.getvalue()
+
+    def test_optional_bounds_collect_available_history_warn_and_resume_fixed_snapshot(self):
+        now = [self.end]
+
+        class ClockMeta(type):
+            def __instancecheck__(cls, value):
+                return isinstance(value, datetime)
+
+        class Clock(datetime, metaclass=ClockMeta):
+            @classmethod
+            def now(cls, tz=None):
+                return now[0]
+
+        for options in [(), ("--end", "2026-10-01"), ("--start", "2026-10-01")]:
+            with self.subTest(options=options), patch("kamotrace.download.datetime", Clock):
+                self.folder = self.folder.parent / ("download-" + str(len(options)) + (options[0] if options else ""))
+                now[0] = self.end
+                lower = self.start if "--start" in options else self.end - timedelta(days=90)
+                first_stamp = lower.isoformat()
+                boundary = self.event("earliest", first_stamp)
+                last = self.event("latest", "2026-10-01T23:59:59.999999Z")
+                after = self.event("outside", "2026-10-02T00:00:00Z")
+                self.identity()
+                stub = self.stubs["cloudtrail", "us-east-1"]
+                while lower < self.end:
+                    upper = min(lower + timedelta(days=1), self.end)
+                    events = [boundary] if lower.isoformat() == first_stamp else []
+                    if upper == self.end:
+                        events += [last, after]
+                    stub.add_response("lookup_events", {"Events": events},
+                                      {"StartTime": lower, "EndTime": upper, "MaxResults": 50})
+                    lower = upper
+                filters = self.filters if "--start" in options else [self.filters[1]]
+                ssm = self.stubs["ssm", "us-east-1"]
+                ssm.add_response("list_commands", {"Commands": []}, {"Filters": filters, "MaxResults": 50})
+                for state in ("Active", "History"):
+                    # An active session can predate both services' usual history retention.
+                    ssm.add_response("describe_sessions", {"Sessions": [
+                        {"SessionId": "older-active", "StartDate": self.end - timedelta(days=120)},
+                        {"SessionId": "at-end", "StartDate": self.end},
+                        {"SessionId": "after-end", "StartDate": self.end + timedelta(microseconds=1)}]},
+                        {"State": state, "Filters": filters, "MaxResults": 100})
+                _, log = self.run_cli(*options, "--progress", "off", bounds=False)
+                self.assertEqual("Warning:" in log, "--start" not in options)
+                if "--start" not in options:
+                    self.assertIn("maximum available history", log)
+                    self.assertIn("90 days", log)
+                    self.assertIn("30 days", log)
+                records = json.loads((self.folder / "cloudtrail.json").read_text())["Records"]
+                self.assertEqual([record["eventID"] for record in records], ["earliest", "latest"])
+                document = json.loads((self.folder / "ssm.json").read_text())
+                self.assertEqual([s["record"]["SessionId"] for s in document["sessions"]],
+                                 ["at-end"] if "--start" in options else ["older-active", "at-end"])
+                manifest = json.loads((self.folder / "manifest.json").read_text())
+                self.assertEqual(manifest["end"], "2026-10-01T23:59:59.999999Z")
+                self.assertEqual(manifest["start"], "2026-10-01T00:00:00Z" if "--start" in options else None)
+                # Advancing the clock must not change the snapshot or make resume fail.
+                now[0] += timedelta(days=2)
+                self.identity()
+                self.run_cli(*options, "--progress", "off", bounds=False)
+                self.assertEqual(json.loads((self.folder / "manifest.json").read_text())["end"], manifest["end"])
+                for stub in self.stubs.values():
+                    stub.assert_no_pending_responses()
 
     def event(self, name, stamp):
         raw = ('{"eventID":"' + name + '","eventTime":"' + stamp + '",'
@@ -82,6 +145,7 @@ class DownloadContract(unittest.TestCase):
         stub.add_client_error("lookup_events", "ExpiredToken", expected_params={**params, "NextToken": "old"})
         _, log = self.run_cli("--services", "cloudtrail", "--progress", "log", status=1)
         self.assertIn("page 1 saved", log)
+        self.assertNotIn("requesting", log)
         self.assertNotIn("\r", log)
         self.assertFalse(json.loads((self.folder / "manifest.json").read_text())["complete"])
         self.identity()
@@ -92,6 +156,7 @@ class DownloadContract(unittest.TestCase):
         _, bar = self.run_cli("--services", "cloudtrail", "--progress", "bar")
         self.assertIn("🦆", bar)
         self.assertIn("1/1 jobs", bar)
+        self.assertNotIn("requesting", bar)
         source = self.folder / "cloudtrail.json"
         records = simplejson.loads(source.read_text(), use_decimal=True)["Records"]
         self.assertEqual([r["eventID"] for r in records], ["first", "last"])
