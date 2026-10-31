@@ -17,6 +17,7 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 - [Record findings and tag events](#findings-and-event-tags)
 - [Search and inspect CloudTrail events](#cloudtrail-workflow)
 - [Browse SSM commands and output](#ssm-command-browser-desktop)
+- [Check where SSM logs sessions and commands](#ssm-logging-check)
 - [Connect an AI agent](#agent-access-mcp)
 - [Store and back up a case](#storage-and-backups)
 - [Fix common problems](#troubleshooting-and-limitations)
@@ -161,6 +162,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `kamotrace enrich --database DB (--geolite2 FOLDER \| --jsonl FILE)...` | Add offline IP enrichment into `<database>.enrichment.duckdb` |
 | `kamotrace serve --database DB [options]` | Start the browser UI on `127.0.0.1` |
 | `kamotrace mcp --url http://127.0.0.1:8765` | Stdio MCP adapter for agents, backed by a running `serve` |
+| `kamotrace ssmcheck [--regions all] [--json FILE\|-] [--max-items 200]` | [Read-only report](#ssm-logging-check) of where SSM session and command output is logged |
 
 `kamotrace <command> --help` lists every option. `python -m kamotrace` works too.
 
@@ -945,6 +947,66 @@ with `search_ssm_log`, `get_ssm_log_entry` and `edit_ssm_log_entry`.
 - The tab covers collected Run Commands, not interactive session transcripts.
   Uncollected commands/outputs and denied calls cannot establish what executed.
   The export's coverage/limitations are expandable above the command list.
+
+## SSM logging check
+
+`kamotrace ssmcheck` reports, per region, what AWS Systems Manager is set up to
+log and where. Use it before `download --session-s3/--session-log-group`, or to
+judge what an investigation can and cannot recover. It is read-only and uses
+your existing AWS login, the same way as `download`:
+
+```powershell
+kamotrace ssmcheck --profile investigation --regions all --json C:\cases\example\ssmcheck.json
+```
+
+The text summary goes to stdout. `--json FILE` also writes the full report to a
+**new** file and refuses to overwrite one; `--json -` prints the JSON to stdout
+and sends the summary to stderr. Keep reports private: they name buckets, log
+groups, KMS keys and the account ID. Caller ARNs and credentials are never reported.
+
+For each region it checks:
+
+| Area | Source | Reported as |
+| --- | --- | --- |
+| Session Manager preferences | `SSM-SessionManagerRunShell` document | S3 bucket/prefix and encryption requirement, CloudWatch log group, encryption and streaming, KMS key, run-as and whether a shell profile is set (not its text) |
+| Custom session documents | `Owner=Self` session documents | session type and whether the document's own logging inputs, the regional preferences, or nothing (`Port`) applies |
+| Observed sessions | active and history sessions | counts per document, session type, and how many recorded an S3 or CloudWatch output URL |
+| Observed Run Command | recent commands | counts per S3 bucket/prefix and CloudWatch log group, and commands with only inline output |
+| State Manager | associations | S3 output location per association |
+| Maintenance windows | Run Command tasks | S3 and CloudWatch output settings per task; other task types are only counted |
+
+Read the states literally:
+
+- `configured` / `not_configured`: the API answered, and the setting is set or
+  absent. A region without the preferences document has never saved
+  Session Manager preferences, so shell sessions there are not logged.
+- `observed`: what recent executions did. Run Command has **no regional output
+  default**: each sender chooses a destination. Observed commands never prove
+  what future commands will log.
+- `denied` / `error`: the call failed (only the API name and error code are
+  kept), so the setting is **unknown**, not absent.
+- `truncated`: a listing reached `--max-items` (default 200 per listing per
+  region), so only the most recent items were examined.
+
+The exit status is 0 when every check completed, 1 when the report is partial
+(any denied, error or truncated listing), and 2 for usage errors or an unusable
+AWS login. The command never reads command or session output, and never reports
+command, association or task parameter values.
+
+Limits to keep in mind:
+
+- Port sessions (SSH through `AWS-StartSSHSession` and port forwarding) are never
+  content-logged by Session Manager.
+- Logging is delivered by the SSM Agent with the instance's permissions.
+  Configured logging does not prove logs were delivered, kept or readable; the
+  check does not inspect the buckets or log groups themselves.
+- Observations cover only history that SSM still returns, generally 30 days.
+
+Permissions: `sts:GetCallerIdentity`, `ec2:DescribeRegions` (for `--regions all`;
+if denied, only the default region is checked and the report is partial),
+`ssm:GetDocument`, `ssm:ListDocuments`, `ssm:DescribeSessions`, `ssm:ListCommands`,
+`ssm:ListAssociations`, `ssm:DescribeAssociation`, `ssm:DescribeMaintenanceWindows`,
+`ssm:DescribeMaintenanceWindowTasks` and `ssm:GetMaintenanceWindowTask`.
 
 ## Agent access (MCP)
 

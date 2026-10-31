@@ -189,6 +189,8 @@ prefixes/groups appropriate to the selected regions; custom layouts are not infe
 Session transcripts are saved separately, **not displayed in the command viewer**.
 Logging must already have been enabled; SSH/port-forwarding sessions have no
 transcripts. Empty results do not prove no activity occurred.
+To find the configured transcript and command output locations first, run the
+read-only [`kamotrace ssmcheck`](docs/user-guide.md#ssm-logging-check).
 
 Permissions depend on collection: `sts:GetCallerIdentity`, `cloudtrail:LookupEvents`,
 `ssm:ListCommands`, `ssm:ListCommandInvocations`, `ssm:GetCommandInvocation`,
@@ -365,6 +367,7 @@ AI provider.
 | Look up source IP information offline | [IP enrichment and JSONL format](docs/user-guide.md#ip-enrichment) |
 | Organise and review findings | [Findings and event tags](docs/user-guide.md#findings-and-event-tags) |
 | Inspect collected command output | [SSM command browser](docs/user-guide.md#ssm-command-browser-desktop) |
+| Find where SSM sessions and commands are logged | [`kamotrace ssmcheck`](docs/user-guide.md#ssm-logging-check) |
 | Connect Claude Code, Amp or another MCP client | [Agent setup and tools](docs/user-guide.md#agent-access-mcp) |
 | Back up or move a case | [Storage and backups](docs/user-guide.md#storage-and-backups) |
 | Resolve an error | [Troubleshooting](docs/user-guide.md#troubleshooting-and-limitations) and [known limitations](docs/BUGS.md) |

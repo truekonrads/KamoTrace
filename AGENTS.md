@@ -51,6 +51,12 @@ only reads them.
   enrichment, detections, and SQLite annotation/tag persistence.
 - `ssm.py`: local SSM export loading, account/region/command joins, separate
   system/plugin outputs, and command/spreadsheet query endpoints.
+- `ssmcheck.py`: read-only, bounded (`--max-items`) per-region report of where SSM
+  session and Run Command output is configured to go: Session Manager preferences,
+  session document types, observed sessions/commands, associations and
+  maintenance-window tasks. Keep configured, not_configured, observed, denied/error
+  and truncated states distinct; never treat history as a default, read output
+  payloads or report parameter values or caller ARNs.
 - `mcp_server.py`: HTTP/stdio MCP adapter (official `mcp` SDK). It owns no database or
   sidecar handle; every tool calls `server.py`'s loopback REST endpoints, so the
   browser and agents share one Store, its validation and its review temp tables.

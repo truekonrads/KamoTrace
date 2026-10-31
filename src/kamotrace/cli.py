@@ -8,6 +8,7 @@
   kamotrace suzaku   --database case.duckdb (--source event_history.json [--suzaku suzaku.exe] | --timeline suzaku.duckdb)
   kamotrace get-dbip [--dest FOLDER]
   kamotrace enrich   --database case.duckdb (--geolite2 FOLDER | --jsonl FILE)...
+  kamotrace ssmcheck [--profile NAME] [--regions all] [--json report.json] [--max-items 200]
   kamotrace serve    --database case.duckdb [--ssm-export ...]
   kamotrace mcp      --url http://127.0.0.1:8765
 """
@@ -22,6 +23,7 @@ COMMANDS = {
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),
     "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2-format .mmdb and/or provider-neutral JSONL"),
+    "ssmcheck": ("kamotrace.ssmcheck", "Read-only report of what SSM sessions and commands log, and where"),
     "serve": ("kamotrace.server", "Start the local browser UI and HTTP MCP at /mcp on 127.0.0.1"),
     "mcp": ("kamotrace.mcp_server", "Stdio MCP adapter for agents, backed by a running `kamotrace serve`"),
 }
