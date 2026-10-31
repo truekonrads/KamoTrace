@@ -2351,7 +2351,7 @@ function setSidebar(open) {
   $("rail-tip").hidden = true;
   localStorage.setItem("sidebar-expanded", open ? "1" : "0");
   requestAnimationFrame(() => {
-    table?.redraw();
+    if (tableReady) table.redraw();
     if (lastHistogram) frequency(lastHistogram, lastContext);
     timeline();
     paintSelection();

@@ -205,6 +205,23 @@ def main():
                 expect(page.locator("#inventory-status")).to_contain_text("--inventory-export")
                 expect(page.locator("#inventory-content")).to_be_hidden()
                 page.screenshot(path=str(results / "inventory-absent.png"))
+                # Let the initial sidebar frame run after startup's API reads, but
+                # before grid initialization. A constructed grid is not yet ready.
+                page.add_init_script("""
+                    const schedule = window.setTimeout.bind(window);
+                    const animate = window.requestAnimationFrame.bind(window);
+                    window.setTimeout = (callback, delay = 0, ...args) =>
+                        schedule(callback, delay === 0 ? 500 : delay, ...args);
+                    window.requestAnimationFrame = callback =>
+                        animate(time => schedule(() => callback(time), 100));
+                """)
+                page.reload()
+                expect(page.locator("#load-status")).to_have_text("5 loaded · all")
+                page.locator("#expand-sidebar").click()
+                expect(page.locator("#sidebar-panel")).to_be_visible()
+                page.locator("#collapse-sidebar").click()
+                expect(page.locator("#rail")).to_be_visible()
+                expect(rows).to_have_count(5)
                 assert not errors, f"Browser JavaScript errors: {errors}"
                 print("PASS: event search/timezone/history, reference cards, inventory map/tables/coverage, tab state, error/retry and no-snapshot; no JavaScript errors.")
             except Exception:
