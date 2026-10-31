@@ -1660,9 +1660,7 @@ dialog::backdrop {
 }
 .log-editor textarea {
   resize: vertical;
-  font:
-    12px/1.55 Consolas,
-    monospace;
+  font: 12px/1.55 var(--font-mono);
 }
 .log-editor-actions {
   display: flex;
