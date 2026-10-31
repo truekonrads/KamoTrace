@@ -665,6 +665,74 @@ function renderLogEnhanced(lane, row) {
     logLine(lane, "Unsaved draft in editor", "ssm-log-draft");
 }
 
+function referenceText(element, kind, value, context = {}) {
+  window.kamotraceReference?.attach(element, {
+    kind,
+    value,
+    region: context.region,
+    account: context.account || context.recipient_account_id,
+  });
+}
+
+function referenceValue(parent, kind, value, context) {
+  const text = document.createElement("span");
+  text.textContent = value;
+  referenceText(text, kind, value, context);
+  parent.append(text);
+  return text;
+}
+
+function referenceTarget(element, value, context) {
+  if (typeof value !== "string" || !value) return;
+  const kind = (item) =>
+    /^arn:[^:]+:(iam|sts):/.test(item) ? "identity" : "machine";
+  if (!value.startsWith("[")) {
+    referenceText(element, kind(value), value, context);
+    return;
+  }
+  // Only a target's JSON string list is decoded, never original event JSON or numeric evidence.
+  try {
+    const items = JSON.parse(value);
+    if (
+      !Array.isArray(items) ||
+      !items.every((item) => typeof item === "string")
+    )
+      return;
+    element.replaceChildren();
+    let offset = 0;
+    for (const match of value.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
+      element.append(value.slice(offset, match.index));
+      const text = document.createElement("span");
+      text.textContent = match[0];
+      const item = JSON.parse(match[0]);
+      referenceText(text, kind(item), item, context);
+      element.append(text);
+      offset = match.index + match[0].length;
+    }
+    element.append(value.slice(offset));
+  } catch {
+    // Invalid or non-list targets remain inert plaintext.
+  }
+}
+
+function showReference(context, parent) {
+  parent.querySelector(".reference-fields")?.remove();
+  const fields = document.createElement("div");
+  fields.className = "reference-fields";
+  for (const [kind, value] of [
+    ["identity", context.identity],
+    ["ip", context.source_ip],
+  ])
+    if (value) referenceValue(fields, kind, value, context);
+  if (context.target) {
+    const target = document.createElement("span");
+    target.textContent = context.target;
+    referenceTarget(target, context.target, context);
+    fields.append(target);
+  }
+  if (fields.childElementCount) parent.append(fields);
+}
+
 function logEntry(row) {
   const card = document.createElement("article");
   card.className = "ssm-log-entry";
@@ -683,7 +751,9 @@ function logEntry(row) {
   what.className = failed ? "ssm-log-failed" : "";
   what.textContent = `${row.operation} · ${row.status}${row.response_code === null ? "" : " · exit " + row.response_code}`;
   const where = document.createElement("span");
-  where.textContent = `${row.instance_id || "no exact machine collected"} · ${row.plugin ? "plugin " + row.plugin : "no plugin"}`;
+  if (row.instance_id) referenceValue(where, "machine", row.instance_id, row);
+  else where.append("no exact machine collected");
+  where.append(` · ${row.plugin ? "plugin " + row.plugin : "no plugin"}`);
   const edit = document.createElement("button");
   edit.type = "button";
   edit.className = "ssm-log-edit";
@@ -706,6 +776,12 @@ function logEntry(row) {
     ),
   ];
   context.textContent = `${row.account || "unknown account"} · ${row.region || "unknown region"} · command ${row.command_id || "none"} · time basis: ${row.time_basis} · ${row.output_state}${requesters.length ? " · requested by " + requesters.join("; ") : ""}`;
+  for (const event of row.events)
+    if (event.identity || event.source_ip) {
+      const references = document.createElement("span");
+      showReference({ ...row, ...event }, references);
+      context.append(references);
+    }
   const lanes = document.createElement("div");
   lanes.className = "ssm-log-lanes";
   const enhanced = document.createElement("div");
@@ -728,7 +804,14 @@ function logEntry(row) {
       : `${event.operation} · ${event.error || "no API error (not execution proof)"} · ${event.event_id} · ${event.source}`;
     button.onclick = async () => {
       try {
-        if (event.id !== null) await detail({ id: event.id });
+        if (event.id !== null)
+          await detail({
+            id: event.id,
+            identity: event.identity,
+            source_ip: event.source_ip,
+            account: event.account,
+            region: event.region,
+          });
         else {
           const data = await request("/api/ssm-event", { key: event.key });
           detailRow = null;
@@ -738,6 +821,7 @@ function logEntry(row) {
           $("record-hash").textContent =
             "Reconstructed from supplemental JSON, not original database evidence.";
           $("detail-findings").replaceChildren();
+          showReference({ ...row, ...event }, $("detail-id").parentElement);
           $("detail-prev").hidden = $("detail-next").hidden = true;
           eventCommandLinks([]);
           openDetail();
@@ -1466,11 +1550,32 @@ function createCommandSheet() {
           button.className = "sheet-value sheet-open";
           button.textContent = cell.getValue() || "Unknown system";
           button.title = "Open command and CloudTrail links";
+          referenceText(
+            button,
+            "machine",
+            cell.getValue(),
+            cell.getRow().getData(),
+          );
           button.onclick = (e) => {
             e.stopPropagation();
             openCommand(cell.getRow().getData().key);
           };
-          return button;
+          const wrapper = document.createElement("span");
+          wrapper.append(button);
+          if (cell.getValue()) {
+            const reference = referenceValue(
+              wrapper,
+              "machine",
+              cell.getValue(),
+              cell.getRow().getData(),
+            );
+            reference.textContent = " ⓘ";
+            reference.setAttribute(
+              "aria-label",
+              `Reference for ${cell.getValue()}`,
+            );
+          }
+          return wrapper;
         },
         cellClick: () => {},
       }),
@@ -1561,16 +1666,26 @@ function evidenceText(parent, title, value) {
   parent.append(heading, pre);
 }
 
-function switchView(commands, run = true) {
+function switchView(commands, run = true, inventory = false) {
   if (commandsActive && commandLog && !commands) leaveLog();
   commandsActive = commands;
   syncLogEditor();
   $("commands-panel").hidden = !commands;
-  $("events-tab").setAttribute("aria-pressed", String(!commands));
+  $("events-tab").setAttribute("aria-pressed", String(!commands && !inventory));
   $("commands-tab").setAttribute("aria-pressed", String(commands));
+  $("inventory-tab").setAttribute("aria-pressed", String(inventory));
+  document.querySelector(".time-panel").hidden = inventory;
+  document.querySelector("main > footer").hidden = inventory;
   for (const id of ["frequency-block", "query-bar", "sql-panel"])
-    $(id).hidden = commands;
-  document.querySelector(".results").hidden = commands;
+    $(id).hidden = commands || inventory;
+  document.querySelector(".results").hidden = commands || inventory;
+  $("show-sql").hidden = inventory;
+  window.kamotraceReference?.close();
+  if (inventory) {
+    window.kamotraceInventory.show();
+    return;
+  }
+  window.kamotraceInventory.hide();
   if (!run) return;
   if (commands) loadCommands();
   else {
@@ -1692,7 +1807,19 @@ async function openCommand(key, keepLayout = false) {
       section.className = "system-result";
       section.open = true;
       const summary = document.createElement("summary");
-      summary.textContent = `${system.instance_id} ${system.invocation?.InstanceName || ""} · ${system.invocation?.Status || system.details[0]?.Status || "No invocation collected"}`;
+      referenceValue(summary, "machine", system.instance_id, command);
+      if (system.invocation?.InstanceName) {
+        summary.append(" ");
+        referenceValue(
+          summary,
+          "machine",
+          system.invocation.InstanceName,
+          command,
+        );
+      }
+      summary.append(
+        ` · ${system.invocation?.Status || system.details[0]?.Status || "No invocation collected"}`,
+      );
       section.append(summary);
       const plugins = new Map(
         (system.invocation?.CommandPlugins || []).map((p) => [
@@ -1767,8 +1894,18 @@ async function openCommand(key, keepLayout = false) {
       const button = document.createElement("button");
       button.className = "linked-event";
       button.textContent = `${shown(Date.parse(event.event_time))} ${meta.timezone} · ${event.operation} · ${event.error || "No API error"}\n${event.identity} · ${event.source_ip}\n${event.event_id} · ${event.source}`;
+      const references = document.createElement("div");
+      showReference({ ...command, ...event }, references);
+      links.append(references);
       button.onclick = async () => {
-        if (event.id !== null) await detail({ id: event.id });
+        if (event.id !== null)
+          await detail({
+            id: event.id,
+            identity: event.identity,
+            source_ip: event.source_ip,
+            account: event.account,
+            region: event.region,
+          });
         else {
           try {
             const data = await request("/api/ssm-event", { key: event.key });
@@ -1779,6 +1916,10 @@ async function openCommand(key, keepLayout = false) {
             $("record-hash").textContent =
               "Supplemental event reconstructed from export JSON; original evidence database is unchanged.";
             $("detail-findings").replaceChildren();
+            showReference(
+              { ...command, ...event },
+              $("detail-id").parentElement,
+            );
             $("detail-prev").hidden = $("detail-next").hidden = true;
             eventCommandLinks([{ key, command_id: command.command_id }]);
             openDetail();
@@ -2780,6 +2921,11 @@ async function detail(row) {
     detailRow = row.record_sha256 ? row : null;
     $("detail-id").textContent =
       `${data.event_id} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
+    const loaded = table
+      .getRows()
+      .find((item) => item.getData().id === row.id)
+      ?.getData();
+    showReference({ ...loaded, ...row }, $("detail-id").parentElement);
     eventCommandLinks(data.ssm_commands);
     // Format using token-aware whitespace only: do not parse/stringify numeric evidence in JavaScript.
     let indent = 0,
@@ -3326,6 +3472,7 @@ async function init() {
     });
   $("events-tab").onclick = () => switchView(false);
   $("commands-tab").onclick = () => switchView(true);
+  $("inventory-tab").onclick = () => switchView(false, true, true);
   $("show-sql").onclick = () => {
     if (commandsActive) switchView(false);
     $("sql-panel").open = true;
@@ -3566,6 +3713,10 @@ async function init() {
       const text = document.createElement("span");
       text.className = "cell-text";
       text.textContent = value ?? "";
+      const context = cell.getRow().getData();
+      if (field === "identity") referenceText(text, "identity", value, context);
+      else if (field === "source_ip") referenceText(text, "ip", value, context);
+      else if (field === "target") referenceTarget(text, value, context);
       const actions = document.createElement("span");
       actions.className = "cell-actions";
       for (const action of ["copy", "prevalence", "filter"]) {

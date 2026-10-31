@@ -87,7 +87,9 @@ class AutoContract(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             try:
-                result = main(["auto", *map(str, argv)])
+                # These pre-inventory contracts isolate the original stages. Network inventory's
+                # online default and resume behavior have cross-platform coverage below.
+                result = main(["auto", *map(str, argv), "--skip-inventory"])
             except SystemExit as exit:  # Usage errors, before any stage runs
                 result = exit.code
         self.assertEqual(result, status, stderr.getvalue())
@@ -582,6 +584,95 @@ class AutoContract(unittest.TestCase):
         self.assertFalse((target / "case.duckdb").exists())
         _, error = self.run_auto(target, "--services", "ssm", status=2)
         self.assertIn("must include cloudtrail", error)
+
+
+class AutoInventoryContract(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.target = self.root / "case"
+        self.source = self.root / "events.json"
+        self.source.write_text(json.dumps({"Records": [record("e1", "2026-01-01T00:00:00Z")]}), encoding="utf-8")
+
+    def run_auto(self, *args):
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            status = main(["auto", str(self.target), "--skip-enrich", "--skip-suzaku", *map(str, args)])
+        return status, output.getvalue()
+
+    def collection(self):
+        from kamotrace import auto
+        folder = self.target / "download"
+        folder.mkdir(parents=True)
+        (folder / "cloudtrail.json").write_bytes(self.source.read_bytes())
+        args = auto.parser().parse_args([str(self.target)])
+        manifest = {"complete": True, "regions": ["all"], "services": args.services, "compress": False,
+                    "session_s3": [], "session_log_groups": [], "start": None, "end_default": True}
+        (folder / "ssm.json").write_text('{"Commands": []}', encoding="utf-8")
+        (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def snapshot(self, output):
+        from kamotrace import inventory
+        # Synthetic collector output with no resources; the original export's JSON shape.
+        region = {"region": "test-region", "errors": [], "describe_vpcs": [], "describe_instances": [],
+                  "describe_db_instances": [], "describe_db_clusters": [], "load_balancers": [],
+                  "classic_load_balancers": [], "describe_security_groups": [], "target_groups": []}
+        original = self.root / "original"
+        inventory.write_json(original / "collection.json", {"account": "123456789012", "regions": ["test-region"],
+                             "completed_at_utc": "2026-01-01T00:00:00Z"})
+        inventory.write_json(original / "regions" / "test-region.json", region)
+        return inventory.build(output, from_export=original)
+
+    def test_offline_source_and_skip_download_never_collect_inventory(self):
+        with patch("kamotrace.inventory.boto3.Session", side_effect=AssertionError("no AWS")), patch("kamotrace.inventory.build", side_effect=AssertionError("no inventory collection")):
+            status, log = self.run_auto("--source", self.source, "--no-serve")
+            self.assertEqual(status, 0, log)
+            self.assertIn("offline inputs", log)
+        self.target = self.root / "downloaded"
+        self.collection()
+        with patch("kamotrace.inventory.boto3.Session", side_effect=AssertionError("no AWS")):
+            status, log = self.run_auto("--skip-download", "--no-serve")
+            self.assertEqual(status, 0, log)
+            self.assertFalse((self.target / "inventory").exists())
+
+    def test_explicit_snapshot_is_passed_to_serve_without_writing_it(self):
+        export = self.snapshot(self.root / "snapshot")
+        before = {p: digest(p) for p in export.rglob("*") if p.is_file()}
+        with patch("kamotrace.inventory.boto3.Session", side_effect=AssertionError("no AWS")), patch("kamotrace.server.main", return_value=0) as serve:
+            status, log = self.run_auto("--source", self.source, "--inventory-export", export)
+            self.assertEqual(status, 0, log)
+            argv = serve.call_args.args[0]
+            self.assertEqual(argv[argv.index("--inventory-export") + 1], str(export))
+        self.assertEqual(before, {p: digest(p) for p in export.rglob("*") if p.is_file()})
+
+    def test_online_default_collects_and_verified_snapshot_resumes_without_aws(self):
+        from kamotrace import inventory
+        self.collection()
+        real_build = inventory.build
+        # Stand in for AWS collection, retaining real staging, reporting, hashes and publication.
+        original = self.snapshot(self.root / "seed")
+        def collect(output, **kwargs):
+            return real_build(output, from_export=original, **kwargs)
+        with patch.object(inventory, "build", side_effect=collect) as collector:
+            status, log = self.run_auto("--no-serve")
+            self.assertEqual(status, 0, log)
+            collector.assert_called_once()
+        with patch.object(inventory.boto3, "Session", side_effect=AssertionError("no AWS")), patch.object(inventory, "build", side_effect=AssertionError("must reuse")):
+            status, log = self.run_auto("--no-serve")
+            self.assertEqual(status, 0, log)
+            self.assertIn("reused without contacting AWS", log)
+            status, log = self.run_auto("--profile", "different-scope", "--no-serve")
+            self.assertEqual(status, 1)
+            self.assertIn("matching scope", log)
+        report = self.target / "inventory" / "report.json"
+        report.write_bytes(b"altered")
+        status, log = self.run_auto("--no-serve")
+        self.assertEqual(status, 1)
+        self.assertIn("matching scope", log)
+        self.assertEqual(report.read_bytes(), b"altered")
+        status, log = self.run_auto("--skip-inventory", "--no-serve")
+        self.assertEqual(status, 0, log)
 
 
 if __name__ == "__main__":

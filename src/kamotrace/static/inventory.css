@@ -1,0 +1,232 @@
+#inventory-panel {
+  color: var(--ink);
+  padding-bottom: 18px;
+}
+.inventory-heading,
+.inventory-inspector-head,
+.inventory-map-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.inventory-heading h2 {
+  margin: 10px 0;
+  font-size: 16px;
+}
+.inventory-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+  padding: 12px 0;
+  border-block: 1px solid var(--line);
+}
+.inventory-toolbar label {
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+}
+.inventory-toolbar input,
+.inventory-toolbar select {
+  height: 32px;
+  min-width: 120px;
+}
+.inventory-search {
+  flex: 1;
+  min-width: 230px;
+}
+.inventory-warning {
+  padding: 10px 12px;
+  border-left: 3px solid var(--amber);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+.inventory-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 14px;
+  align-items: start;
+}
+.inventory-main {
+  min-width: 0;
+}
+#inventory-views {
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+#inventory-inspector {
+  position: sticky;
+  top: 12px;
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--blue);
+  padding: 12px;
+  scrollbar-gutter: stable;
+}
+.inventory-inspector-head {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+  margin-bottom: 12px;
+}
+.inventory-inspector-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+#inventory-evidence h3 {
+  overflow-wrap: anywhere;
+}
+#inventory-panel pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--surface);
+  padding: 10px;
+  max-height: 360px;
+  overflow: auto;
+  font: 11px/1.5 var(--font-mono);
+}
+#inventory-panel details {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+#inventory-panel summary {
+  cursor: pointer;
+}
+.inventory-facts {
+  margin: 10px 0;
+}
+.inventory-facts > div {
+  border-bottom: 1px solid var(--header);
+  padding: 5px 0;
+}
+.inventory-facts dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+.inventory-facts dd {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+.inventory-link {
+  display: block;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+  margin-block: 5px;
+}
+.inventory-map-tools {
+  border: 1px solid var(--line);
+  background: var(--header);
+  padding: 8px;
+  flex-wrap: wrap;
+}
+.inventory-map-tools > div {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#inventory-zoom {
+  min-width: 40px;
+  text-align: center;
+  font-size: 11px;
+}
+#inventory-canvas {
+  height: 570px;
+  max-height: 70vh;
+  min-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-top: 0;
+  background: var(--surface);
+}
+#inventory-topology {
+  display: block;
+  max-width: none;
+  font-family: var(--font-sans);
+}
+#inventory-topology .inventory-vpc {
+  fill: white;
+  stroke: var(--line);
+}
+#inventory-topology text {
+  fill: var(--ink);
+  font-size: 12px;
+  pointer-events: none;
+}
+#inventory-topology .inventory-node rect {
+  fill: var(--surface);
+  stroke: var(--control-line);
+  stroke-width: 1.3;
+}
+#inventory-topology .inventory-node {
+  cursor: pointer;
+}
+#inventory-topology .inventory-node:focus rect,
+#inventory-topology .inventory-node:hover rect,
+#inventory-topology .inventory-node[aria-pressed="true"] rect {
+  stroke: var(--blue);
+  stroke-width: 3;
+}
+#inventory-topology .inventory-node .inventory-node-sub {
+  fill: var(--muted);
+  font-size: 10px;
+}
+#inventory-topology .inventory-edge {
+  fill: none;
+  stroke: var(--context);
+  stroke-width: 2;
+  stroke-dasharray: 5 4;
+  cursor: pointer;
+}
+#inventory-topology .inventory-edge.forwarding {
+  stroke: var(--blue);
+  stroke-width: 3;
+  stroke-dasharray: none;
+}
+#inventory-topology .inventory-edge:focus,
+#inventory-topology .inventory-edge:hover {
+  stroke: var(--red);
+  stroke-width: 5;
+  outline: none;
+}
+.inventory-legend {
+  margin-top: 9px;
+}
+#inventory-panel .inventory-table {
+  border: 1px solid var(--line);
+}
+#inventory-panel .tabulator {
+  font-size: 12px;
+}
+#inventory-panel .tabulator-cell button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--blue-dark);
+  text-decoration: underline;
+  font: inherit;
+}
+#inventory-panel .tabulator-cell button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+.inventory-empty {
+  padding: 24px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+}
+@media (min-width: 1600px) {
+  .inventory-workspace {
+    grid-template-columns: minmax(0, 1fr) 400px;
+  }
+}
+@media (max-width: 1100px) {
+  .inventory-workspace {
+    grid-template-columns: minmax(0, 1fr) 290px;
+  }
+}

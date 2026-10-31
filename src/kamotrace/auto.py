@@ -1,7 +1,7 @@
 """Full-auto case preparation: tools, AWS collection, import, enrichment and detections, then the UI.
 
 Stages run in dependency order and reuse the other commands' code: get-suzaku, get-dbip, download,
-import, enrich, suzaku, serve. Rerun the same command after a failure or interruption: each stage
+import, enrich, suzaku, inventory, serve. Rerun the same command after a failure or interruption: each stage
 keeps verified completed work and redoes only what is missing or partial.
 """
 import argparse
@@ -12,14 +12,15 @@ import sys
 
 import duckdb
 import ijson
+from botocore.exceptions import BotoCoreError, ClientError
 
-from . import download, get_dbip, get_suzaku, server
+from . import download, get_dbip, get_suzaku, inventory, server
 from .enrich import SCHEMA as ENRICH_SCHEMA, Source, build as enrich, read_geolite2
 from .importer import build as import_evidence, expand, in_staging, lock_path, sha256, write_lock
 from .suzaku import (LEVELS, SCHEMA as SUZAKU_SCHEMA, evidence_identity, identify_sidecar, import_timeline,
                      run_options, run_suzaku)
 
-STAGES = ("get-suzaku", "get-dbip", "download", "import", "enrich", "suzaku", "serve")
+STAGES = ("get-suzaku", "get-dbip", "download", "import", "enrich", "suzaku", "inventory", "serve")
 
 
 class StageError(Exception):
@@ -137,6 +138,8 @@ def parser():
     inputs.add_argument("--source", action="extend", nargs="+", type=Path,
                         help="Existing CloudTrail JSON/gzip files or folder to import instead of downloading")
     inputs.add_argument("--ssm-export", type=Path, help="Existing SSM export to show in the UI (with --source/--skip-download)")
+    inputs.add_argument("--inventory-export", type=Path, help="Existing network inventory snapshot (read-only; no AWS calls)")
+    inputs.add_argument("--skip-inventory", action="store_true", help="Do not collect or show network inventory")
     enrichment = parser.add_argument_group("IP enrichment (kamotrace get-dbip / enrich)")
     enrichment.add_argument("--skip-enrich", action="store_true", help="No IP enrichment")
     enrichment.add_argument("--geolite2", dest="sources", action=Source, metavar="FOLDER",
@@ -177,7 +180,9 @@ def main(argv=None):
         options.error("--suzaku-version selects an installed or downloaded Suzaku; omit --suzaku/--timeline/--skip-suzaku")
     if args.ssm_export and not (args.source or args.skip_download):
         options.error("--ssm-export replaces the downloaded SSM export; use it with --source or --skip-download")
-    for path in (*(args.source or []), args.ssm_export, args.suzaku, args.timeline, args.rules,
+    if args.skip_inventory and args.inventory_export:
+        options.error("--skip-inventory cannot be combined with --inventory-export")
+    for path in (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules,
                  *(p for _, p in args.sources or [])):
         if path is not None and not path.exists():
             options.error(f"not found: {path}")
@@ -197,10 +202,18 @@ def main(argv=None):
     # and holding no input (importer.discard_abandoned), so these are the only predictable write paths.
     published = (database, database.with_suffix(".enrichment.duckdb"), database.with_suffix(".detections.duckdb"))
     outputs = {*published, *map(lock_path, published)}
-    inputs = (*(args.source or []), args.ssm_export, args.suzaku, args.timeline, args.rules, *(p for _, p in args.sources or []))
+    inputs = (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules, *(p for _, p in args.sources or []))
     for path in inputs:
         if path is not None and path.resolve() in outputs:
             options.error(f"{path} is an input but also a path this run writes; choose another --database or TARGET")
+    if args.inventory_export and any(path.is_relative_to(args.inventory_export.resolve()) for path in outputs):
+        options.error("The database and its sidecars/locks must be outside the original --inventory-export")
+    inventory_output = target / "inventory"
+    if not (args.skip_inventory or args.inventory_export or args.source or args.skip_download):
+        for path in (*inputs, *outputs, folder, tools):
+            if path is not None and (path.resolve().is_relative_to(inventory_output)
+                                     or path.resolve() == lock_path(inventory_output)):
+                options.error(f"{path} overlaps the inventory output; choose another TARGET or --skip-inventory")
     # Any stage may remove an abandoned `.<name>.<random>.staging` folder, so no input may live in one.
     # Checked before anything is written; expanded --source folders are checked again before import.
     for path in (*inputs, args.download_dir or target / "download", args.tools or get_suzaku.tools_folder()):
@@ -370,17 +383,42 @@ def main(argv=None):
                 finally:
                     work.cleanup()
 
-        # 7. UI: serve's defaults pick up the sidecars beside the database.
+        # 7. Current network configuration, independent of the historical CloudTrail range.
         stage = STAGES[6]
+        inventory_export = args.inventory_export
+        if args.skip_inventory:
+            say(stage, "skipped")
+        elif inventory_export:
+            inventory.read_export(inventory_export)
+            say(stage, f"using existing snapshot {inventory_export}; no AWS calls")
+        elif args.source or args.skip_download:
+            say(stage, "skipped: offline inputs; pass --inventory-export to show an existing snapshot")
+        else:
+            inventory_export = inventory_output
+            with write_lock(inventory_export):
+                current = inventory.completed_export(inventory_export, args.regions, args.profile)
+                if inventory_export.exists() and not current:
+                    raise StageError(f"{inventory_export} is not a verified completed inventory with matching scope; "
+                                     "use a new TARGET or --skip-inventory (existing snapshots are never overwritten)")
+                if current:
+                    say(stage, f"verified {inventory_export}; reused without contacting AWS")
+                else:
+                    say(stage, f"collecting current configuration into {inventory_export}")
+                    inventory.build(inventory_export, profile=args.profile, regions=args.regions, lock=False)
+
+        # 8. UI: serve's defaults pick up the sidecars beside the database.
+        stage = STAGES[7]
         if args.no_serve:
             say(stage, f"skipped; start later with: kamotrace serve --database {database}"
-                + (f" --ssm-export {ssm_export}" if ssm_export else ""))
+                + (f" --ssm-export {ssm_export}" if ssm_export else "")
+                + (f" --inventory-export {inventory_export}" if inventory_export else ""))
             return 0
         locks.close()  # Preparation is done; the server only reads the database and sidecars.
         say(stage, "starting the local browser UI (Ctrl+C to stop)")
         run_command(server.main, ["--database", str(database), "--port", str(args.port),
                                  "--mcp-transport", args.mcp_transport] +
-                    (["--ssm-export", str(ssm_export)] if ssm_export else []), "serve")
+                    (["--ssm-export", str(ssm_export)] if ssm_export else []) +
+                    (["--inventory-export", str(inventory_export)] if inventory_export else []), "serve")
         return 0
     except KeyboardInterrupt:
         print(f"kamotrace auto interrupted during {stage}; rerun the same command to resume.", file=sys.stderr)
@@ -388,7 +426,7 @@ def main(argv=None):
     except BlockingIOError as error:  # Contention, not a failed stage: nothing to renew or resume
         print(f"kamotrace auto stopped: {error}\nWait for the other run to finish, then rerun.", file=sys.stderr)
         return 1
-    except (StageError, OSError, ValueError, RuntimeError, duckdb.Error, ijson.JSONError) as error:
+    except (StageError, BotoCoreError, ClientError, OSError, ValueError, RuntimeError, duckdb.Error, ijson.JSONError) as error:
         print(f"kamotrace auto stopped during {stage}: {error}\nCompleted work is kept; fix the cause "
               "(e.g. renew your AWS login), then rerun the same command to resume.", file=sys.stderr)
         return getattr(error, "status", 1)

@@ -8,10 +8,14 @@
     <link rel="stylesheet" href="/vendor/tabulator.min.css" />
     <link rel="stylesheet" href="/vendor/nouislider.min.css" />
     <link rel="stylesheet" href="/app.css" />
+    <link rel="stylesheet" href="/inventory.css" />
+    <link rel="stylesheet" href="/reference-cards.css" />
     <script defer src="/vendor/tabulator.min.js"></script>
     <script defer src="/vendor/nouislider.min.js"></script>
     <script defer src="/vendor/marked.min.js"></script>
     <script defer src="/vendor/purify.min.js"></script>
+    <script defer src="/inventory.js"></script>
+    <script defer src="/reference-cards.js"></script>
     <script defer src="/app.js"></script>
   </head>
   <body>
@@ -26,6 +30,13 @@
       <nav class="workspace-tabs" aria-label="Evidence views">
         <button id="events-tab" aria-pressed="true">CloudTrail events</button>
         <button id="commands-tab" aria-pressed="false">SSM commands</button>
+        <button
+          id="inventory-tab"
+          aria-pressed="false"
+          aria-controls="inventory-panel"
+        >
+          AWS inventory
+        </button>
       </nav>
       <div class="utilities">
         <button id="show-sql" title="Show the generated SQL below the grid">
@@ -135,6 +146,202 @@
         </div>
       </aside>
       <main>
+        <section id="inventory-panel" hidden aria-label="AWS inventory">
+          <div class="inventory-heading">
+            <h2>AWS inventory &amp; configuration map</h2>
+            <span class="hint">Collected snapshot · read-only</span>
+          </div>
+          <p id="inventory-metadata" class="hint"></p>
+          <p id="inventory-status" role="status" aria-live="polite">
+            Open inventory to load the local snapshot.
+          </p>
+          <button id="inventory-retry" type="button" hidden>
+            Retry inventory
+          </button>
+          <div id="inventory-content" hidden>
+            <p id="inventory-warning" class="inventory-warning" hidden></p>
+            <form
+              id="inventory-filters"
+              class="inventory-toolbar"
+              role="search"
+              aria-label="Filter inventory"
+            >
+              <label class="inventory-search"
+                >Search inventory<input
+                  id="inventory-search"
+                  type="search"
+                  placeholder="Name, ID, address, rule, IAM role…"
+                  autocomplete="off"
+              /></label>
+              <label
+                >Region<select id="inventory-region">
+                  <option value="">All regions</option>
+                </select></label
+              >
+              <label
+                >Kind<select id="inventory-kind">
+                  <option value="">All kinds</option>
+                </select></label
+              >
+              <label
+                >Status<select id="inventory-assessment">
+                  <option value="">All statuses</option>
+                </select></label
+              >
+              <button id="inventory-clear" type="button">Clear filters</button>
+            </form>
+            <p id="inventory-count" class="hint" role="status"></p>
+            <div class="inventory-workspace">
+              <div class="inventory-main">
+                <div
+                  id="inventory-views"
+                  class="segmented"
+                  role="group"
+                  aria-label="Inventory views"
+                >
+                  <button type="button" data-view="map" aria-pressed="true">
+                    Map
+                  </button>
+                  <button
+                    type="button"
+                    data-view="systems"
+                    aria-pressed="false"
+                  >
+                    Systems
+                  </button>
+                  <button type="button" data-view="routes" aria-pressed="false">
+                    LB paths
+                  </button>
+                  <button type="button" data-view="groups" aria-pressed="false">
+                    Security groups
+                  </button>
+                  <button
+                    type="button"
+                    data-view="coverage"
+                    aria-pressed="false"
+                  >
+                    Coverage
+                  </button>
+                </div>
+                <section
+                  id="inventory-map-view"
+                  aria-label="Configuration topology"
+                >
+                  <div class="inventory-map-tools">
+                    <span class="hint"
+                      >Region / VPC groups · select a system or path for
+                      evidence</span
+                    >
+                    <div>
+                      <button
+                        id="inventory-zoom-out"
+                        type="button"
+                        aria-label="Zoom topology out"
+                      >
+                        −</button
+                      ><span id="inventory-zoom">100%</span
+                      ><button
+                        id="inventory-zoom-in"
+                        type="button"
+                        aria-label="Zoom topology in"
+                      >
+                        +</button
+                      ><button id="inventory-fit" type="button">
+                        Fit width
+                      </button>
+                    </div>
+                  </div>
+                  <div
+                    id="inventory-canvas"
+                    tabindex="0"
+                    role="region"
+                    aria-label="Scrollable configuration topology; Tab to nodes and paths, Enter to inspect"
+                  >
+                    <svg
+                      id="inventory-topology"
+                      xmlns="http://www.w3.org/2000/svg"
+                      role="group"
+                      aria-label="AWS systems grouped by region and VPC"
+                    ></svg>
+                  </div>
+                  <p class="hint inventory-legend">
+                    Solid teal: configured LB forwarding. Dashed: declared
+                    relationship. Select a system to inspect security groups,
+                    routes and ACLs. Lines describe configuration, not observed
+                    traffic.
+                  </p>
+                  <p class="hint">
+                    Allowed: world-source configuration path. Restricted:
+                    allowlisted source. Blocked: analyzed public path blocked.
+                    Unknown: incomplete or unmodeled evidence. Inactive: system
+                    not active. A private address or blocked direct path does
+                    not rule out load balancer access.
+                  </p>
+                </section>
+                <section
+                  id="inventory-systems-view"
+                  hidden
+                  aria-label="Inventory systems"
+                >
+                  <p class="hint">
+                    Scroll horizontally for addresses, IAM roles and assessment
+                    details. Inspect a row to see its collected evidence.
+                  </p>
+                  <div id="inventory-systems-table"></div>
+                </section>
+                <section
+                  id="inventory-routes-view"
+                  hidden
+                  aria-label="Load balancer paths"
+                >
+                  <p class="hint">
+                    Potential configuration matches, not successful requests.
+                    Conditions, priority, authentication, target health and
+                    network evidence still apply. Scroll horizontally for
+                    additional columns.
+                  </p>
+                  <div id="inventory-routes-table"></div>
+                  <h3>Other listener actions</h3>
+                  <div id="inventory-actions-table"></div>
+                </section>
+                <section
+                  id="inventory-groups-view"
+                  hidden
+                  aria-label="Security groups"
+                >
+                  <p class="hint">
+                    Search and region apply directly; kind and status restrict
+                    groups to matching attached systems. A rule alone does not
+                    establish public reachability.
+                  </p>
+                  <div id="inventory-groups-table"></div>
+                </section>
+                <section
+                  id="inventory-coverage-view"
+                  hidden
+                  aria-label="Full collection coverage"
+                ></section>
+              </div>
+              <aside
+                id="inventory-inspector"
+                tabindex="-1"
+                aria-label="Inventory evidence inspector"
+              >
+                <div class="inventory-inspector-head">
+                  <h3>Evidence inspector</h3>
+                  <button id="inventory-deselect" type="button">Clear</button>
+                </div>
+                <div id="inventory-evidence">
+                  <p class="hint">
+                    Select a system, security group or load balancer path to
+                    inspect collected evidence. This snapshot is separate from
+                    original CloudTrail events.
+                  </p>
+                </div>
+              </aside>
+            </div>
+          </div>
+        </section>
         <section class="time-panel" aria-label="Time range and histograms">
           <div class="time-row">
             <strong>Time</strong>

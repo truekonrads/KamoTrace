@@ -62,7 +62,8 @@ kamotrace auto C:\cases\example
 
 It installs and verifies Suzaku and DB-IP Lite (unless already installed),
 downloads CloudTrail and SSM from all enabled regions (maximum available history),
-imports `case.duckdb`, adds IP enrichment and Suzaku detections, and starts the
+imports `case.duckdb`, adds IP enrichment and Suzaku detections, collects a current
+network inventory in `TARGET/inventory`, and starts the
 UI on http://127.0.0.1:8765. Every default can be overridden, for example
 `--profile investigation --start 2026-10-01 --end 2026-10-02`, `--source FILE`
 to skip AWS, `--skip-suzaku`, or `--no-serve` for unattended use. If anything
@@ -70,6 +71,49 @@ fails or you interrupt it, **rerun the same command**: completed work is kept,
 including the collection's frozen time range. See
 [full-auto preparation](docs/user-guide.md#full-auto-preparation) for all
 options and recovery rules.
+
+#### Current AWS network inventory
+
+```powershell
+kamotrace inventory --profile investigation --regions all --output C:\cases\example\inventory
+# Reanalyze an existing standalone or KamoTrace export, without any AWS calls:
+kamotrace inventory --from-export C:\cases\example\inventory --output C:\cases\example\inventory-analysis
+```
+
+The collector uses read-only EC2, RDS, ELB/ELBv2 and assigned IAM instance-profile
+lookups in one authenticated account. `--regions` defaults to all enabled regions.
+It preserves API response pages under `raw/`, regional inputs under `regions/`,
+collection identity/timestamps in `collection.json`, IAM lookup timestamps in
+`iam.json`, and SHA-256/size provenance in `manifest.json`. Reports retain the
+standalone export's `report.json` shape and CSV tables; the browser presentation
+is provided by KamoTrace rather than a generated `network-map.html`.
+`--collect-only` omits analysis; reanalyze into a **different** output folder later.
+`--from-export` is entirely offline unless `--enrich-iam` explicitly opts into IAM
+lookups (which must authenticate to the exported account). Original inputs are
+copied byte-for-byte, not updated. Every output must be a new folder: it is privately
+staged and published atomically while holding the shared writer lock.
+
+This is **current configuration, not historical incident-time evidence**. Collection
+is non-atomic across services/regions. Allowed/Restricted means exported SG, route
+and ACL configuration permits a modeled path, not that a connection succeeds or a
+service listens. Direct exposure is separate from exposure through load balancers.
+Backend validation is intentionally limited (currently same-VPC IPv4 TCP NLB paths
+with client IP preservation and no frontend SG); other modes and missing evidence
+remain Unknown. Host firewalls, authentication, WAF, CloudFront, API Gateway and
+Global Accelerator are not assessed. Full modeling limitations and API errors are
+included in the report. Completion records mean collection finished, **not** that
+every API call was authorized or successful. Exports contain sensitive infrastructure
+metadata and are not encrypted.
+
+Online `auto` collects this snapshot by default and passes it to `serve` using
+`--inventory-export FOLDER`. `--skip-inventory` opts out. Offline `auto --source`
+and `auto --skip-download` never collect inventory or make inventory AWS calls;
+pass `--inventory-export FOLDER` to show an existing snapshot instead. Tool downloads
+and IP enrichment retain their separate existing defaults. Auto reuses only a
+completed, hash-verified inventory with matching requested regions/profile; it
+does not refresh an existing snapshot or recheck its account through AWS on resume.
+Use a new TARGET for a fresh configuration snapshot. An unknown, changed, partial
+or differently scoped inventory folder is refused, never overwritten.
 
 ### 2. Get your CloudTrail export
 

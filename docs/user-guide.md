@@ -14,6 +14,7 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 - [Run KamoTrace in Docker](#docker)
 - [Add Suzaku detections](#suzaku-detections)
 - [Add offline IP enrichment](#ip-enrichment)
+- [Browse AWS inventory and map](#aws-inventory-and-map)
 - [Record findings and tag events](#findings-and-event-tags)
 - [Search and inspect CloudTrail events](#cloudtrail-workflow)
 - [Browse SSM commands and output](#ssm-command-browser-desktop)
@@ -23,6 +24,44 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 - [Fix common problems](#troubleshooting-and-limitations)
 - [Check licences and dependencies](#open-source-components)
 - [Run development checks](#verification)
+
+## AWS inventory and map
+
+Collect a read-only snapshot using your existing AWS login, then attach it when
+opening a case:
+
+```powershell
+kamotrace inventory --profile investigation --regions all --output C:\cases\acme\inventory
+kamotrace serve --database C:\cases\acme\case.duckdb --inventory-export C:\cases\acme\inventory
+```
+
+The **AWS inventory** workspace shows collected systems and their network
+configuration. Search and region/status filters apply to the snapshot, not the
+CloudTrail time range. Select a system to inspect its addresses, assigned IAM
+roles, security groups, and exposure assessment. Collection failures remain
+visible as coverage gaps; a denied read does not mean the resource is absent.
+
+Inventory is a **current, non-atomic configuration snapshot**, not a reconstruction
+of the incident. A permitted path means the exported configuration allows it,
+not that a service was listening or a connection succeeded. No active network
+probes or DNS lookups are performed. See the snapshot's limitations for network
+paths the analysis cannot verify.
+
+Online `kamotrace auto` also prepares inventory. Use `--skip-inventory` to omit it,
+or `--inventory-export FOLDER` to attach an existing snapshot. Offline preparation
+with `--source` or `--skip-download` does not collect inventory from AWS.
+
+Hover over, focus, or click an identity, machine, or IP reference in event and SSM
+views to inspect known context. Click keeps a card open; Escape dismisses it.
+Cards label inventory, observed CloudTrail/SSM activity, and IP lookup information
+separately. Exact names and addresses can match multiple systems: account and
+region narrow the results when available, and competing matches remain visible.
+A reused IP is not proof that its current owner generated historical traffic.
+An assumed-role session is not silently matched to an IAM role by its name.
+These lookups do not change your filters, evidence, findings, or tags.
+
+Inventory JSON, raw AWS responses, and CSV exports contain sensitive infrastructure
+metadata. Keep them with the private case files, not in the source repository.
 
 ## End-to-end example
 

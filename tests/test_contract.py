@@ -30,6 +30,52 @@ from kamotrace.enrich import build as enrich
 from kamotrace.suzaku import import_timeline
 
 
+def inventory_fixture(folder):
+    """Synthetic current configuration, including an intentionally ambiguous private address/name."""
+    resources = []
+    for identifier, region, status, addresses in [
+        ("i-example", "ap-southeast-3", "Restricted", ["10.0.1.5", "1.1.1.1"]),
+        ("i-other", "us-east-1", "Blocked", ["10.0.1.5"]),
+        ("i-alpha", "ap-southeast-3", "Blocked", ["10.0.1.9"]),
+    ]:
+        resources.append({"id": identifier, "name": "application" if identifier != "i-alpha" else "worker <synthetic>",
+            "kind": "EC2", "region": region, "vpc_id": "vpc-test", "subnet_ids": ["subnet-test"],
+            "state": "running", "addresses": addresses, "security_groups": ["sg-test"], "details": {"instance_type": "t3.small"},
+            "status": status, "summary": "Synthetic configuration assessment, not a connection test", "paths": [],
+            "direct_status": status, "indirect_status": "None", "via_load_balancers": [],
+            "iam_roles": ["application-role"], "iam_role_arns": ["arn:aws:iam::123:role/application-role"],
+            "iam_role_status": "Resolved", "iam_instance_profile": "arn:aws:iam::123:instance-profile/application"})
+    resources.append({"id": "lb-synthetic", "name": "application-gateway", "kind": "Load balancer",
+        "region": "ap-southeast-3", "vpc_id": "vpc-test", "subnet_ids": ["subnet-test"],
+        "state": "active", "addresses": ["gateway.synthetic.invalid"], "security_groups": ["sg-test"],
+        "status": "Restricted", "direct_status": "Restricted", "indirect_status": "None", "via_load_balancers": [],
+        "summary": "Synthetic restricted frontend; configuration is not a connection test", "paths": [],
+        "iam_roles": [], "iam_role_arns": [], "iam_role_status": "Not applicable", "details": {}})
+    resources[0].update(indirect_status="Configured", via_load_balancers=["application-gateway"])
+    route = {"id": "route-synthetic", "region": "ap-southeast-3", "load_balancer_id": "lb-synthetic",
+        "load_balancer_name": "application-gateway", "scheme": "internet-facing", "listener_id": "listener-synthetic",
+        "listener_protocol": "HTTPS", "listener_port": 443, "rule_id": "rule-synthetic", "priority": "default",
+        "conditions": [], "actions": [{"Type": "forward", "TargetGroupArn": "target-group-synthetic"}],
+        "target_group_id": "target-group-synthetic", "target_group_name": "application-backends", "target_type": "instance",
+        "target_id": "i-example", "target_resource_id": "i-example", "target_resource_region": "ap-southeast-3",
+        "target_name": "application", "target_port": 8080, "health": "healthy", "weight": 1,
+        "frontend_status": "Restricted", "network_status": "Restricted", "status": "Configured", "public_entry": True,
+        "reason": "Synthetic forwarding configuration; not successful access", "network_evidence": ["Synthetic restricted backend path"]}
+    report = {"metadata": {"account": "123", "started_at_utc": "2026-10-29T15:00:00Z",
+        "completed_at_utc": "2026-10-29T15:01:00Z", "regions": ["ap-southeast-3", "us-east-1"],
+        "limitations": ["Current configuration snapshot, not historical incident-time state.", "No active probes are performed."]},
+        "resources": resources, "vpcs": [{"id": "vpc-test", "region": region, "name": "Synthetic VPC", "cidr": "10.0.0.0/16"}
+            for region in ("ap-southeast-3", "us-east-1")],
+        "security_groups": [{"id": "sg-test", "name": "Application ingress", "region": "ap-southeast-3", "vpc_id": "vpc-test",
+                             "ingress": [], "egress": [], "resources": ["i-example", "i-alpha"]}],
+        "relationships": [], "forwarding_paths": [route], "listener_actions": [],
+        "errors": [{"region": "us-east-1", "operation": "describe_db_instances", "error": "AccessDenied (synthetic)"}],
+        "counts": {"Restricted": 2, "Blocked": 2}}
+    folder.mkdir()
+    (folder / "report.json").write_text(json.dumps(report), encoding="utf-8")
+    return report
+
+
 class BrowserContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -75,7 +121,7 @@ class BrowserContract(unittest.TestCase):
             {"region": "us-east-1", "record": {**command, "InstanceIds": ["i-other"], "TargetCount": 1,
                 "Parameters": {"commands": ["different region"]}}}],
             "invocations": [{"region": "ap-southeast-3", "record": {"CommandId": "command-multi", "InstanceId": instance,
-                "Status": status, "CommandPlugins": [{"Name": "shell", "Output": "combined fallback", "Status": status}]
+                "InstanceName": "ssm-worker", "Status": status, "CommandPlugins": [{"Name": "shell", "Output": "combined fallback", "Status": status}]
                     + ([{"Name": "fallback-step", "Output": "mixed stdout/stderr", "Status": "TimedOut", "ResponseCode": 7}]
                        if instance == "i-beta" else [])}}
                 for instance, status in [("i-alpha", "Success"), ("i-beta", "Failed")]],
@@ -86,7 +132,9 @@ class BrowserContract(unittest.TestCase):
                     ("i-beta", "shell", "Failed", 9, "beta stdout", "beta stderr"),
                     ("i-alpha", "second-step", "Success", 0, "alpha second plugin", "")]],
             "cloudtrail_records": [events[0], supplement]}), encoding="utf-8")
-        cls.store = Store(cls.database, ssm_export=cls.ssm_export)
+        cls.inventory_export = root / "inventory"
+        cls.inventory_report = inventory_fixture(cls.inventory_export)
+        cls.store = Store(cls.database, ssm_export=cls.ssm_export, inventory_export=cls.inventory_export)
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=cls.store))
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -115,6 +163,48 @@ class BrowserContract(unittest.TestCase):
             with error:
                 return error.code, json.load(error)
 
+    def test_inventory_and_scope_aware_reference_cards(self):
+        status, report = self.call("/api/inventory")
+        self.assertEqual(status, 200)
+        self.assertTrue(report["loaded"])
+        self.assertEqual(report["resources"], self.inventory_report["resources"])
+        self.assertEqual(report["errors"][0]["operation"], "describe_db_instances")
+        self.assertEqual(report["metadata"]["completed_at_utc"], "2026-10-29T15:01:00Z")
+        for kind, value in [("machine", "application"), ("ip", "10.0.1.5")]:
+            status, card = self.call("/api/reference", {"kind": kind, "value": value})
+            self.assertEqual(status, 200)
+            self.assertTrue(card["ambiguous"])
+            self.assertEqual({m["id"] for m in card["matches"]}, {"i-example", "i-other"})
+            _, card = self.call("/api/reference", {"kind": kind, "value": value, "account": "123", "region": "us-east-1"})
+            self.assertFalse(card["ambiguous"])
+            self.assertEqual([m["id"] for m in card["matches"]], ["i-other"])
+            _, card = self.call("/api/reference", {"kind": kind, "value": value, "account": "different-account"})
+            self.assertEqual(card["matches"], [])
+        _, role = self.call("/api/reference", {"kind": "identity", "value": "arn:aws:iam::123:role/application-role"})
+        self.assertEqual({m["source"] for m in role["matches"]}, {"inventory"})
+        _, session = self.call("/api/reference", {"kind": "identity", "value": "arn:aws:sts::123:assumed-role/application-role/session"})
+        self.assertEqual(session["matches"], [])  # Never guess that a session belongs to a known role.
+        _, identity = self.call("/api/reference", {"kind": "identity", "value": "arn:aws:iam::123:user/alice", "account": "123"})
+        self.assertEqual(sum(m["identity"]["event_count"] for m in identity["matches"]), 5)
+        self.assertEqual(identity["matches"][0]["identity"]["first_seen"], "2026-10-24 16:59:59+00")
+        _, ip = self.call("/api/reference", {"kind": "ip", "value": "1.1.1.1", "region": "ap-southeast-3", "account": "123"})
+        self.assertEqual({m["source"] for m in ip["matches"]}, {"inventory", "cloudtrail", "enrichment"})
+        observed = next(m for m in ip["matches"] if m["source"] == "cloudtrail")
+        self.assertEqual(observed["identity"]["event_count"], 1)  # Other account and missing scope excluded.
+        _, machine = self.call("/api/reference", {"kind": "machine", "value": "i-alpha", "account": "123", "region": "ap-southeast-3"})
+        self.assertEqual({m["source"] for m in machine["matches"]}, {"inventory", "ssm"})
+        _, name = self.call("/api/reference", {"kind": "machine", "value": "ssm-worker", "account": "123", "region": "ap-southeast-3"})
+        self.assertTrue(name["ambiguous"])
+        self.assertEqual({m["id"] for m in name["matches"]}, {"i-alpha", "i-beta"})
+        _, unknown = self.call("/api/reference", {"kind": "machine", "value": "application' OR 1=1 --"})
+        self.assertEqual(unknown["matches"], [])
+        for body in ({"kind": "sql", "value": "select"}, {"kind": "ip", "value": "not-an-ip"},
+                     {"kind": "machine", "value": "x", "region": []}):
+            self.assertEqual(self.call("/api/reference", body)[0], 400)
+        self.assertEqual(self.call("/api/inventory", headers={"Origin": "https://attacker.invalid"})[0], 403)
+        self.assertEqual(self.call("/api/reference", {"kind": "machine", "value": "i-alpha"},
+                                   headers={"Host": "attacker.invalid"})[0], 403)
+
     def test_serve_reports_startup_progress_and_ready_url(self):
         for transport in ("http", "stdio"):
             with self.subTest(transport=transport):
@@ -125,7 +215,7 @@ class BrowserContract(unittest.TestCase):
             process = subprocess.Popen([sys.executable, "-m", "kamotrace", "serve",
                 "--database", str(self.database), "--ssm-export", str(self.ssm_export),
                 "--annotations", str(Path(temporary) / "reviews.sqlite3"), "--bind", "127.0.0.1", "--port", "0",
-                *(["--mcp-transport", "stdio"] if transport == "stdio" else [])],
+                *(["--mcp-transport", "stdio", "--inventory-export", str(self.inventory_export)] if transport == "stdio" else [])],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             lines = Queue()
 
@@ -176,6 +266,12 @@ class BrowserContract(unittest.TestCase):
                 self.assertRegex(output, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4} INFO")
                 with urlopen(url + "/api/meta", timeout=15) as response:
                     self.assertEqual(json.load(response)["total"], 5)
+                with urlopen(url + "/api/inventory", timeout=15) as response:
+                    inventory = json.load(response)
+                    self.assertEqual(inventory["loaded"], transport == "stdio")
+                    if transport == "http":
+                        self.assertEqual(inventory["resources"], [])
+                        self.assertIsNone(inventory["metadata"])
             finally:
                 process.terminate()
                 process.wait(timeout=15)

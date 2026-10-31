@@ -9,6 +9,7 @@
   kamotrace get-dbip [--dest FOLDER]
   kamotrace enrich   --database case.duckdb (--geolite2 FOLDER | --jsonl FILE)...
   kamotrace ssmcheck [--profile NAME] [--regions all] [--json report.json] [--max-items 200]
+  kamotrace inventory --output FOLDER [--profile NAME] [--regions all] [--from-export FOLDER]
   kamotrace serve    --database case.duckdb [--ssm-export ...]
   kamotrace mcp      --url http://127.0.0.1:8765
 """
@@ -24,6 +25,7 @@ COMMANDS = {
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),
     "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2-format .mmdb and/or provider-neutral JSONL"),
     "ssmcheck": ("kamotrace.ssmcheck", "Read-only report of what SSM sessions and commands log, and where"),
+    "inventory": ("kamotrace.inventory", "Export current AWS network configuration or analyze an existing export offline"),
     "serve": ("kamotrace.server", "Start the local browser UI and HTTP MCP at /mcp on 127.0.0.1"),
     "mcp": ("kamotrace.mcp_server", "Stdio MCP adapter for agents, backed by a running `kamotrace serve`"),
 }

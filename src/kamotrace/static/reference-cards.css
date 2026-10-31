@@ -1,0 +1,79 @@
+.reference-trigger {
+  text-decoration: underline dotted var(--context);
+  text-underline-offset: 3px;
+  cursor: help;
+}
+.reference-trigger:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+.reference-card {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  width: 430px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  z-index: 10000;
+  background: #fff;
+  color: var(--ink);
+  border: 1px solid var(--blue);
+  border-top: 4px solid var(--blue);
+  padding: 12px 14px;
+  box-shadow: 0 6px 22px #103b5533;
+  font: 13px/1.5 var(--font-sans);
+  overflow-wrap: anywhere;
+}
+.reference-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.reference-card header strong {
+  font-size: 15px;
+}
+.reference-card p {
+  margin: 7px 0;
+  white-space: pre-wrap;
+}
+.reference-card h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.reference-card .reference-value {
+  font-family: var(--font-mono);
+}
+.reference-card .reference-match {
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+}
+.reference-card .reference-provenance {
+  color: var(--muted);
+  font-size: 12px;
+}
+.reference-card .reference-warning {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  padding: 8px;
+}
+.reference-card dl {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 8px 0 0;
+}
+.reference-card dt {
+  color: var(--muted);
+}
+.reference-card dd {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.reference-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 8px 0;
+}

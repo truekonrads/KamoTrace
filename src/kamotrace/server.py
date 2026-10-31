@@ -159,7 +159,7 @@ def build_query(body):
 
 
 class Store:
-    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None):
+    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None):
         with ExitStack() as startup:
             logger.info("Opening evidence database (read-only): %s", database)
             self.connection = duckdb.connect(str(database), read_only=True)
@@ -228,6 +228,9 @@ class Store:
             from .suzaku import load_detections
             logger.info("Loading and linking SSM commands: %s", ssm_export or "none (no export supplied)")
             self.commands = Commands(ssm_export, self.connection)
+            from .inventory_store import Inventory
+            logger.info("Loading current-configuration inventory: %s", inventory_export or "none (no export supplied)")
+            self.inventory = Inventory(inventory_export)
             # Suzaku detections come from a derived sidecar written by `kamotrace suzaku`; only rows the
             # CLI linked to exactly one evidence record are queryable. Missing sidecar = no detections.
             default = database.with_suffix(".detections.duckdb")
@@ -240,6 +243,11 @@ class Store:
             self.meta = self.metadata()
             # The Store owns both connections after initialization succeeds.
             startup.pop_all()
+
+    def reference(self, body):
+        from .inventory_store import reference
+        with self.lock:
+            return reference(body, self.inventory, self.connection, self.commands)
 
     def ssm_log(self, body):
         with self.lock:
@@ -659,6 +667,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(self.store.reviews_list())
         elif path == "/api/detections":
             self.respond(self.store.detections_list())
+        elif path == "/api/inventory":
+            self.respond(self.store.inventory.report)
         elif path.startswith("/api/events/"):
             try:
                 record = int(path.rsplit("/", 1)[-1])
@@ -669,7 +679,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(detail or {"error": "Event not found"}, 200 if detail else 404)
         elif path.startswith("/api/"):
             self.respond({"error": "Not found"}, 404)
-        elif path in ("/", "/index.html", "/app.js", "/app.css", "/favicon.png", "/konami-duck.png") or path.startswith("/vendor/"):
+        elif path in ("/", "/index.html", "/app.js", "/app.css", "/inventory.js", "/inventory.css",
+                      "/reference-cards.js", "/reference-cards.css", "/favicon.png", "/konami-duck.png") or path.startswith("/vendor/"):
             super().do_GET()
         else:
             self.respond({"error": "Not found"}, 404)
@@ -680,7 +691,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review"):
+        if self.path not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/reference"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -692,6 +703,7 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("Expected a JSON object")
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
+                         "/api/reference": self.store.reference,
                          "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]
@@ -719,6 +731,8 @@ def main(argv=None):
                         help="Listening address (default: 127.0.0.1, or $KAMOTRACE_BIND inside the container)")
     parser.add_argument("--annotations", type=Path, help="SQLite sidecar (default: beside the evidence database)")
     parser.add_argument("--ssm-export", type=Path, help="Local ssm_command_session_activity[.enriched].json export")
+    parser.add_argument("--inventory-export", type=Path,
+                        help="AWS inventory export folder containing report.json; current configuration, not historical evidence")
     parser.add_argument("--detections", type=Path,
                         help="Suzaku detections from `kamotrace suzaku` (default: <database>.detections.duckdb if present)")
     args = parser.parse_args(argv)
@@ -730,9 +744,11 @@ def main(argv=None):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             parser.error(f"--{name.replace('_', '-')} not found: {path}")
+    if args.inventory_export is not None and not args.inventory_export.is_dir():
+        parser.error(f"--inventory-export folder not found: {args.inventory_export}")
     try:
         store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
-                      args.ssm_export, args.detections and args.detections.resolve())
+                      args.ssm_export, args.detections and args.detections.resolve(), inventory_export=args.inventory_export)
     except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
         parser.error(str(error))
     logger.info("Binding HTTP server to %s:%s", args.bind, args.port)
