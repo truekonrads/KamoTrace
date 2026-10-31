@@ -81,6 +81,7 @@ class AutoContract(unittest.TestCase):
         os.environ.pop("KAMOTRACE_BIND")
         # The browser server is constructed for real (validating every sidecar), but never listens.
         self.http = self.stack.enter_context(patch("kamotrace.server.ThreadingHTTPServer"))
+        self.http.return_value.server_port = 8765
 
     def run_auto(self, *argv, status=0):
         stdout, stderr = io.StringIO(), io.StringIO()
