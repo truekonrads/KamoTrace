@@ -342,6 +342,13 @@
               >
                 Spreadsheet
               </button>
+              <button
+                type="button"
+                id="command-log-layout"
+                aria-pressed="false"
+              >
+                Activity log
+              </button>
             </div>
             <input
               id="command-search"
@@ -349,6 +356,16 @@
               aria-label="Search commands, decoded payloads, system IDs and output"
               placeholder="Search commands, decoded payloads, system IDs, output, identity…"
             />
+            <select
+              id="log-search-scope"
+              hidden
+              aria-label="Activity log search scope"
+              title="Both: raw or enhanced. Raw/context: request, output, entry context and linked event metadata. Enhanced/analyst: export decoding, interpretations, entry tags/findings and linked event tags/findings."
+            >
+              <option value="both">Both (raw + enhanced)</option>
+              <option value="raw">Raw / context</option>
+              <option value="enhanced">Enhanced / analyst</option>
+            </select>
             <select id="command-sort" aria-label="Sort commands">
               <option value="requested_ms">Requested time</option>
               <option value="command_id">Command ID</option>
@@ -375,12 +392,12 @@
               <summary>Coverage and limitations</summary>
               <p class="hint">
                 The time range above filters command requested time in the
-                selected timezone. CloudTrail field/tag filters do not apply
-                here. Output is collected evidence, may be truncated, and is
-                never executed. Spreadsheet: one row per system/plugin output
-                record; commands repeat for each system and search keeps a
-                command's systems together. Click a cell to read/copy its full
-                value.
+                selected timezone (Activity log uses each entry's time).
+                CloudTrail field/tag filters do not apply here. Output is
+                collected evidence, may be truncated, and is never executed.
+                Spreadsheet: one row per system/plugin output record; commands
+                repeat for each system and search keeps a command's systems
+                together. Click a cell to read/copy its full value.
               </p>
               <ul id="command-limitations"></ul>
             </details>
@@ -395,6 +412,116 @@
               <span id="sheet-load-status" role="status"></span>
               <button id="more-sheet" hidden>Load more rows</button>
             </div>
+          </section>
+          <section
+            id="command-log-panel"
+            hidden
+            aria-label="Reconstructed SSM activity log"
+          >
+            <p class="hint">
+              Chronological reconstruction, not a terminal recording. API
+              acceptance is not execution success. Times and outputs may be
+              incomplete; separate machines and plugins are never merged.
+              Analyst interpretations, entry tags and entry findings are
+              separate from original evidence and event findings.
+            </p>
+            <div class="ssm-log-lanes-head">
+              <span>Collected evidence · read-only</span>
+              <span
+                >Derived &amp; analyst · not evidence
+                <button id="refresh-log" type="button" hidden>
+                  Results may be out of date · Refresh search
+                </button></span
+              >
+            </div>
+            <div id="command-log"></div>
+            <p id="log-load-status" class="hint" role="status"></p>
+            <button id="more-log" hidden>Retry loading activity</button>
+            <aside
+              id="log-editor"
+              hidden
+              aria-labelledby="log-editor-title"
+              class="log-editor"
+            >
+              <div class="log-editor-head">
+                <h2 id="log-editor-title">Analyst entry</h2>
+                <span id="log-editor-dirty" class="hint"></span>
+                <button id="log-editor-close" type="button">Close</button>
+              </div>
+              <p id="log-editor-entry" class="hint"></p>
+              <form id="log-editor-form">
+                <label
+                  >De-obfuscated / enriched text (line breaks preserved)
+                  <textarea id="log-edit-text" rows="12"></textarea>
+                </label>
+                <div class="command-links">
+                  <button type="button" id="log-copy-raw">
+                    Copy raw text into editor
+                  </button>
+                  <button
+                    type="button"
+                    class="log-decode"
+                    data-encoding="utf-8"
+                  >
+                    Decode Base64 (UTF-8)
+                  </button>
+                  <button
+                    type="button"
+                    class="log-decode"
+                    data-encoding="utf-16le"
+                  >
+                    Decode Base64 (UTF-16LE)
+                  </button>
+                </div>
+                <p class="hint">
+                  Select a Base64 token to decode it, or decode the whole field.
+                  UTF-16LE suits PowerShell encoded commands. Nothing is
+                  executed or fetched.
+                </p>
+                <label
+                  >Entry tags (comma-separated slugs)
+                  <input id="log-edit-tags" autocomplete="off" />
+                </label>
+                <label
+                  >Entry finding / analyst note
+                  <textarea id="log-edit-finding" rows="4"></textarea>
+                </label>
+                <div class="log-editor-actions">
+                  <button type="submit" id="log-save" class="primary">
+                    Save analyst entry
+                  </button>
+                  <button type="button" id="log-latest">
+                    Read latest saved (keep draft)
+                  </button>
+                  <button type="button" id="log-discard">Discard draft</button>
+                </div>
+                <p id="log-editor-status" role="status"></p>
+              </form>
+              <section
+                id="log-latest-panel"
+                hidden
+                aria-label="Latest saved version"
+              >
+                <h3>
+                  Latest saved version · <span id="log-latest-stamp"></span>
+                </h3>
+                <pre id="log-latest-text"></pre>
+                <p id="log-latest-tags"></p>
+                <pre id="log-latest-finding"></pre>
+                <button type="button" id="log-use-latest">
+                  I merged it: save my draft over this version
+                </button>
+                <button type="button" id="log-replace-latest">
+                  Replace my draft with this version
+                </button>
+              </section>
+              <details id="log-drafts" hidden>
+                <summary>
+                  Unsaved drafts (<span id="log-draft-count">0</span>)
+                </summary>
+                <ul id="log-draft-list"></ul>
+              </details>
+            </aside>
           </section>
           <div id="command-browser-panel" class="command-workspace">
             <section aria-label="Matching commands">

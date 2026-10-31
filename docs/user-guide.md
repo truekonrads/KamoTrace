@@ -719,8 +719,9 @@ The file has `account_id`, `commands`, `invocations`, `invocation_details`, and
 optional `cloudtrail_records`, `coverage` and `base64_enrichment` fields. Each
 command/invocation/detail is wrapped as `{ "region": "...", "record": {...} }`;
 commands may additionally contain per-parameter `base64_enrichment` arrays.
-Without this option, CloudTrail browsing still works and the SSM tab explains
-how to load an export. Exports remain local and read-only; restart to reload.
+Without this option, the Activity log still shows CloudTrail SSM activity;
+the command browser and spreadsheet explain how to load an export for output.
+Exports remain local and read-only; restart to reload.
 
 ### Search commands and switch layouts
 
@@ -744,6 +745,78 @@ how to load an export. Exports remain local and read-only; restart to reload.
   CloudTrail links** to return to the detailed command browser. Switching layouts
   retains time and command search. SSM records remain JSON-backed in memory;
   this view does not import them into persistent DuckDB tables.
+
+### Activity log and analyst interpretations
+
+Choose **Activity log** for an oldest-first, scrolling screen log. This is a
+**reconstruction, not a terminal recording**: collected command output and
+CloudTrail API activity have different sources. Failed SendCommand requests
+without a command ID and session operations (including port-forwarding requests)
+remain visible; API acceptance does not establish that a command ran or that a
+session connected. This view does not invent terminal output for sessions.
+Downloaded session transcript files remain separate.
+
+Each entry retains its timestamp, account, region, command ID where available,
+machine and plugin, outcome/code and exact CloudTrail links. Missing output,
+collected empty streams and combined-only output are distinguished. Each entry
+labels its time basis: CloudTrail time, execution/response start, command requested
+time as an output fallback, or reported session start. Time bounds
+apply to the entry time, start-inclusive/end-exclusive; unknown-time entries are
+excluded when a bound is set.
+
+Search is a case-insensitive literal substring over the whole selection, before
+counting and paging. Choose its scope beside the search box: **Both** (default),
+**Raw / context** (request/command, stdout, stderr, combined output, account,
+region, machine, plugin, command ID and linked event metadata) or **Enhanced /
+analyst** (the export's static decoding, saved interpretations, entry tags and
+entry findings, plus tags and findings on the linked evidence events).
+
+Scroll with the mouse wheel or Page Down as one continuous sheet: the next
+100 entries load automatically before you reach the end. Existing entries,
+drafts and scroll position stay in place; no expansion or pagination clicks are
+needed to read collected text and saved interpretations. Entries are compact:
+one heading line (time, operation, outcome, machine, plugin), one context line
+(account, region, command ID, time basis), then full wrapping text in two
+aligned lanes: collected evidence on the left and derived/analyst content on the
+right. Long output is never clipped or placed in its own scroll box.
+Only editing requires opening the editor. The footer reports progress and when all matching activity
+is loaded. If a request fails, loaded entries remain readable and an explicit
+**Retry loading activity** button appears rather than retrying endlessly; it
+retries exactly the failed request.
+
+If an analyst write (yours, another tab's or an agent's) could change which
+entries match a Both/Enhanced search, the log stops loading further pages and
+shows **Results may be out of date · Refresh search** instead of skipping or
+repeating entries. Loaded entries and drafts stay; Refresh reruns the search and
+returns you to the same entry if it still matches. Empty and Raw/context
+searches are not affected by analyst writes.
+
+Raw collected text stays read-only. **Edit analyst entry** opens one side
+editor over the right edge of the page; the log does not move or rewrap, so you
+can keep reading the raw lane. Enter de-obfuscated/enriched text, line breaks,
+entry tags and an entry finding. Saving updates only that entry in place. Close
+(or Escape) returns focus to the entry, so Page Down continues from there.
+Drafts are kept per entry while you switch entries, layouts, tabs and searches;
+**Unsaved drafts** in the editor lists them. They are not stored on disk: the
+browser warns before leaving the page with unsaved drafts. You can copy raw text into
+the editor, select a Base64 token and decode it as UTF-8 or UTF-16LE (PowerShell),
+or decode the whole field. These are static text transformations only: nothing
+is executed or fetched. Check the result and **Save analyst entry** explicitly.
+
+Interpretations, entry tags and entry findings live in the evidence-bound SQLite
+sidecar, not the export or CloudTrail database. They attach to a content-addressed
+entry, so changing its source cannot silently reuse the old interpretation.
+Concurrent edits from another browser or MCP agent are rejected; your draft
+stays. Use **Read latest saved (keep draft)** to see the other version next to
+your draft, merge it in, then choose **I merged it: save my draft over this
+version** (or **Replace my draft with this version**) and save.
+Entry tags/findings are distinct from event tags and shared event findings in
+the sidebar. For entries with original evidence links, **Event tags** and
+**Event finding** reuse those existing workflows, and the enhanced lane shows
+them labelled as event tags/findings. Supplemental
+entries can still have entry tags/findings without pretending they are original
+CloudTrail evidence. MCP agents can read the same log and save interpretations
+with `search_ssm_log`, `get_ssm_log_entry` and `edit_ssm_log_entry`.
 
 ### Interpret command output
 

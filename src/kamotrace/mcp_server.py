@@ -283,9 +283,49 @@ def get_ssm_command(key: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=READ)
 def get_ssm_event(key: str) -> dict[str, Any]:
-    """A CloudTrail event linked to an SSM command, by its event `key` from get_ssm_command; includes
+    """A CloudTrail SSM event, by its event `key` from get_ssm_command or search_ssm_log; includes
     the original raw JSON and whether it is from the database or a labeled supplemental export."""
     return call("/api/ssm-event", {"key": key})
+
+
+@mcp.tool(annotations=READ)
+def search_ssm_log(search: Annotated[str, Field(max_length=2000, description=(
+                       "Case-insensitive literal substring (no query language); empty matches everything."))] = "",
+                   search_scope: Annotated[Literal["both", "raw", "enhanced"], Field(description=(
+                       "raw: request/command, stdout, stderr, combined output, entry context and linked event metadata. "
+                       "enhanced: export's Base64 decoding, saved interpretation, entry tags/finding, and linked "
+                       "evidence events' tags and finding bodies. both (default): either."))] = "both",
+                   start: str | None = None, end: str | None = None,
+                   page: Annotated[int, Field(ge=1)] = 1,
+                   revision: Annotated[str | None, Field(description=(
+                       "For page > 1 of a non-empty both/enhanced search: the `revision` returned with page 1. "
+                       "If analyst content changed since, the call fails as stale; search page 1 again."))] = None,
+                   ) -> dict[str, Any]:
+    """Chronological SSM exported outputs and CloudTrail requests, including failures and sessions.
+    Search, totals and ordering cover the whole selection; 100 entries/page, oldest first,
+    start-inclusive/end-exclusive. Requests do not prove execution. Raw events remain available
+    through get_event/get_ssm_event. Reviews are separate analyst plaintext; each linked event also
+    lists its own event tags and findings (event review, not entry review)."""
+    return call("/api/ssm-log", {"search": search, "search_scope": search_scope, "start": start, "end": end,
+                                 "page": page, "revision": revision})
+
+
+@mcp.tool(annotations=READ)
+def get_ssm_log_entry(entry_id: str) -> dict[str, Any]:
+    """One current log entry by exact entry_id with its latest saved review (use before re-editing
+    after a stale edit). Independent of search and time range; fails if the entry no longer exists."""
+    return call("/api/ssm-log", {"entry_id": entry_id})["data"][0]
+
+
+@mcp.tool(annotations=WRITE)
+def edit_ssm_log_entry(entry_id: str, text: str, tags: list[str], finding: str,
+                       updated: str | None) -> dict[str, Any]:
+    """Replace an explicit content-addressed log entry's analyst review, never raw output.
+    Quote its current updated stamp (null for a new review); stale edits fail. Tags belong to
+    this log entry, not evidence events. Use existing event tag/note tools for linked evidence.
+    On a stale error, re-read with get_ssm_log_entry, merge deliberately, and quote its updated."""
+    return call("/api/ssm-log-review", {"entry_id": entry_id, "text": text, "tags": tags,
+                                       "finding": finding, "updated": updated})
 
 
 @mcp.tool(annotations=READ)

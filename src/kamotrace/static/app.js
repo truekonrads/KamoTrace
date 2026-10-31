@@ -83,7 +83,14 @@ let commandKey = null,
   commandPage = 1,
   commandRequest = 0,
   commandDetailRequest = 0;
-let commandSheet = false,
+let commandLog = false,
+  logPage = 1,
+  logTotal = 0,
+  logBusy = false,
+  logSelection,
+  logFailure,
+  logObserver,
+  commandSheet = false,
   sheetTable,
   sheetRequest = 0,
   sheetPage = 1,
@@ -465,17 +472,732 @@ function commandQuery() {
   };
 }
 
-function commandLayout(sheet) {
+function commandLayout(sheet, log = false) {
+  if (commandLog && !log) leaveLog();
+  commandLog = log;
   commandSheet = sheet;
   ++commandRequest;
   ++sheetRequest;
-  $("command-browser-panel").hidden = sheet;
+  // A layout switch abandons any in-flight log request; let the next one start.
+  logBusy = false;
+  $("command-browser-panel").hidden = sheet || log;
   $("command-sheet-panel").hidden = !sheet;
+  $("command-log-panel").hidden = !log;
+  $("log-search-scope").hidden = !log;
   $("sheet-density-label").hidden = !sheet;
-  $("command-sort").disabled = $("command-direction").disabled = sheet;
-  $("command-detail-layout").setAttribute("aria-pressed", String(!sheet));
+  $("command-sort").disabled = $("command-direction").disabled = sheet || log;
+  $("command-search").placeholder = log
+    ? "Search activity: commands, output, decoding, interpretations, tags, findings…"
+    : "Search commands, decoded payloads, system IDs, output, identity…";
+  $("command-detail-layout").setAttribute(
+    "aria-pressed",
+    String(!sheet && !log),
+  );
   $("command-sheet-layout").setAttribute("aria-pressed", String(sheet));
+  $("command-log-layout").setAttribute("aria-pressed", String(log));
+  syncLogEditor();
   loadCommands();
+}
+
+// ---- Activity log: dense raw/enhanced reading lanes and one reusable side editor ----------
+// Drafts live in logDrafts (keyed by entry_id), never only in DOM, so they survive appending pages,
+// new searches, layout/tab switches and reopening the editor. They are not persisted (privacy);
+// leaving the page with dirty drafts asks for confirmation instead.
+const logDrafts = new Map();
+const logCards = new Map(); // entry_id -> { row, card } for the displayed result only.
+let logEditing = null,
+  logPending = false,
+  logStale = false,
+  logLatest = null,
+  logReturn = null,
+  logFocus = null;
+
+function logQuery() {
+  return { ...commandQuery(), search_scope: $("log-search-scope").value };
+}
+
+const sameLogQuery = (a, b) =>
+  ["start", "end", "search", "search_scope"].every((k) => a[k] === b[k]);
+
+const logTags = (value) => [
+  ...new Set(
+    value
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean),
+  ),
+];
+
+function logDirty(draft) {
+  return (
+    draft.text !== draft.base.text ||
+    draft.finding !== draft.base.finding ||
+    logTags(draft.tags).sort().join() !== draft.base.tags.join()
+  );
+}
+
+function logField(parent, label, value, className = "") {
+  const field = document.createElement("div");
+  field.className = "ssm-log-field " + className;
+  const name = document.createElement("span");
+  name.className = "ssm-log-label";
+  name.textContent = label;
+  const text = document.createElement("pre");
+  text.textContent = value;
+  field.append(name, text);
+  parent.append(field);
+}
+
+function logLine(parent, text, className = "ssm-log-state") {
+  const line = document.createElement("p");
+  line.className = className;
+  line.textContent = text;
+  parent.append(line);
+}
+
+function logRaw(row) {
+  const lane = document.createElement("div");
+  lane.className = "ssm-log-raw";
+  if (row.parameters === null) logLine(lane, "request: not collected");
+  else
+    logField(
+      lane,
+      row.operation === "Session metadata" ? "session metadata" : "request",
+      row.parameters,
+    );
+  const states = { "not collected": [], "collected empty": [] };
+  for (const [field, label] of [
+    ["stdout", "stdout"],
+    ["stderr", "stderr"],
+    ["combined_output", "combined"],
+  ]) {
+    if (row[field] === null) states["not collected"].push(label);
+    else if (row[field] === "") states["collected empty"].push(label);
+    else
+      logField(
+        lane,
+        field === "combined_output"
+          ? "combined output (streams not separable)"
+          : label,
+        row[field],
+        field === "stderr" ? "stderr" : "",
+      );
+  }
+  // Missing and empty streams stay distinct, in one compact line.
+  const summary = Object.entries(states)
+    .filter(([, names]) => names.length)
+    .map(([state, names]) => `${names.join(", ")}: ${state}`);
+  if (summary.length) logLine(lane, summary.join(" · "));
+  return lane;
+}
+
+function renderLogEnhanced(lane, row) {
+  lane.replaceChildren();
+  const review = row.review;
+  if (row.decoded)
+    logField(lane, "export decoding · derived, not raw", row.decoded);
+  if (review.text) logField(lane, "interpretation · analyst", review.text);
+  if (review.tags.length)
+    logLine(lane, `entry tags: ${review.tags.join(", ")}`, "ssm-log-tags");
+  if (review.finding) logField(lane, "entry finding", review.finding);
+  for (const event of row.events) {
+    if (event.tags?.length)
+      logLine(
+        lane,
+        `event tags (${event.event_id}): ${event.tags.map((t) => t.slug).join(", ")}`,
+        "ssm-log-tags event",
+      );
+    for (const finding of event.findings || [])
+      logField(
+        lane,
+        `event finding #${finding.id} (${event.event_id})`,
+        finding.body,
+        "event",
+      );
+  }
+  if (!review.text && !review.tags.length && !review.finding)
+    logLine(lane, "No analyst review", "ssm-log-state");
+  if (logDrafts.get(row.entry_id)?.dirty)
+    logLine(lane, "Unsaved draft in editor", "ssm-log-draft");
+}
+
+function logEntry(row) {
+  const card = document.createElement("article");
+  card.className = "ssm-log-entry";
+  card.dataset.entryId = row.entry_id;
+  card.classList.toggle("editing", logEditing === row.entry_id);
+  const head = document.createElement("header");
+  const time = document.createElement("strong");
+  time.textContent =
+    row.time_ms === null
+      ? "Unknown time"
+      : `${shown(row.time_ms)} ${meta.timezone}`;
+  const what = document.createElement("span");
+  const failed =
+    /fail|denied|timed ?out|cancel|error/i.test(row.status) ||
+    (row.operation !== "Command output" && row.events.some((e) => e.error));
+  what.className = failed ? "ssm-log-failed" : "";
+  what.textContent = `${row.operation} · ${row.status}${row.response_code === null ? "" : " · exit " + row.response_code}`;
+  const where = document.createElement("span");
+  where.textContent = `${row.instance_id || "no exact machine collected"} · ${row.plugin ? "plugin " + row.plugin : "no plugin"}`;
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.className = "ssm-log-edit";
+  edit.textContent = "Edit analyst entry";
+  edit.onclick = () => openLogEditor(row.entry_id);
+  head.append(time, what, where, edit);
+  const context = document.createElement("p");
+  context.className = "ssm-log-context";
+  context.textContent = `${row.account || "unknown account"} · ${row.region || "unknown region"} · command ${row.command_id || "none"} · time basis: ${row.time_basis} · ${row.output_state}`;
+  const lanes = document.createElement("div");
+  lanes.className = "ssm-log-lanes";
+  const enhanced = document.createElement("div");
+  enhanced.className = "ssm-log-enhanced";
+  renderLogEnhanced(enhanced, row);
+  lanes.append(logRaw(row), enhanced);
+  card.append(head, context, lanes);
+  const links = document.createElement("div");
+  links.className = "ssm-log-links";
+  for (const event of row.events) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `${event.operation} · ${event.error || "no API error (not execution proof)"} · ${event.event_id} · ${event.source}`;
+    button.onclick = async () => {
+      try {
+        if (event.id !== null) await detail({ id: event.id });
+        else {
+          const data = await request("/api/ssm-event", { key: event.key });
+          detailRow = null;
+          $("detail-id").textContent =
+            `${data.event_id} · Supplemental SSM export`;
+          $("raw-event").textContent = data.raw_json;
+          $("record-hash").textContent =
+            "Reconstructed from supplemental JSON, not original database evidence.";
+          $("detail-findings").replaceChildren();
+          $("detail-prev").hidden = $("detail-next").hidden = true;
+          eventCommandLinks([]);
+          openDetail();
+        }
+      } catch (e) {
+        error(e.message);
+      }
+    };
+    links.append(button);
+  }
+  const hashes = [
+    ...new Set(row.events.map((e) => e.record_sha256).filter(Boolean)),
+  ];
+  if (hashes.length) {
+    for (const [label, handler] of [
+      ["Event tags", (b) => openQuickTag(b, hashes)],
+      ["Event finding", (b) => openNoteMenu(b, hashes)],
+    ]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.title = `Applies to ${hashes.length} linked evidence event${hashes.length === 1 ? "" : "s"}, not to this log entry`;
+      button.onclick = () => handler(button);
+      links.append(button);
+    }
+  }
+  if (links.childElementCount) card.append(links);
+  logCards.set(row.entry_id, { row, card });
+  return card;
+}
+
+// The first entry whose bottom is below the viewport top, and its offset. Entries are in document
+// order, so a binary search keeps this cheap with thousands loaded.
+function logAnchor() {
+  const cards = $("command-log").getElementsByClassName("ssm-log-entry");
+  let low = 0,
+    high = cards.length - 1,
+    found = null;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (cards[mid].getBoundingClientRect().bottom > 0) {
+      found = cards[mid];
+      high = mid - 1;
+    } else low = mid + 1;
+  }
+  return found
+    ? {
+        id: found.dataset.entryId,
+        top: found.getBoundingClientRect().top,
+        loaded: logCards.size,
+      }
+    : null;
+}
+
+function restoreLogAnchor(anchor) {
+  const item = anchor && logCards.get(anchor.id);
+  if (item) scrollBy(0, item.card.getBoundingClientRect().top - anchor.top);
+  return Boolean(item);
+}
+
+// Patch only one entry's analyst lane, keeping the reader's place: no reload or forced scroll.
+function patchLogRow(id, change) {
+  const draft = logDrafts.get(id);
+  if (draft) draft.row = { ...draft.row, ...change };
+  const item = logCards.get(id);
+  if (!item) return;
+  item.row = { ...item.row, ...change };
+  const anchor = logAnchor();
+  renderLogEnhanced(item.card.querySelector(".ssm-log-enhanced"), item.row);
+  restoreLogAnchor(anchor);
+}
+
+function markLogStale(message) {
+  if (!logSelection?.review_dependent) return;
+  logStale = true;
+  logObserver.unobserve($("log-load-status"));
+  $("log-load-status").textContent =
+    `${message} Loaded entries and drafts are kept; refresh to continue past ${number(logCards.size)} loaded.`;
+  const anchor = logAnchor(); // The Refresh button grows the header above the entries.
+  $("refresh-log").hidden = false;
+  restoreLogAnchor(anchor);
+}
+
+function logDraft(row) {
+  let draft = logDrafts.get(row.entry_id);
+  if (!draft) {
+    const base = row.review;
+    draft = {
+      row,
+      base,
+      text: base.text,
+      tags: base.tags.join(", "),
+      finding: base.finding,
+      dirty: false,
+    };
+    logDrafts.set(row.entry_id, draft);
+  }
+  return draft;
+}
+
+// Forget a clean draft once its entry is no longer being edited; dirty drafts stay.
+function releaseLogDraft(id) {
+  const draft = logDrafts.get(id);
+  if (draft && !draft.dirty && id !== logEditing) logDrafts.delete(id);
+  logCards.get(id)?.card.classList.toggle("editing", id === logEditing);
+}
+
+function renderLogDrafts() {
+  const dirty = [...logDrafts.entries()].filter(([, d]) => d.dirty);
+  $("log-draft-count").textContent = dirty.length;
+  $("log-drafts").hidden = !dirty.length;
+  $("log-draft-list").replaceChildren(
+    ...dirty.map(([id, d]) => {
+      const li = document.createElement("li");
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = `${d.row.time_ms === null ? "Unknown time" : shown(d.row.time_ms)} · ${d.row.operation} · ${d.row.instance_id || "no machine"}${logCards.has(id) ? "" : " (not in current results)"}`;
+      b.setAttribute("aria-current", String(id === logEditing));
+      b.onclick = () => openLogEditor(id);
+      li.append(b);
+      return li;
+    }),
+  );
+}
+
+function renderLogEditor() {
+  const draft = logDrafts.get(logEditing);
+  if (!draft) return;
+  const row = draft.row;
+  $("log-editor-entry").textContent =
+    `${row.time_ms === null ? "Unknown time" : shown(row.time_ms) + " " + meta.timezone} · ${row.operation} · ${row.status}\n${row.account || "unknown account"} · ${row.region || "unknown region"} · ${row.instance_id || "no exact machine"} · ${row.plugin || "no plugin"}\nEntry ${row.entry_id.slice(0, 12)}… · saved ${draft.base.updated || "never"}`;
+  $("log-edit-text").value = draft.text;
+  $("log-edit-tags").value = draft.tags;
+  $("log-edit-finding").value = draft.finding;
+  renderLogEditorState();
+}
+
+function renderLogEditorState() {
+  const draft = logDrafts.get(logEditing);
+  // Disabling the focused button drops focus to <body>; remember it so Escape/Tab keep working.
+  const focused = document.activeElement;
+  for (const id of [
+    "log-save",
+    "log-latest",
+    "log-discard",
+    "log-copy-raw",
+    "log-use-latest",
+    "log-replace-latest",
+  ])
+    $(id).disabled = logPending;
+  if (!logPending && focused === document.body && logEditing)
+    (logFocus || $("log-edit-text")).focus({ preventScroll: true });
+  logFocus = logPending ? focused : null;
+  $("log-editor-dirty").textContent = draft?.dirty
+    ? "Unsaved draft"
+    : "No unsaved changes";
+  $("log-latest-panel").hidden = !(logLatest && logLatest.id === logEditing);
+  renderLogDrafts();
+}
+
+function logEditorStatus(id, message) {
+  if (id === logEditing) $("log-editor-status").textContent = message;
+}
+
+function syncLogEditor() {
+  $("log-editor").hidden = !(commandsActive && commandLog && logEditing);
+}
+
+function openLogEditor(id) {
+  const row = logCards.get(id)?.row || logDrafts.get(id)?.row;
+  if (!row) return;
+  const previous = logEditing;
+  logEditing = id;
+  if (previous) releaseLogDraft(previous);
+  const draft = logDraft(row);
+  if (logLatest?.id !== id) logLatest = null;
+  logCards.get(id)?.card.classList.add("editing");
+  renderLogEditor();
+  $("log-editor-status").textContent = draft.dirty
+    ? "Unsaved draft restored."
+    : "";
+  syncLogEditor();
+  $("log-edit-text").focus({ preventScroll: true });
+}
+
+function closeLogEditor() {
+  const id = logEditing;
+  logEditing = null;
+  logLatest = null;
+  releaseLogDraft(id);
+  syncLogEditor();
+  renderLogDrafts();
+  // Return to the entry without moving the page, so Page Down continues from here.
+  logCards
+    .get(id)
+    ?.card.querySelector(".ssm-log-edit")
+    .focus({ preventScroll: true });
+}
+
+function editLogDraft() {
+  const draft = logDrafts.get(logEditing);
+  if (!draft) return;
+  draft.text = $("log-edit-text").value;
+  draft.tags = $("log-edit-tags").value;
+  draft.finding = $("log-edit-finding").value;
+  const was = draft.dirty;
+  draft.dirty = logDirty(draft);
+  if (was !== draft.dirty) patchLogRow(logEditing, {});
+  renderLogEditorState();
+}
+
+async function saveLogEntry() {
+  const id = logEditing,
+    draft = logDrafts.get(id);
+  if (!draft || logPending) return;
+  logPending = true;
+  renderLogEditorState();
+  try {
+    const saved = await request("/api/ssm-log-review", {
+      entry_id: id,
+      updated: draft.base.updated,
+      text: draft.text,
+      tags: logTags(draft.tags),
+      finding: draft.finding,
+    });
+    // Text typed while saving stays dirty: dirtiness is relative to the saved version.
+    draft.base = saved;
+    draft.dirty = logDirty(draft);
+    if (logLatest?.id === id) logLatest = null;
+    patchLogRow(id, { review: saved });
+    logEditorStatus(
+      id,
+      draft.dirty
+        ? "Saved. Edits made while saving are still unsaved."
+        : "Saved separately; raw evidence unchanged.",
+    );
+    markLogStale("Saved analyst content may change which entries match.");
+    releaseLogDraft(id);
+  } catch (e) {
+    logEditorStatus(
+      id,
+      `${e.message} Your draft is kept. Read latest saved, merge deliberately, then save.`,
+    );
+  } finally {
+    logPending = false;
+    renderLogEditorState();
+  }
+}
+
+async function readLatestLog() {
+  const id = logEditing;
+  if (!id || logPending) return;
+  logPending = true;
+  renderLogEditorState();
+  try {
+    const [latest] = (await request("/api/ssm-log", { entry_id: id })).data;
+    // The log shows saved state, so it can show the latest; the draft is never replaced silently.
+    patchLogRow(id, { review: latest.review, events: latest.events });
+    const draft = logDrafts.get(id);
+    if (!draft) return;
+    if (!draft.dirty) {
+      Object.assign(draft, {
+        base: latest.review,
+        text: latest.review.text,
+        tags: latest.review.tags.join(", "),
+        finding: latest.review.finding,
+      });
+      if (id === logEditing) renderLogEditor();
+      logEditorStatus(
+        id,
+        "No unsaved changes; editor shows the latest saved version.",
+      );
+    } else if (latest.review.updated === draft.base.updated)
+      logEditorStatus(id, "Your draft is based on the latest saved version.");
+    else {
+      logLatest = { id, review: latest.review };
+      $("log-latest-stamp").textContent = latest.review.updated || "deleted";
+      $("log-latest-text").textContent = latest.review.text || "(empty)";
+      $("log-latest-tags").textContent =
+        `Entry tags: ${latest.review.tags.join(", ") || "none"}`;
+      $("log-latest-finding").textContent = latest.review.finding || "(empty)";
+      logEditorStatus(
+        id,
+        "Someone else saved this entry. Compare, merge into your draft, then choose a merge base.",
+      );
+    }
+  } catch (e) {
+    logEditorStatus(id, e.message);
+  } finally {
+    logPending = false;
+    renderLogEditorState();
+  }
+}
+
+function adoptLatestLog(replace) {
+  const draft = logDrafts.get(logEditing);
+  if (!draft || !logLatest || logLatest.id !== logEditing) return;
+  if (replace && !confirm("Replace your draft with the latest saved version?"))
+    return;
+  draft.base = logLatest.review;
+  if (replace)
+    Object.assign(draft, {
+      text: draft.base.text,
+      tags: draft.base.tags.join(", "),
+      finding: draft.base.finding,
+    });
+  draft.dirty = logDirty(draft);
+  logLatest = null;
+  renderLogEditor();
+  patchLogRow(logEditing, {});
+  $("log-editor-status").textContent = replace
+    ? "Draft replaced with the latest saved version."
+    : "Your draft now replaces the latest saved version when saved. Check it includes their changes.";
+}
+
+function discardLogDraft() {
+  const draft = logDrafts.get(logEditing);
+  if (!draft || (draft.dirty && !confirm("Discard this unsaved draft?")))
+    return;
+  Object.assign(draft, {
+    text: draft.base.text,
+    tags: draft.base.tags.join(", "),
+    finding: draft.base.finding,
+    dirty: false,
+  });
+  renderLogEditor();
+  patchLogRow(logEditing, {});
+  $("log-editor-status").textContent = "Draft discarded.";
+}
+
+function copyRawToLog() {
+  const draft = logDrafts.get(logEditing);
+  if (!draft) return;
+  const input = $("log-edit-text");
+  if (
+    input.value &&
+    !confirm("Replace the current interpretation draft with raw text?")
+  )
+    return;
+  const row = draft.row;
+  input.value = [row.parameters, row.stdout, row.stderr, row.combined_output]
+    .filter((v) => v !== null && v !== "")
+    .join("\n\n");
+  editLogDraft();
+}
+
+function decodeLog(encoding) {
+  const input = $("log-edit-text");
+  const start = input.selectionStart,
+    end = input.selectionEnd;
+  const encoded = (
+    start === end ? input.value : input.value.slice(start, end)
+  ).replace(/\s/g, "");
+  try {
+    const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
+    const decoded = new TextDecoder(encoding, { fatal: true }).decode(bytes);
+    if (start === end) input.value = decoded;
+    else input.setRangeText(decoded, start, end, "select");
+    editLogDraft();
+    $("log-editor-status").textContent =
+      "Decoded as data only. Review the interpretation before saving.";
+  } catch {
+    $("log-editor-status").textContent =
+      `Not valid Base64 ${encoding} text; draft unchanged.`;
+  }
+}
+
+// Event tag/finding writes (from any view) patch linked log events in place. A review-dependent
+// search may now match differently, so say so instead of continuing with shifted pages.
+function patchLogEvents(body, result) {
+  const hashes = new Set(body.hashes || []);
+  const tag = reviews.tags.find((t) => t.slug === body.slug);
+  const id = body.action === "annotate" ? result.id : body.id;
+  const note = reviews.annotations.find((n) => n.id === id);
+  for (const [entryId, { row }] of logCards) {
+    let changed = false;
+    const events = row.events.map((event) => {
+      const hit = hashes.has(event.record_sha256);
+      let tags = event.tags,
+        findings = event.findings;
+      if (
+        body.action === "tag" &&
+        hit &&
+        !tags.some((t) => t.slug === body.slug)
+      )
+        tags = [...tags, { slug: body.slug, color: tag.color }].sort((a, b) =>
+          a.slug.localeCompare(b.slug),
+        );
+      if (body.action === "untag" && hit)
+        tags = tags.filter((t) => t.slug !== body.slug);
+      if (["annotate", "link"].includes(body.action) && hit && note)
+        findings = [...findings.filter((f) => f.id !== id), note].sort(
+          (a, b) => a.id - b.id,
+        );
+      if ((body.action === "unlink" && hit) || body.action === "delete")
+        findings = findings.filter((f) => f.id !== id);
+      if (body.action === "edit" && note)
+        findings = findings.map((f) => (f.id === id ? note : f));
+      if (tags === event.tags && findings === event.findings) return event;
+      changed = true;
+      return { ...event, tags, findings };
+    });
+    if (changed) patchLogRow(entryId, { events });
+  }
+  if (logSelection && result.log_revision !== logSelection.revision)
+    markLogStale("Event tags or findings linked to this log changed.");
+}
+
+function leaveLog() {
+  if (!$("command-log-panel").hidden) logReturn = logAnchor();
+  logObserver.unobserve($("log-load-status"));
+}
+
+function logStatus() {
+  const loaded = logCards.size;
+  $("command-status").textContent =
+    `${number(logTotal)} activity entries · oldest first · ${number(loaded)} loaded`;
+  if (logStale) return;
+  $("log-load-status").textContent =
+    `${number(loaded)} / ${number(logTotal)} entries loaded · ${loaded < logTotal ? "Keep scrolling for more" : "All matching activity loaded"}`;
+  if (loaded < logTotal) logObserver.observe($("log-load-status"));
+}
+
+// Returning to an unchanged applied selection reuses loaded entries and the reading position.
+function resumeLog() {
+  logStatus();
+  const anchor = logReturn;
+  logReturn = null;
+  if (anchor) requestAnimationFrame(() => restoreLogAnchor(anchor));
+}
+
+async function loadLog({ more = false, retry = null, fresh = false } = {}) {
+  if (
+    more &&
+    (logBusy ||
+      logStale ||
+      !commandsActive ||
+      !commandLog ||
+      logPage * 100 >= logTotal)
+  )
+    return;
+  if (
+    !more &&
+    !retry &&
+    !fresh &&
+    logSelection &&
+    !logFailure &&
+    sameLogQuery(logQuery(), logSelection)
+  )
+    return resumeLog();
+  let selection = retry ? retry.selection : more ? logSelection : logQuery();
+  let page = retry ? retry.page : more ? logPage + 1 : 1;
+  const restore = retry?.restore;
+  const token = ++commandRequest;
+  logBusy = true;
+  logObserver.unobserve($("log-load-status"));
+  $("more-log").hidden = $("refresh-log").hidden = true;
+  $("more-log").disabled = true;
+  $("log-load-status").textContent = "Loading activity…";
+  if (page === 1) $("command-status").textContent = "Loading activity…";
+  try {
+    for (;;) {
+      const { start, end, search, search_scope, revision } = selection;
+      const result = await request("/api/ssm-log", {
+        start,
+        end,
+        search,
+        search_scope,
+        page,
+        ...(page > 1 ? { revision } : {}),
+      });
+      if (token !== commandRequest) return;
+      if (page === 1) {
+        selection = {
+          ...selection,
+          revision: result.revision,
+          review_dependent: result.review_dependent,
+        };
+        logCards.clear();
+        logStale = false;
+        $("command-log").replaceChildren();
+        if (!result.total)
+          $("command-log").textContent =
+            "No matching activity. Widen the time range, change the search scope or clear search.";
+      }
+      logSelection = selection;
+      logFailure = null;
+      logPage = page;
+      logTotal = result.total;
+      $("command-log").append(...result.data.map(logEntry));
+      limitations(result.limitations);
+      // An explicit refresh reloads up to the previous position so the reader's entry can be restored.
+      if (
+        restore &&
+        !logCards.has(restore.id) &&
+        page * 100 < Math.min(result.total, restore.loaded)
+      ) {
+        page += 1;
+        continue;
+      }
+      if (restore && !restoreLogAnchor(restore))
+        $("command-status").textContent =
+          "Refreshed; your previous entry no longer matches this search.";
+      break;
+    }
+    logStatus();
+  } catch (e) {
+    if (token === commandRequest) {
+      if (e.stale)
+        markLogStale("Analyst content changed since this search ran.");
+      else {
+        logFailure = { selection, page };
+        $("command-status").textContent = e.message;
+        $("log-load-status").textContent =
+          `Could not load requested activity: ${e.message}. Previously loaded results and drafts are unchanged.`;
+        $("more-log").hidden = false;
+      }
+    }
+  } finally {
+    if (token === commandRequest) {
+      logBusy = false;
+      $("more-log").disabled = false;
+    }
+  }
 }
 
 function sheetStatus() {
@@ -679,7 +1401,9 @@ function evidenceText(parent, title, value) {
 }
 
 function switchView(commands, run = true) {
+  if (commandsActive && commandLog && !commands) leaveLog();
   commandsActive = commands;
+  syncLogEditor();
   $("commands-panel").hidden = !commands;
   $("events-tab").setAttribute("aria-pressed", String(!commands));
   $("commands-tab").setAttribute("aria-pressed", String(commands));
@@ -696,6 +1420,7 @@ function switchView(commands, run = true) {
 }
 
 async function loadCommands(more = false) {
+  if (commandLog) return loadLog({ more });
   if (commandSheet) {
     if (!sheetTable) createCommandSheet();
     else {
@@ -746,7 +1471,7 @@ async function loadCommands(more = false) {
 }
 
 async function openCommand(key, keepLayout = false) {
-  if (commandSheet && !keepLayout) commandLayout(false);
+  if ((commandSheet || commandLog) && !keepLayout) commandLayout(false);
   const token = ++commandDetailRequest;
   try {
     const command = await request("/api/ssm-detail", { key });
@@ -1482,6 +2207,14 @@ function rowsByHash() {
   const map = new Map();
   for (const row of table.getData()) map.set(row.record_sha256, row);
   if (detailRow) map.set(detailRow.record_sha256, detailRow);
+  for (const { row } of logCards.values())
+    for (const e of row.events)
+      if (e.record_sha256 && !map.has(e.record_sha256))
+        map.set(e.record_sha256, {
+          record_sha256: e.record_sha256,
+          tags: e.tags,
+          annotations: e.findings.map((f) => f.id),
+        });
   return map;
 }
 
@@ -1643,6 +2376,7 @@ async function writeReview(body) {
   try {
     const result = await request("/api/reviews", body);
     await refreshReviews();
+    patchLogEvents(body, result);
     const hashes = new Set(body.hashes || []);
     const tag = reviews.tags.find((t) => t.slug === body.slug);
     const id = body.action === "annotate" ? result.id : body.id;
@@ -1721,7 +2455,10 @@ async function request(url, body) {
         },
   );
   const result = await res.json();
-  if (!res.ok) throw new Error(result.error || `HTTP ${res.status}`);
+  if (!res.ok)
+    throw Object.assign(new Error(result.error || `HTTP ${res.status}`), {
+      stale: result.stale === true,
+    });
   return result;
 }
 
@@ -2425,11 +3162,53 @@ async function init() {
   };
   $("command-search-form").onsubmit = (e) => {
     e.preventDefault();
-    loadCommands();
+    if (commandLog) loadLog({ fresh: true });
+    else loadCommands();
   };
   $("more-commands").onclick = () => loadCommands(true);
   $("command-detail-layout").onclick = () => commandLayout(false);
   $("command-sheet-layout").onclick = () => commandLayout(true);
+  $("command-log-layout").onclick = () => commandLayout(false, true);
+  logObserver = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((entry) => entry.isIntersecting))
+        loadLog({ more: true });
+    },
+    { rootMargin: "1200px 0px" },
+  );
+  $("more-log").onclick = () => loadLog({ retry: logFailure });
+  $("refresh-log").onclick = () =>
+    loadLog({
+      retry: { selection: logSelection, page: 1, restore: logAnchor() },
+    });
+  $("log-search-scope").onchange = () => loadLog({ fresh: true });
+  $("log-editor-form").onsubmit = (e) => {
+    e.preventDefault();
+    saveLogEntry();
+  };
+  for (const id of ["log-edit-text", "log-edit-tags", "log-edit-finding"])
+    $(id).oninput = editLogDraft;
+  $("log-editor-close").onclick = closeLogEditor;
+  $("log-editor").onkeydown = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeLogEditor();
+    }
+  };
+  $("log-latest").onclick = readLatestLog;
+  $("log-discard").onclick = discardLogDraft;
+  $("log-copy-raw").onclick = copyRawToLog;
+  for (const button of document.querySelectorAll(".log-decode"))
+    button.onclick = () => decodeLog(button.dataset.encoding);
+  $("log-use-latest").onclick = () => adoptLatestLog(false);
+  $("log-replace-latest").onclick = () => adoptLatestLog(true);
+  // Drafts are deliberately not stored in localStorage; warn before losing them instead.
+  addEventListener("beforeunload", (e) => {
+    if ([...logDrafts.values()].some((d) => d.dirty)) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
   $("more-sheet").onclick = loadMoreSheet;
   $("close-sheet-cell").onclick = () => $("sheet-cell-dialog").close();
   $("sheet-density").onchange = () => {

@@ -1389,6 +1389,205 @@ dialog::backdrop {
   font-weight: 400;
 }
 
+/* Reconstructed activity: a dense continuous sheet. Full wrapping text, no nested scroll boxes,
+   thin dividers; derived/analyst text in its own lane beside the raw lane. */
+.ssm-log-lanes-head,
+.ssm-log-lanes {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 14px;
+}
+.ssm-log-lanes-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 4px 8px;
+  background: #e9f0f4;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 600;
+  color: #4b6575;
+}
+.ssm-log-lanes-head button {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border-color: #c45436;
+  color: #8a2f18;
+}
+#command-log {
+  /* Patches keep the reader's entry in place explicitly (see logAnchor). */
+  overflow-anchor: none;
+  background: #fff;
+}
+.ssm-log-entry {
+  padding: 6px 8px 7px;
+  border-bottom: 1px solid var(--line);
+}
+.ssm-log-entry.editing {
+  box-shadow: inset 3px 0 0 #c45436;
+  background: #fffaf6;
+}
+.ssm-log-entry > header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+.ssm-log-entry > header strong {
+  font-variant-numeric: tabular-nums;
+}
+.ssm-log-failed {
+  color: #a3341b;
+  font-weight: 600;
+}
+.ssm-log-edit {
+  margin-left: auto;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 400;
+}
+.ssm-log-context {
+  margin: 1px 0 4px;
+  font-size: 11px;
+  color: #5d7380;
+  overflow-wrap: anywhere;
+}
+.ssm-log-raw,
+.ssm-log-enhanced {
+  min-width: 0;
+}
+.ssm-log-enhanced {
+  padding-left: 10px;
+  border-left: 2px solid #d5e2ea;
+}
+.ssm-log-field {
+  margin: 0 0 3px;
+}
+.ssm-log-label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #6b8492;
+}
+.ssm-log-field pre {
+  margin: 0;
+  line-height: 1.4;
+  color: #17313f;
+}
+.ssm-log-field.stderr pre {
+  color: #8a2f18;
+}
+.ssm-log-enhanced .ssm-log-field pre {
+  color: #2a4a5c;
+}
+.ssm-log-field.event .ssm-log-label,
+.ssm-log-tags.event {
+  color: #6a5a1c;
+}
+.ssm-log-state,
+.ssm-log-tags,
+.ssm-log-draft {
+  margin: 0 0 3px;
+  font-size: 11px;
+  color: #6b8492;
+  overflow-wrap: anywhere;
+}
+.ssm-log-tags {
+  color: #25475b;
+}
+.ssm-log-draft {
+  color: #a3341b;
+  font-weight: 600;
+}
+.ssm-log-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 3px;
+}
+.ssm-log-links button {
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 400;
+  border-color: #d5e2ea;
+  color: #4b6575;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+/* One non-modal editor overlays the right edge, so opening it never rewraps the log. */
+.log-editor {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 20;
+  width: min(520px, 40vw);
+  height: 100vh;
+  overflow-y: auto;
+  padding: 10px 14px 16px;
+  background: #fff;
+  border-left: 1px solid var(--line);
+  box-shadow: -6px 0 18px rgba(20, 43, 56, 0.14);
+}
+.log-editor-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.log-editor-head h2 {
+  margin: 0;
+  font-size: 15px;
+}
+.log-editor-head button {
+  margin-left: auto;
+}
+#log-editor-entry {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.log-editor label {
+  display: block;
+  margin: 10px 0;
+  font-size: 12px;
+}
+.log-editor input,
+.log-editor textarea {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+}
+.log-editor textarea {
+  resize: vertical;
+  font:
+    12px/1.55 Consolas,
+    monospace;
+}
+.log-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+#log-latest-panel {
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px solid #e0b8a8;
+  background: #fff7f2;
+}
+#log-latest-panel h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+#log-draft-list button {
+  text-align: left;
+  font-size: 12px;
+}
+#log-draft-list button[aria-current="true"] {
+  font-weight: 600;
+}
+
 .konami-duck {
   position: fixed;
   right: 24px;

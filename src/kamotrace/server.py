@@ -1,5 +1,6 @@
 """Local, read-only CloudTrail browser. Run with: kamotrace serve --database events.duckdb"""
 import argparse
+from collections import defaultdict
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -10,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -35,6 +37,10 @@ OPERATORS = {"eq", "neq", "in", "contains", "not_contains", "empty", "not_empty"
 PAGE_SIZES = (25, 50, 100, 250, 500)
 LEVELS = ("informational", "low", "medium", "high", "critical")  # Suzaku/Sigma severity order
 TIMEZONES = sorted(available_timezones() - {"localtime"})
+
+
+class StaleSelection(ValueError):
+    """A continuation page was requested for a selection whose membership may have changed."""
 
 
 def query_timezone(body):
@@ -160,6 +166,8 @@ class Store:
             startup.callback(self.connection.close)
             self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
             self.lock = threading.Lock()
+            # Per-process prefix: a page-1 revision from before a restart never validates afterwards.
+            self.log_revision = f"{secrets.token_hex(4)}-0"
             logger.info("Opening findings/tags sidecar: %s", annotations or database.with_suffix(".annotations.sqlite3"))
             self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
             startup.callback(self.reviews.close)
@@ -173,6 +181,8 @@ class Store:
                 CREATE TABLE IF NOT EXISTS tags(slug TEXT PRIMARY KEY, color TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS event_tags(hash TEXT NOT NULL, slug TEXT REFERENCES tags(slug), PRIMARY KEY(hash, slug));
                 CREATE TABLE IF NOT EXISTS sidecar_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS ssm_log_reviews(entry_id TEXT PRIMARY KEY, text TEXT NOT NULL,
+                    tags TEXT NOT NULL, finding TEXT NOT NULL, updated TEXT NOT NULL);
             """)
             # Bind the sidecar to its evidence on first use (older sidecars too), so another case's notes
             # can't be mixed in silently, as detections and enrichment sidecars already refuse.
@@ -231,6 +241,88 @@ class Store:
             # The Store owns both connections after initialization succeeds.
             startup.pop_all()
 
+    def ssm_log(self, body):
+        with self.lock:
+            entry_id = body.get("entry_id")
+            if entry_id is not None:
+                # Exact lookup (e.g. reading the latest saved review), independent of search, scope and time.
+                if any(body.get(k) not in (None, "") for k in ("search", "search_scope", "start", "end", "page", "revision")):
+                    raise ValueError("entry_id lookup takes no search, search_scope, time, page or revision")
+                if not isinstance(entry_id, str) or entry_id not in self.commands.log_entries:
+                    raise ValueError("Unknown current log entry")
+                return {"data": self.log_review_data([self.commands.log_entries[entry_id]]), "total": 1,
+                        "revision": self.log_revision, **self.commands.log_info()}
+            analyst = None
+
+            def analyst_text(entry):
+                nonlocal analyst
+                if analyst is None:  # Bulk-read once per request, only for searches that need it.
+                    analyst = ({r[0]: "\0".join([r[1], *json.loads(r[2]), r[3]]).lower() for r in self.reviews.execute(
+                                   "SELECT entry_id, text, tags, finding FROM ssm_log_reviews")},
+                               defaultdict(list), defaultdict(list))
+                    for hash_, slug in self.reviews.execute("SELECT hash, slug FROM event_tags"):
+                        analyst[1][hash_].append(slug)
+                    for hash_, note in self.reviews.execute("""SELECT e.hash, a.body FROM annotation_events e
+                            JOIN annotations a ON a.id = e.annotation_id"""):
+                        analyst[2][hash_].append(note.lower())
+                saved, tags, notes = analyst
+                hashes = [e["record_sha256"] for e in entry["events"] if e["record_sha256"]]
+                return "\0".join([saved.get(entry["entry_id"], "")] + [v for h in hashes for v in tags[h] + notes[h]])
+
+            result = self.commands.log(body, analyst_text)
+            # Analyst content can move entries in or out of a review-dependent search between pages; an
+            # offset continuation would then skip or repeat entries. Refuse it; the client refreshes explicitly.
+            if result["review_dependent"] and body.get("page", 1) > 1 and body.get("revision") != self.log_revision:
+                raise StaleSelection("Analyst content changed since this search ran; refresh the search (page 1) "
+                                     "to continue. Pass the revision returned with page 1 for later pages.")
+            return {**result, "data": self.log_review_data(result["data"]), "revision": self.log_revision}
+
+    def log_review_data(self, entries):
+        """Attach each entry's saved review and its linked events' tags/findings (read-only here). Caller holds the lock."""
+        ids = json.dumps([e["entry_id"] for e in entries])
+        hashes = json.dumps(list({e["record_sha256"] for entry in entries for e in entry["events"] if e["record_sha256"]}))
+        saved = {r["entry_id"]: {"text": r["text"], "tags": json.loads(r["tags"]), "finding": r["finding"], "updated": r["updated"]}
+                 for r in self.reviews.execute("SELECT * FROM ssm_log_reviews WHERE entry_id IN (SELECT value FROM json_each(?))", (ids,))}
+        tags, notes = defaultdict(list), defaultdict(list)
+        for r in self.reviews.execute("""SELECT t.hash, t.slug, g.color FROM event_tags t JOIN tags g ON g.slug = t.slug
+                WHERE t.hash IN (SELECT value FROM json_each(?)) ORDER BY t.slug""", (hashes,)):
+            tags[r["hash"]].append({"slug": r["slug"], "color": r["color"]})
+        for r in self.reviews.execute("""SELECT e.hash, a.id, a.body, a.updated FROM annotation_events e
+                JOIN annotations a ON a.id = e.annotation_id WHERE e.hash IN (SELECT value FROM json_each(?)) ORDER BY a.id""", (hashes,)):
+            notes[r["hash"]].append({"id": r["id"], "body": r["body"], "updated": r["updated"]})
+        return [{**entry, "review": saved.get(entry["entry_id"], {"text": "", "tags": [], "finding": "", "updated": None}),
+                 "events": [{**e, "tags": tags.get(e["record_sha256"], []), "findings": notes.get(e["record_sha256"], [])}
+                            for e in entry["events"]]} for entry in entries]
+
+    def bump_log_revision(self, hashes=None):
+        """Advance the log selection revision after analyst content changed (entry reviews, or event
+        tags/findings on evidence linked to log entries). Caller holds the lock."""
+        if hashes is None or not self.commands.log_hashes.isdisjoint(hashes):
+            prefix, count = self.log_revision.rsplit("-", 1)
+            self.log_revision = f"{prefix}-{int(count) + 1}"
+
+    def ssm_log_review(self, body):
+        with self.lock, self.reviews:
+            entry_id = body.get("entry_id")
+            if not isinstance(entry_id, str) or entry_id not in self.commands.log_entries:
+                raise ValueError("Unknown current log entry")
+            text, tags, finding = body.get("text"), body.get("tags"), body.get("finding")
+            if any(not isinstance(value, str) or len(value) > 30000 for value in (text, finding)):
+                raise ValueError("Review text and finding must be text up to 30,000 characters")
+            if (not isinstance(tags, list) or len(tags) > 100 or any(not isinstance(tag, str) or len(tag) > 256
+                    or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", tag) for tag in tags)):
+                raise ValueError("Use at most 100 lowercase hyphen-separated tag slugs, at most 256 characters each")
+            current = self.reviews.execute("SELECT updated FROM ssm_log_reviews WHERE entry_id=?", (entry_id,)).fetchone()
+            if "updated" not in body or body["updated"] != (current["updated"] if current else None):
+                raise ValueError("This log review changed since it was loaded; reload it and reapply your change")
+            review = {"text": text, "tags": sorted(set(tags)), "finding": finding,
+                      "updated": datetime.now(timezone.utc).isoformat()}
+            self.reviews.execute("""INSERT INTO ssm_log_reviews VALUES (?,?,?,?,?) ON CONFLICT(entry_id)
+                DO UPDATE SET text=excluded.text,tags=excluded.tags,finding=excluded.finding,updated=excluded.updated""",
+                (entry_id, text, json.dumps(review["tags"]), finding, review["updated"]))
+            self.bump_log_revision()
+            return review
+
     def refresh_reviews(self):
         for table, source in (("review_tags", "SELECT hash,slug FROM event_tags"),
                               ("review_notes", "SELECT hash,annotation_id FROM annotation_events")):
@@ -270,7 +362,10 @@ class Store:
                     if len(found) != len(hashes):
                         raise ValueError("Unknown event hash")
                 stamp = datetime.now(timezone.utc).isoformat()
+                changed = set(hashes) if action in ("annotate", "tag", "untag", "link", "unlink") else set()
                 if action in ("edit", "delete"):
+                    changed = {r[0] for r in self.reviews.execute("SELECT hash FROM annotation_events WHERE annotation_id=?",
+                                                                  (int(body.get("id")),))}
                     # Optimistic concurrency: the browser and agents share this sidecar, so a writer must
                     # quote the version it read; a stale edit/delete fails instead of overwriting.
                     current = self.reviews.execute("SELECT updated FROM annotations WHERE id=?", (int(body.get("id")),)).fetchone()
@@ -331,7 +426,9 @@ class Store:
                 else:
                     raise ValueError("Unknown review action")
             self.refresh_reviews()
-        return {"ok": True, **({"id": cursor.lastrowid} if action == "annotate" else {}),
+            self.bump_log_revision(changed)
+            revision = self.log_revision
+        return {"ok": True, "log_revision": revision, **({"id": cursor.lastrowid} if action == "annotate" else {}),
                 **({"updated": stamp} if action in ("annotate", "edit", "link", "unlink") else {})}
 
     def rows(self, sql, params=None):
@@ -542,7 +639,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return
-        if self.path not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event"):
+        if self.path not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -554,9 +651,12 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("Expected a JSON object")
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
+                         "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]
             self.respond(operation(body))
+        except StaleSelection as error:
+            self.respond({"error": str(error), "stale": True}, 409)
         except (ValueError, TypeError, AttributeError) as error:
             self.respond({"error": str(error)}, 400)
         except (duckdb.Error, sqlite3.Error) as error:

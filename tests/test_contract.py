@@ -335,7 +335,7 @@ class BrowserContract(unittest.TestCase):
                 names = {t.name for t in (await client.list_tools()).tools}
                 self.assertLessEqual({"describe_schema", "search_events", "get_event", "tag_events", "untag_events",
                                       "create_note", "edit_note", "link_note_events", "unlink_note_events",
-                                      "search_ssm_commands", "get_ssm_command"}, names)
+                                      "search_ssm_commands", "get_ssm_command", "search_ssm_log", "get_ssm_log_entry", "edit_ssm_log_entry"}, names)
                 self.assertEqual(await tool("list_detections"), {"run": None, "rules": []})
                 schema = await tool("describe_schema")
                 self.assertIn("not_missing", schema["operators"])
@@ -402,6 +402,28 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual([c["region"] for c in commands["data"]], ["ap-southeast-3"])
                 command = await tool("get_ssm_command", key=commands["data"][0]["key"])
                 self.assertEqual(sorted(s["instance_id"] for s in command["systems"]), ["i-alpha", "i-beta", "i-missing"])
+                log = await tool("search_ssm_log", search="alpha stdout")
+                entry = log["data"][0]
+                args = {"entry_id": entry["entry_id"], "text": "echo synthetic\n",
+                        "tags": ["decoded"], "finding": "Agent note: statically decoded Base64 as UTF-8; not executed.",
+                        "updated": entry["review"]["updated"]}
+                review = await tool("edit_ssm_log_entry", **args)
+                self.assertEqual(review["tags"], ["decoded"])
+                self.assertEqual(review["text"], "echo synthetic\n")
+                self.assertEqual((await tool("edit_ssm_log_entry", **args))[0], "error")
+                reread = (await tool("search_ssm_log", search="alpha stdout"))["data"][0]
+                self.assertEqual(reread["review"], review)
+                self.assertEqual(reread["stdout"], entry["stdout"])
+                found = await tool("search_ssm_log", search="STATICALLY decoded", search_scope="enhanced")
+                self.assertEqual([e["entry_id"] for e in found["data"]], [entry["entry_id"]])
+                self.assertEqual((await tool("search_ssm_log", search="statically decoded", search_scope="raw"))["total"], 0)
+                self.assertEqual((await tool("get_ssm_log_entry", entry_id=entry["entry_id"]))["review"], review)
+                self.assertEqual((await tool("get_ssm_log_entry", entry_id="0" * 64))[0], "error")
+                continued = await tool("search_ssm_log", search="stdout", page=2)
+                self.assertEqual(continued[0], "error")
+                self.assertIn("refresh the search", continued[1])
+                self.assertEqual((await tool("search_ssm_log", search="stdout", page=2, revision=found["revision"]))["data"], [])
+                self.assertEqual((await tool("edit_ssm_log_entry", **{**args, "entry_id": "0" * 64}))[0], "error")
                 self.assertEqual((await tool("delete_note", id=created["id"], updated=note["updated"]))["deleted"], True)
                 self.assertNotIn(created["id"], [n["id"] for n in rest("/api/reviews")["annotations"]])
 
@@ -729,6 +751,293 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(self.call("/api/ssm-sheet", {"start": "2026-10-25T00:00:00+07:00"})[1]["total"], 6)
         for body in ({"sorters": [{"field": "bad", "dir": "asc"}]}, {"page": 0}, {"search": []}):
             self.assertEqual(self.call("/api/ssm-sheet", body)[0], 400)
+
+    def test_ssm_log_outputs_exact_links_and_review_contract(self):
+        status, result = self.call("/api/ssm-log", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["total"], 10)  # Six sheet rows plus four CT requests; duplicate export CT is not doubled.
+        self.assertEqual([r["time_ms"] for r in result["data"]], sorted(r["time_ms"] for r in result["data"]))
+        outputs = [r for r in result["data"] if r["operation"] == "Command output"]
+        alpha = next(r for r in outputs if r["instance_id"] == "i-alpha" and r["plugin"] == "shell")
+        missing = next(r for r in outputs if r["instance_id"] == "i-missing")
+        combined = next(r for r in outputs if r["plugin"] == "fallback-step")
+        self.assertEqual((alpha["stdout"], alpha["stderr"]), ("alpha stdout <script>neverRun()</script>", ""))
+        self.assertEqual((missing["stdout"], missing["stderr"], missing["combined_output"]), (None, None, None))
+        self.assertEqual((combined["stdout"], combined["stderr"], combined["combined_output"]), (None, None, "mixed stdout/stderr"))
+        self.assertEqual(next(r for r in outputs if r["region"] == "us-east-1")["events"], [])
+        self.assertEqual({e["event_id"] for e in alpha["events"]}, {"event-0", "event-2", "supplement-only"})
+        supplemental = next(e for e in alpha["events"] if e["id"] is None)
+        self.assertEqual(supplemental["source"], "Supplemental SSM export")
+        self.assertIn("raw_json", self.call("/api/ssm-event", {"key": supplemental["key"]})[1])
+        body = {"entry_id": missing["entry_id"], "text": "<script>plaintext only</script>",
+                "tags": ["log-only", "log-only"], "finding": "Missing output, not empty output", "updated": missing["review"]["updated"]}
+        status, saved = self.call("/api/ssm-log-review", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["tags"], ["log-only"])
+        self.assertEqual(self.call("/api/ssm-log-review", body)[0], 400)
+        self.assertEqual(self.call("/api/ssm-log", {"search": "i-missing"})[1]["data"][0]["review"], saved)
+        for bad in ({"entry_id": "0" * 64}, {"tags": ["Bad Tag"]}, {"text": "x" * 30001},
+                    {"finding": None}, {"tags": ["a"] * 101}):
+            self.assertEqual(self.call("/api/ssm-log-review", {**body, "updated": saved["updated"], **bad})[0], 400)
+        self.assertEqual(self.call("/api/ssm-log", {"page": 2})[1]["data"], [])
+        for bad in ({"page": 0}, {"page": True}, {"search": []}, {"start": "2026-10-25"},
+                    {"start": "2026-10-26T00:00:00Z", "end": "2026-10-25T00:00:00Z"}):
+            self.assertEqual(self.call("/api/ssm-log", bad)[0], 400)
+        sliced = self.call("/api/ssm-log", {"start": "2026-10-24T17:00:00Z", "end": "2026-10-24T17:00:01Z"})[1]
+        self.assertEqual(sliced["total"], 7)
+
+    def test_ssm_log_failed_requests_sessions_without_export_and_pagination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, database = root / "source.json", root / "source.duckdb"
+            events = [{"eventID": f"request-{i}", "eventTime": f"2026-10-24T17:{i // 60:02}:{i % 60:02}Z",
+                "eventSource": "ssm.amazonaws.com", "eventName": ["SendCommand", "StartSession", "ResumeSession", "TerminateSession"][i % 4],
+                "recipientAccountId": "123", "awsRegion": "eu-west-1", "errorCode": "AccessDenied",
+                "requestParameters": {"command": "plaintext", "sessionId": "s-exact",
+                    **({"instanceIds": ["i-denied-a", "i-denied-b"]} if i % 4 == 0 else {"target": "i-session-target"})}}
+                for i in range(105)]
+            source.write_text(json.dumps({"Records": events}))
+            build(source, database)
+            store = Store(database)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            def post(path, body):
+                with urlopen(Request(f"http://127.0.0.1:{server.server_port}" + path,
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})) as response:
+                    return json.load(response)
+
+            try:
+                first, last = post("/api/ssm-log", {}), post("/api/ssm-log", {"page": 2})
+                self.assertFalse(first["loaded"])
+                self.assertEqual((first["total"], len(first["data"]), len(last["data"])), (105, 100, 5))
+                self.assertEqual(len({e["entry_id"] for e in first["data"] + last["data"]}), 105)
+                self.assertLess(first["data"][-1]["time_ms"], last["data"][0]["time_ms"])
+                self.assertEqual({e["operation"] for e in first["data"]}, {"SendCommand", "StartSession", "ResumeSession", "TerminateSession"})
+                for entry in first["data"]:
+                    self.assertIsNone(entry["command_id"])
+                    self.assertIsNone(entry["command_key"])
+                    self.assertIsNone(entry["stdout"])
+                    self.assertEqual(entry["status"], "Failed request")
+                    self.assertEqual(entry["events"][0]["error"], "AccessDenied")
+                    self.assertEqual(entry["instance_id"], "i-denied-a, i-denied-b" if entry["operation"] == "SendCommand"
+                                     else "i-session-target")
+                entry = first["data"][0]
+                review = post("/api/ssm-log-review", {"entry_id": entry["entry_id"], "text": "Unlinked request",
+                    "tags": ["failed"], "finding": "Denied, not executed", "updated": None})
+                self.assertEqual(post("/api/ssm-log", {})["data"][0]["review"], review)
+                original = post("/api/ssm-event", {"key": entry["events"][0]["key"]})
+                self.assertEqual(json.loads(original["raw_json"]), events[0])
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                store.reviews.close()
+                store.connection.close()
+
+    def test_ssm_log_scoped_search_revision_continuation_and_exact_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, database, export = root / "source.json", root / "source.duckdb", root / "export.json"
+            # 230 linked requests (> two pages) plus one unrelated non-SSM event; request 5 has escaped characters.
+            events = [{"eventID": f"req-{i:03d}", "eventTime": f"2026-10-24T17:{i // 60:02}:{i % 60:02}Z",
+                "eventSource": "ssm.amazonaws.com", "eventName": "SendCommand", "recipientAccountId": "123",
+                "awsRegion": "eu-west-1", "requestParameters": {"instanceIds": ["i-scope"], "commands": [
+                    'Write-Output "C:\\Temp\\Mixed"' if i == 5 else f"echo request-{i:03d}"]}} for i in range(230)]
+            events.append({"eventID": "unrelated", "eventTime": "2026-10-24T18:00:00Z", "eventSource": "ec2.amazonaws.com",
+                           "eventName": "DescribeInstances", "recipientAccountId": "123", "awsRegion": "eu-west-1"})
+            source.write_text(json.dumps({"Records": events}))
+            build(source, database)
+            command = {"CommandId": "cmd-late", "DocumentName": "AWS-RunShellScript", "RequestedDateTime": "2026-10-24T19:00:00Z",
+                       "Status": "Success", "InstanceIds": ["i-late"], "Parameters": {"commands": ["echo ZGVjb2Rl | base64 -d"]}}
+            export.write_text(json.dumps({"account_id": "123", "commands": [{"region": "eu-west-1", "record": command,
+                "base64_enrichment": [{"parameter": "commands", "value_index": 0, "decodings": [
+                    {"status": "decoded_utf8", "decoded_text": "DecodedOnlyTerm", "nested_decodings": []}]}]}],
+                "invocations": [], "invocation_details": [{"region": "eu-west-1", "record": {"CommandId": "cmd-late",
+                    "InstanceId": "i-late", "PluginName": "shell", "Status": "Success", "StandardOutputContent": "late stdout",
+                    "StandardErrorContent": ""}}]}))
+            store = Store(database, annotations=root / "reviews.sqlite3", ssm_export=export)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            def post(path, body, expect=200):
+                request = Request(f"http://127.0.0.1:{server.server_port}" + path, data=json.dumps(body).encode(),
+                                  headers={"Content-Type": "application/json"})
+                try:
+                    with urlopen(request) as response:
+                        status, result = response.status, json.load(response)
+                except HTTPError as error:
+                    with error:
+                        status, result = error.code, json.load(error)
+                self.assertEqual(status, expect, result)
+                return result
+
+            def ids(body):
+                result = post("/api/ssm-log", body)
+                return result["total"], [e["entry_id"] for e in result["data"]]
+
+            try:
+                everything = post("/api/ssm-log", {})
+                order = everything["data"] + post("/api/ssm-log", {"page": 2})["data"] + post("/api/ssm-log", {"page": 3})["data"]
+                self.assertEqual((everything["total"], len({e["entry_id"] for e in order})), (231, 231))
+                request = [e for e in order if e["operation"] == "SendCommand"]  # request[i] is req-i, oldest first.
+                late = next(e for e in order if e["operation"] == "Command output")
+                unrelated = store.connection.execute("SELECT record_sha256 FROM events WHERE event_id='unrelated'").fetchone()[0]
+                post("/api/ssm-log-review", {"entry_id": request[150]["entry_id"], "text": "Interp-Unique line\nbreak",
+                                             "tags": [], "finding": "", "updated": None})
+                post("/api/ssm-log-review", {"entry_id": request[160]["entry_id"], "text": "", "tags": ["mark-unique"],
+                                             "finding": "", "updated": None})
+                post("/api/ssm-log-review", {"entry_id": request[170]["entry_id"], "text": "", "tags": [],
+                                             "finding": "Finding-Unique", "updated": None})
+                post("/api/reviews", {"action": "tag", "slug": "event-label-unique", "color": "#123456",
+                                      "hashes": [request[180]["events"][0]["record_sha256"]]})
+                note = post("/api/reviews", {"action": "annotate", "body": "Event **finding** unique",
+                                             "hashes": [request[190]["events"][0]["record_sha256"]]})
+                # Each enhanced-only term is found beyond the first page, by Both and Enhanced but not Raw.
+                for term, entry in (("interp-UNIQUE", request[150]), ("mark-unique", request[160]), ("finding-unique", request[170]),
+                                    ("event-label-unique", request[180]), ("**finding** UNIQUE", request[190]),
+                                    ("decodedonlyterm", late)):
+                    for scope in ("both", "enhanced"):
+                        self.assertEqual(ids({"search": term, "search_scope": scope}), (1, [entry["entry_id"]]), (term, scope))
+                    self.assertEqual(ids({"search": term, "search_scope": "raw"}), (0, []), term)
+                # Raw-only terms, including literal quotes/backslashes that serialized JSON would have escaped.
+                for term, entry in (("c:\\temp\\mixed", request[5]), ('"C:\\', request[5]), ("late stdout", late)):
+                    self.assertEqual(ids({"search": term, "search_scope": "raw"}), (1, [entry["entry_id"]]), term)
+                    self.assertEqual(ids({"search": term}), (1, [entry["entry_id"]]), term)
+                    self.assertEqual(ids({"search": term, "search_scope": "enhanced"}), (0, []), term)
+                # Event tags/findings are shown per linked event, distinct from the entry's own review.
+                shown = post("/api/ssm-log", {"search": "unique", "search_scope": "enhanced"})
+                self.assertEqual([e["entry_id"] for e in shown["data"]], [request[i]["entry_id"] for i in (150, 160, 170, 180, 190)])
+                tagged, noted = shown["data"][3], shown["data"][4]
+                self.assertEqual((tagged["events"][0]["tags"], tagged["review"]["tags"]), ([{"slug": "event-label-unique", "color": "#123456"}], []))
+                self.assertEqual(([n["id"] for n in noted["events"][0]["findings"]], noted["review"]["finding"]), ([note["id"]], ""))
+
+                # Continuation: a review-dependent search needs page 1's revision and goes stale on relevant writes.
+                both = {"search": "echo request", "search_scope": "both"}
+                first = post("/api/ssm-log", both)
+                self.assertTrue(first["review_dependent"])
+                self.assertEqual(first["total"], 229)
+                self.assertIn("refresh", post("/api/ssm-log", {**both, "page": 2}, 409)["error"])
+                post("/api/reviews", {"action": "tag", "slug": "elsewhere", "color": "#654321", "hashes": [unrelated]})
+                second = post("/api/ssm-log", {**both, "page": 2, "revision": first["revision"]})  # Unlinked event: unaffected.
+                post("/api/ssm-log-review", {"entry_id": request[10]["entry_id"], "text": "edited before the boundary",
+                                             "tags": [], "finding": "", "updated": None})
+                stale = post("/api/ssm-log", {**both, "page": 3, "revision": first["revision"]}, 409)
+                self.assertTrue(stale["stale"])
+                tag = post("/api/reviews", {"action": "tag", "slug": "linked", "color": "#000000",
+                                            "hashes": [request[1]["events"][0]["record_sha256"]]})
+                refreshed = post("/api/ssm-log", both)
+                self.assertEqual(refreshed["revision"], tag["log_revision"])
+                self.assertNotEqual(refreshed["revision"], first["revision"])
+                pages = refreshed["data"] + post("/api/ssm-log", {**both, "page": 2, "revision": refreshed["revision"]})["data"] \
+                    + post("/api/ssm-log", {**both, "page": 3, "revision": refreshed["revision"]})["data"]
+                self.assertEqual(len({e["entry_id"] for e in pages}), 229)
+                self.assertEqual([e["entry_id"] for e in second["data"]], [e["entry_id"] for e in pages[100:200]])
+                # Raw-only and empty searches are not invalidated by review changes.
+                raw = {"search": "echo request", "search_scope": "raw"}
+                raw_first = post("/api/ssm-log", raw)
+                self.assertFalse(raw_first["review_dependent"])
+                post("/api/ssm-log-review", {"entry_id": request[11]["entry_id"], "text": "x", "tags": [], "finding": "", "updated": None})
+                raw_pages = raw_first["data"] + post("/api/ssm-log", {**raw, "page": 2})["data"] + post("/api/ssm-log", {**raw, "page": 3})["data"]
+                self.assertEqual(len({e["entry_id"] for e in raw_pages}), 229)
+                self.assertEqual(len(post("/api/ssm-log", {"page": 3, "revision": "anything"})["data"]), 31)
+                # Time bounds still apply first (start inclusive, end exclusive) with enhanced search.
+                self.assertEqual(ids({"search": "interp-unique", "start": "2026-10-24T17:02:30Z", "end": "2026-10-24T17:02:31Z"}),
+                                 (1, [request[150]["entry_id"]]))
+                self.assertEqual(ids({"search": "interp-unique", "start": "2026-10-24T17:02:31Z"})[0], 0)
+                self.assertEqual(ids({"search": "interp-unique", "end": "2026-10-24T17:02:30Z"})[0], 0)
+
+                # Exact lookup ignores search/time selection and returns the latest saved review.
+                exact = post("/api/ssm-log", {"entry_id": request[150]["entry_id"]})
+                self.assertEqual((exact["total"], exact["data"][0]["review"]["text"]), (1, "Interp-Unique line\nbreak"))
+                self.assertEqual(exact["data"][0]["parameters"], request[150]["parameters"])
+                for bad in ({"entry_id": "0" * 64}, {"entry_id": 5}, {"entry_id": request[0]["entry_id"], "search": "x"},
+                            {"entry_id": request[0]["entry_id"], "page": 1}, {"search_scope": "analyst"}, {"search_scope": None}):
+                    post("/api/ssm-log", bad, 400)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                store.reviews.close()
+                store.connection.close()
+
+    def test_ssm_log_review_persistence_and_changed_export_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            export, annotations = root / "export.json", root / "reviews.sqlite3"
+            document = json.loads(self.ssm_export.read_text())
+            document["invocation_details"][0]["record"]["ExecutionStartDateTime"] = "2026-10-24T17:03:00Z"
+            # Supplemental activity is independently reviewable even with no evidence hash.
+            document["cloudtrail_records"].append({"eventID": "supp-failed", "eventSource": "ssm.amazonaws.com",
+                "eventName": "SendCommand", "recipientAccountId": "123", "awsRegion": "us-east-2",
+                "errorCode": "AccessDenied", "requestParameters": {"commands": ["echo unexecuted"]}})
+            document["cloudtrail_records"].append({"eventID": "supp-invalid-time", "eventSource": "ssm.amazonaws.com",
+                "eventName": "StartSession", "eventTime": "invalid timestamp", "recipientAccountId": "123",
+                "awsRegion": "us-east-2", "requestParameters": {"target": "i-invalid-time"}})
+            session_record = {"SessionId": "port-forward-only", "Target": "i-session", "Status": "Terminated",
+                "DocumentName": "AWS-StartPortForwardingSession", "StartDate": "2026-10-24T17:00:00Z",
+                "EndDate": "2026-10-24T17:05:00Z"}
+            document["sessions"] = [{"region": region, "record": session_record} for region in ("us-east-1", "us-west-2")]
+            export.write_text(json.dumps(document))
+            old_id = None
+            saved = None
+            for stage in range(3):
+                if stage == 2:
+                    document["invocation_details"][0]["record"]["StandardOutputContent"] += " changed"
+                    export.write_text(json.dumps(document))
+                store = Store(self.database, annotations=annotations, ssm_export=export)
+                server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+
+                def post(path, body):
+                    with urlopen(Request(f"http://127.0.0.1:{server.server_port}" + path,
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})) as response:
+                        return json.load(response)
+
+                try:
+                    rows = post("/api/ssm-log", {})["data"]
+                    output = next(e for e in rows if e["instance_id"] == "i-alpha" and e["plugin"] == "shell")
+                    self.assertEqual((output["time_ms"], output["time_basis"]), (1792861380000, "Execution start"))
+                    supplemental = next(e for e in rows if e["status"] == "Failed request")
+                    sessions = [e for e in rows if e["operation"] == "Session metadata"]
+                    self.assertEqual(len(sessions), 2)
+                    self.assertNotEqual(sessions[0]["entry_id"], sessions[1]["entry_id"])
+                    for entry in sessions:
+                        self.assertEqual(json.loads(entry["parameters"]), session_record)
+                        self.assertEqual(entry["status"], "Terminated")
+                        self.assertIsNone(entry["stdout"])
+                        self.assertEqual(entry["events"], [])
+                    self.assertIsNone(supplemental["time_ms"])
+                    self.assertIsNone(rows[-1]["time_ms"])
+                    invalid = next(e for e in rows if e["instance_id"] == "i-invalid-time")
+                    self.assertIsNone(invalid["time_ms"])
+                    self.assertEqual(post("/api/ssm-log", {"search": "i-invalid-time", "end": "2026-10-26T00:00:00Z"})["total"], 0)
+                    self.assertIsNone(supplemental["events"][0]["record_sha256"])
+                    if stage == 0:
+                        old_id = output["entry_id"]
+                        saved = post("/api/ssm-log-review", {"entry_id": old_id, "text": "Keep plaintext", "tags": ["persisted"],
+                            "finding": "Source-specific finding", "updated": None})
+                        post("/api/ssm-log-review", {"entry_id": supplemental["entry_id"], "text": "Supplemental request", "tags": [],
+                            "finding": "Failed request without command ID", "updated": None})
+                    elif stage == 1:
+                        self.assertEqual(output["entry_id"], old_id)
+                        self.assertEqual(output["review"], saved)
+                        self.assertEqual(supplemental["review"]["text"], "Supplemental request")
+                    else:
+                        self.assertNotEqual(output["entry_id"], old_id)
+                        self.assertIsNone(output["review"]["updated"])
+                        with self.assertRaises(HTTPError) as error:
+                            post("/api/ssm-log-review", {"entry_id": old_id})
+                        self.assertEqual(error.exception.code, 400)
+                finally:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+                    store.reviews.close()
+                    store.connection.close()
 
     def test_time_slice_and_full_dataset_sort_pagination(self):
         body = {"timezone": "Asia/Jakarta", "start": "2026-10-25T00:00:00+07:00", "end": "2026-10-26T00:00:00+07:00",

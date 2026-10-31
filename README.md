@@ -310,6 +310,10 @@ search, filter and timeline controls.
 
 The MCP connection lets your assistant search and inspect evidence, review
 detections and SSM output, tag events and write notes linked to those events.
+The SSM **Activity log** also supports editable de-obfuscated/enriched analyst
+text, entry tags and entry findings through both the browser and MCP, and search
+scoped to raw evidence, analyst/enhanced content or both; raw evidence stays
+unchanged. It reconstructs activity, not a terminal recording.
 The assistant and browser use the same evidence and saved findings. The
 assistant cannot change the original CloudTrail records.
 
