@@ -856,6 +856,26 @@ remain visible; API acceptance does not establish that a command ran or that a
 session connected. This view does not invent terminal output for sessions.
 Downloaded session transcript files remain separate.
 
+Exported command output is one entry per machine and plugin: its command input,
+streams and observed status/exit code for that exact machine/plugin. A CloudTrail
+request (SendCommand) whose account, region and command ID exactly match the
+command is part of those entries, not a separate entry; it and other linked
+events (such as GetCommandInvocation polls) sit in a collapsed **CloudTrail
+provenance** section with their request parameters, raw-event links and event
+tag/finding actions. The entry's context line names who requested it (identity
+and source IP of that SendCommand). Requests without matching output stay their
+own entries, labelled as API activity that does not prove execution.
+
+With a Both or Raw search, matches in collected text (command input, streams,
+linked request parameters) are highlighted in magenta, and the sticky lane header
+counts them in the loaded entries. **Prev**/**Next**, or N and Shift+N outside
+text fields, jump between matches, opening collapsed provenance as needed and
+loading further entries when stepping past the last loaded match.
+
+If saved entry reviews no longer belong to a current entry (the export changed,
+or the entry is now shown within another), a notice above the log lists them
+read-only. They are never attached to another entry.
+
 Each entry retains its timestamp, account, region, command ID where available,
 machine and plugin, outcome/code and exact CloudTrail links. Missing output,
 collected empty streams and combined-only output are distinguished. Each entry

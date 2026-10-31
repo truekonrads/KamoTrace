@@ -15,6 +15,9 @@
     <script defer src="/app.js"></script>
   </head>
   <body>
+    <div id="app-loading" class="grid-loading" role="status">
+      Opening local evidence…
+    </div>
     <header class="topbar">
       <div class="brand">
         <h1>KamoTrace</h1>
@@ -442,8 +445,37 @@
               Analyst interpretations, entry tags and entry findings are
               separate from original evidence and event findings.
             </p>
+            <details id="log-unmatched" class="log-unmatched" hidden>
+              <summary id="log-unmatched-summary"></summary>
+              <p class="hint">
+                These saved entry reviews were written for source content that
+                is no longer an Activity log entry (the export changed, or the
+                entry is now shown within another). They are kept read-only and
+                are not attached to any current entry.
+              </p>
+              <div id="log-unmatched-list"></div>
+            </details>
             <div class="ssm-log-lanes-head">
-              <span>Collected evidence · read-only</span>
+              <span
+                >Collected evidence · read-only
+                <span id="log-matches" hidden>
+                  · <span id="log-match-count" role="status"></span>
+                  <button
+                    id="log-match-prev"
+                    type="button"
+                    title="Previous match (Shift+N)"
+                  >
+                    ↑ Prev
+                  </button>
+                  <button
+                    id="log-match-next"
+                    type="button"
+                    title="Next match (N)"
+                  >
+                    ↓ Next
+                  </button>
+                </span></span
+              >
               <span
                 >Derived &amp; analyst · not evidence
                 <button id="refresh-log" type="button" hidden>

@@ -848,9 +848,30 @@ class BrowserContract(unittest.TestCase):
     def test_ssm_log_outputs_exact_links_and_review_contract(self):
         status, result = self.call("/api/ssm-log", {})
         self.assertEqual(status, 200)
-        self.assertEqual(result["total"], 10)  # Six sheet rows plus four CT requests; duplicate export CT is not doubled.
+        # Six sheet rows plus two requests. SendCommand event-0/event-2 match account+region+command ID, so
+        # they belong to each command-multi machine/plugin entry instead of being separate activity; event-3
+        # has the same command ID in another account and stays its own request entry, as does StartSession.
+        self.assertEqual(result["total"], 8)
         self.assertEqual([r["time_ms"] for r in result["data"]], sorted(r["time_ms"] for r in result["data"]))
+        requests = [r for r in result["data"] if r["operation"] != "Command output"]
+        self.assertEqual(sorted((r["operation"], r["events"][0]["event_id"]) for r in requests),
+                         [("SendCommand", "event-3"), ("StartSession", "event-1")])
+        self.assertEqual(requests[1]["command_id"], "command-multi")
         outputs = [r for r in result["data"] if r["operation"] == "Command output"]
+        self.assertEqual(sorted((r["instance_id"], r["plugin"]) for r in outputs if r["region"] == "ap-southeast-3"),
+            [("i-alpha", "second-step"), ("i-alpha", "shell"), ("i-beta", "fallback-step"), ("i-beta", "shell"), ("i-missing", None)])
+        for row in outputs:
+            linked = {e["event_id"]: e for e in row["events"]}
+            if row["region"] != "ap-southeast-3":
+                continue
+            self.assertEqual(set(linked), {"event-0", "event-2", "supplement-only"})
+            # The linked request keeps its exact CloudTrail parameters (precision preserved); polls carry none.
+            self.assertEqual(linked["event-0"]["request"], '{"number": 9007199254740993, "instanceId": "i-example"}')
+            self.assertIsNone(linked["supplement-only"]["request"])
+        # Raw search reaches the linked request's parameters inside every matching output entry.
+        found = self.call("/api/ssm-log", {"search": "i-example", "search_scope": "raw"})[1]
+        self.assertEqual((found["total"], sum(r["region"] == "us-east-1" for r in found["data"])), (7, 0))
+        self.assertEqual(self.call("/api/ssm-log", {"search": "i-example", "search_scope": "enhanced"})[1]["total"], 0)
         alpha = next(r for r in outputs if r["instance_id"] == "i-alpha" and r["plugin"] == "shell")
         missing = next(r for r in outputs if r["instance_id"] == "i-missing")
         combined = next(r for r in outputs if r["plugin"] == "fallback-step")
@@ -1116,12 +1137,16 @@ class BrowserContract(unittest.TestCase):
                         post("/api/ssm-log-review", {"entry_id": supplemental["entry_id"], "text": "Supplemental request", "tags": [],
                             "finding": "Failed request without command ID", "updated": None})
                     elif stage == 1:
+                        self.assertEqual(post("/api/ssm-log", {})["unmatched_reviews"], [])
                         self.assertEqual(output["entry_id"], old_id)
                         self.assertEqual(output["review"], saved)
                         self.assertEqual(supplemental["review"]["text"], "Supplemental request")
                     else:
                         self.assertNotEqual(output["entry_id"], old_id)
                         self.assertIsNone(output["review"]["updated"])
+                        # The old review is reported as unmatched, not inherited; the still-current one is not listed.
+                        self.assertEqual(post("/api/ssm-log", {"search": "no such entry"})["unmatched_reviews"],
+                                         [{"entry_id": old_id, **saved}])
                         with self.assertRaises(HTTPError) as error:
                             post("/api/ssm-log-review", {"entry_id": old_id})
                         self.assertEqual(error.exception.code, 400)

@@ -275,7 +275,14 @@ class Store:
             if result["review_dependent"] and body.get("page", 1) > 1 and body.get("revision") != self.log_revision:
                 raise StaleSelection("Analyst content changed since this search ran; refresh the search (page 1) "
                                      "to continue. Pass the revision returned with page 1 for later pages.")
-            return {**result, "data": self.log_review_data(result["data"]), "revision": self.log_revision}
+            # Saved reviews whose source content is no longer an entry (changed export or grouping) stay
+            # readable rather than silently disappearing; they are never attached to another entry.
+            unmatched = [{"entry_id": r["entry_id"], "text": r["text"], "tags": json.loads(r["tags"]),
+                          "finding": r["finding"], "updated": r["updated"]}
+                         for r in self.reviews.execute("SELECT * FROM ssm_log_reviews ORDER BY updated, entry_id")
+                         if r["entry_id"] not in self.commands.log_entries]
+            return {**result, "data": self.log_review_data(result["data"]), "revision": self.log_revision,
+                    "unmatched_reviews": unmatched}
 
     def log_review_data(self, entries):
         """Attach each entry's saved review and its linked events' tags/findings (read-only here). Caller holds the lock."""

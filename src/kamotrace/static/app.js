@@ -1,5 +1,9 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
+function setLoading(message = "") {
+  $("app-loading").textContent = message;
+  $("app-loading").hidden = !message;
+}
 let meta,
   table,
   lastResult,
@@ -156,12 +160,14 @@ async function apply(state, push = true) {
     return;
   }
   if (next.timezone !== meta.timezone) {
+    setLoading(`Applying ${next.timezone}…`);
     try {
       const result = await request("/api/meta", { timezone: next.timezone });
       if (requestId !== latestApply) return;
       meta = result;
     } catch (e) {
       if (requestId !== latestApply) return;
+      setLoading();
       error(e.message);
       $("timezone").value = meta.timezone;
       return;
@@ -537,16 +543,49 @@ function logDirty(draft) {
   );
 }
 
-function logField(parent, label, value, className = "") {
+// The applied raw search (case-insensitive literal, as the server matches it), or "" when the
+// selection has none or searches enhanced/analyst content only.
+function logNeedle() {
+  return logSelection?.search && logSelection.search_scope !== "enhanced"
+    ? logSelection.search.toLowerCase()
+    : "";
+}
+
+// Plaintext with each match wrapped in <mark>; text nodes only, whitespace kept. Returns hits.
+function markText(element, value, needle) {
+  const lower = value.toLowerCase();
+  // Lowercasing a few characters changes length; then compare slices of the original instead.
+  const find = (from) => {
+    if (lower.length === value.length) return lower.indexOf(needle, from);
+    for (let i = from; i + needle.length <= value.length; i++)
+      if (value.slice(i, i + needle.length).toLowerCase() === needle) return i;
+    return -1;
+  };
+  let at = 0,
+    hits = 0;
+  for (let i = needle ? find(0) : -1; i >= 0; i = find(at)) {
+    const hit = document.createElement("mark");
+    hit.className = "ssm-log-hit";
+    hit.textContent = value.slice(i, i + needle.length);
+    element.append(value.slice(at, i), hit);
+    at = i + needle.length;
+    hits += 1;
+  }
+  element.append(value.slice(at));
+  return hits;
+}
+
+function logField(parent, label, value, className = "", needle = "") {
   const field = document.createElement("div");
   field.className = "ssm-log-field " + className;
   const name = document.createElement("span");
   name.className = "ssm-log-label";
   name.textContent = label;
   const text = document.createElement("pre");
-  text.textContent = value;
+  const hits = markText(text, value, needle);
   field.append(name, text);
   parent.append(field);
+  return hits;
 }
 
 function logLine(parent, text, className = "ssm-log-state") {
@@ -559,12 +598,15 @@ function logLine(parent, text, className = "ssm-log-state") {
 function logRaw(row) {
   const lane = document.createElement("div");
   lane.className = "ssm-log-raw";
+  const needle = logNeedle();
   if (row.parameters === null) logLine(lane, "request: not collected");
   else
     logField(
       lane,
       row.operation === "Session metadata" ? "session metadata" : "request",
       row.parameters,
+      "",
+      needle,
     );
   const states = { "not collected": [], "collected empty": [] };
   for (const [field, label] of [
@@ -582,6 +624,7 @@ function logRaw(row) {
           : label,
         row[field],
         field === "stderr" ? "stderr" : "",
+        needle,
       );
   }
   // Missing and empty streams stay distinct, in one compact line.
@@ -649,7 +692,20 @@ function logEntry(row) {
   head.append(time, what, where, edit);
   const context = document.createElement("p");
   context.className = "ssm-log-context";
-  context.textContent = `${row.account || "unknown account"} · ${row.region || "unknown region"} · command ${row.command_id || "none"} · time basis: ${row.time_basis} · ${row.output_state}`;
+  // Who issued a command is a first question; take it from the exactly linked SendCommand.
+  const requesters = [
+    ...new Set(
+      row.operation === "Command output"
+        ? row.events
+            .filter((e) => e.operation === "SendCommand")
+            .map(
+              (e) =>
+                `${e.identity || "unknown identity"} from ${e.source_ip || "unknown source IP"}`,
+            )
+        : [],
+    ),
+  ];
+  context.textContent = `${row.account || "unknown account"} · ${row.region || "unknown region"} · command ${row.command_id || "none"} · time basis: ${row.time_basis} · ${row.output_state}${requesters.length ? " · requested by " + requesters.join("; ") : ""}`;
   const lanes = document.createElement("div");
   lanes.className = "ssm-log-lanes";
   const enhanced = document.createElement("div");
@@ -657,12 +713,19 @@ function logEntry(row) {
   renderLogEnhanced(enhanced, row);
   lanes.append(logRaw(row), enhanced);
   card.append(head, context, lanes);
+  // Collected output already states the observed result for this exact machine/plugin, so its
+  // linked CloudTrail events (the request and status polls) are compact provenance, not the
+  // primary result. Request-only entries keep them prominent: API acceptance is not execution.
+  const output = row.operation === "Command output" && row.events.length;
   const links = document.createElement("div");
   links.className = "ssm-log-links";
   for (const event of row.events) {
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = `${event.operation} · ${event.error || "no API error (not execution proof)"} · ${event.event_id} · ${event.source}`;
+    const time = Date.parse(event.time);
+    button.textContent = output
+      ? `${event.operation} · ${Number.isNaN(time) ? "unknown time" : shown(time)} · ${event.error || "no API error"} · ${event.identity || "unknown identity"} · ${event.source_ip || "no source IP"} · ${event.event_id} · ${event.source}`
+      : `${event.operation} · ${event.error || "no API error (not execution proof)"} · ${event.event_id} · ${event.source}`;
     button.onclick = async () => {
       try {
         if (event.id !== null) await detail({ id: event.id });
@@ -701,9 +764,101 @@ function logEntry(row) {
       links.append(button);
     }
   }
-  if (links.childElementCount) card.append(links);
+  if (output) {
+    const details = document.createElement("details");
+    details.className = "ssm-log-provenance";
+    const summary = document.createElement("summary");
+    const counts = new Map();
+    for (const event of row.events)
+      counts.set(event.operation, (counts.get(event.operation) || 0) + 1);
+    summary.textContent = `CloudTrail provenance · ${[...counts].map(([name, n]) => (n > 1 ? `${n}× ${name}` : name)).join(", ")}`;
+    details.append(summary);
+    // Open it when the search matched inside, so a match is never hidden.
+    for (const event of row.events)
+      if (
+        event.request !== null &&
+        logField(
+          details,
+          `CloudTrail ${event.operation} request · ${event.event_id}`,
+          event.request,
+          "",
+          logNeedle(),
+        )
+      )
+        details.open = true;
+    details.append(links);
+    card.append(details);
+  } else if (links.childElementCount) card.append(links);
   logCards.set(row.entry_id, { row, card });
   return card;
+}
+
+// Search-match navigation over the highlighted collected text of loaded entries.
+const logHits = () => $("command-log").getElementsByClassName("ssm-log-hit");
+
+function renderLogMatches() {
+  const needle = logNeedle(),
+    hits = logHits();
+  $("log-matches").hidden = !needle;
+  if (!needle) return;
+  const current = Array.prototype.findIndex.call(hits, (h) =>
+    h.classList.contains("current"),
+  );
+  const entries = new Set(Array.from(hits, (h) => h.closest(".ssm-log-entry")))
+    .size;
+  $("log-match-count").textContent = hits.length
+    ? `${current >= 0 ? number(current + 1) + " / " : ""}${number(hits.length)} match${hits.length === 1 ? "" : "es"} in ${number(entries)} loaded entr${entries === 1 ? "y" : "ies"}${logCards.size < logTotal ? " · more load as you go" : ""}`
+    : "no matches highlighted in collected text";
+  $("log-match-prev").disabled = $("log-match-next").disabled = !hits.length;
+}
+
+async function stepLogMatch(delta) {
+  let hits = [...logHits()];
+  if (!hits.length) return;
+  let index = hits.findIndex((h) => h.classList.contains("current"));
+  if (index >= 0) index += delta;
+  else {
+    // Start from the reading position, below the sticky lane header.
+    const top = $("command-log-panel")
+      .querySelector(".ssm-log-lanes-head")
+      .getBoundingClientRect().bottom;
+    index = hits.findIndex((h) => h.getBoundingClientRect().top > top);
+    if (delta < 0) index = (index < 0 ? hits.length : index) - 1;
+  }
+  if (index >= hits.length && logCards.size < logTotal && !logStale) {
+    await loadLog({ more: true });
+    hits = [...logHits()];
+  }
+  index = (index + hits.length) % hits.length;
+  for (const hit of hits) hit.classList.remove("current");
+  const hit = hits[index];
+  hit.classList.add("current");
+  const details = hit.closest("details");
+  if (details) details.open = true;
+  hit.scrollIntoView({ block: "center" });
+  renderLogMatches();
+}
+
+// Saved reviews whose entry no longer exists stay readable (plaintext), never reattached.
+function renderLogUnmatched(reviews) {
+  $("log-unmatched").hidden = !reviews.length;
+  $("log-unmatched-summary").textContent =
+    `${number(reviews.length)} saved entry review${reviews.length === 1 ? "" : "s"} no longer match${reviews.length === 1 ? "es" : ""} a current entry`;
+  $("log-unmatched-list").replaceChildren(
+    ...reviews.map((review) => {
+      const item = document.createElement("div");
+      item.className = "log-unmatched-item";
+      logLine(
+        item,
+        `Entry ${review.entry_id.slice(0, 12)}… · saved ${review.updated}`,
+      );
+      if (review.tags.length)
+        logLine(item, `entry tags: ${review.tags.join(", ")}`, "ssm-log-tags");
+      if (review.text) logField(item, "interpretation · analyst", review.text);
+      if (review.finding) logField(item, "entry finding", review.finding);
+      return item;
+    }),
+  );
 }
 
 // The first entry whose bottom is below the viewport top, and its offset. Entries are in document
@@ -1156,6 +1311,7 @@ async function loadLog({ more = false, retry = null, fresh = false } = {}) {
         logCards.clear();
         logStale = false;
         $("command-log").replaceChildren();
+        renderLogUnmatched(result.unmatched_reviews);
         if (!result.total)
           $("command-log").textContent =
             "No matching activity. Widen the time range, change the search scope or clear search.";
@@ -1165,6 +1321,7 @@ async function loadLog({ more = false, retry = null, fresh = false } = {}) {
       logPage = page;
       logTotal = result.total;
       $("command-log").append(...result.data.map(logEntry));
+      renderLogMatches();
       limitations(result.limitations);
       // An explicit refresh reloads up to the previous position so the reader's entry can be restored.
       if (
@@ -3191,6 +3348,8 @@ async function init() {
     { rootMargin: "1200px 0px" },
   );
   $("more-log").onclick = () => loadLog({ retry: logFailure });
+  $("log-match-prev").onclick = () => stepLogMatch(-1);
+  $("log-match-next").onclick = () => stepLogMatch(1);
   $("refresh-log").onclick = () =>
     loadLog({
       retry: { selection: logSelection, page: 1, restore: logAnchor() },
@@ -3479,6 +3638,8 @@ async function init() {
     ajaxURL: "/api/events",
     ajaxRequestFunc: async (_url, _config, params) => {
       const requestId = ++latestQuery;
+      const applyId = latestApply;
+      setLoading(`Loading events · ${meta.timezone}…`);
       loadingFirst = true;
       loadingMore = false;
       $("events-loading").hidden = true;
@@ -3539,6 +3700,9 @@ async function init() {
           error(e.message);
         }
         throw e;
+      } finally {
+        // An older event load must not dismiss a newer timezone refresh.
+        if (requestId === latestQuery && applyId === latestApply) setLoading();
       }
     },
     rowFormatter: (row) => {
@@ -3754,6 +3918,15 @@ async function init() {
       go(e.key === "ArrowLeft" ? -1 : 1);
     } else if (e.key === "Escape" && $("detail").open && !typing) {
       $("detail").close();
+    } else if (
+      (e.key === "n" || e.key === "N") &&
+      commandsActive &&
+      commandLog &&
+      !$("log-matches").hidden &&
+      !(typing || e.ctrlKey || e.metaKey || e.altKey)
+    ) {
+      e.preventDefault();
+      stepLogMatch(e.key === "N" ? -1 : 1);
     } else if (typing || e.ctrlKey || e.metaKey || e.altKey || commandsActive) {
       return;
     } else if (e.key === "/") {
@@ -3868,4 +4041,7 @@ async function init() {
   });
 })();
 
-init().catch((e) => error(e.message));
+init().catch((e) => {
+  setLoading();
+  error(e.message);
+});

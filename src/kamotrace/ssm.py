@@ -6,6 +6,8 @@ import json
 from .importer import open_json
 from .server import parse_time
 
+REQUESTS = ("SendCommand", "StartSession", "ResumeSession", "TerminateSession")
+
 
 class Commands:
     def __init__(self, path, connection):
@@ -61,8 +63,7 @@ class Commands:
             request, response = event.get("requestParameters") or {}, event.get("responseElements") or {}
             command_id = request.get("commandId") or (response.get("command") or {}).get("commandId")
             key = json.dumps([event.get("recipientAccountId", ""), event.get("awsRegion", ""), command_id], separators=(",", ":"))
-            if key not in self.commands and event.get("eventName") not in (
-                    "SendCommand", "StartSession", "ResumeSession", "TerminateSession"):
+            if key not in self.commands and event.get("eventName") not in REQUESTS:
                 continue
             event_key = hashlib.sha256(json.dumps([event.get("recipientAccountId"), event.get("awsRegion"),
                 event.get("eventID") or hashlib.sha256(raw.encode()).hexdigest()]).encode()).hexdigest()
@@ -72,6 +73,9 @@ class Commands:
                 "time": event.get("eventTime"),
                 "identity": (event.get("userIdentity") or {}).get("arn", ""),
                 "source_ip": event.get("sourceIPAddress"), "error": event.get("errorCode"),
+                # Request operations keep their CloudTrail requestParameters for display where linked.
+                "request": json.dumps(request, ensure_ascii=False)
+                    if event.get("eventName") in REQUESTS and event.get("requestParameters") is not None else None,
                 "command_key": key if command_id else None, "command_id": command_id,
                 "account": event.get("recipientAccountId", ""), "region": event.get("awsRegion", ""),
                 "source": "DuckDB" if source_record is not None else "Supplemental SSM export"}
@@ -150,7 +154,9 @@ class Commands:
             # Bind reviews to the actual source records, not just rendered output or row order.
             add(item, source)["events"] = command["events"]
         for event in self.events.values():
-            if event["operation"] not in ("SendCommand", "StartSession", "ResumeSession", "TerminateSession"):
+            # A request linked by exact account, region and command ID is part of that command's
+            # activity: it is already a linked event of each of the command's system/plugin entries.
+            if event["operation"] not in REQUESTS or event["command_key"] in self.commands:
                 continue
             raw = json.loads(event["raw_json"])
             request = raw.get("requestParameters")
@@ -188,13 +194,14 @@ class Commands:
                                          "stderr", "combined_output")]
             values += [e[k] for e in entry["events"] for k in ("event_id", "operation", "time", "identity", "source_ip",
                                                                 "error", "source", "record_sha256")]
+            # Requests/session metadata display as JSON; also match their unescaped string values.
+            stack = [json.loads(e["request"]) for e in entry["events"] if e["request"] is not None]
             if entry["operation"] != "Command output" and entry["parameters"] is not None:
-                # Requests/session metadata display as JSON; also match their unescaped string values.
-                stack = [json.loads(entry["parameters"])]
-                while stack:
-                    value = stack.pop()
-                    stack.extend(value.values() if isinstance(value, dict) else value if isinstance(value, list) else [])
-                    values += [value] if isinstance(value, str) else []
+                stack.append(json.loads(entry["parameters"]))
+            while stack:
+                value = stack.pop()
+                stack.extend(value.values() if isinstance(value, dict) else value if isinstance(value, list) else [])
+                values += [value] if isinstance(value, str) else []
             self.log_search[entry["entry_id"]] = ("\0".join(str(v) for v in values if v is not None).lower(),
                                                   entry["decoded"].lower())
         # Evidence hashes whose event tags/findings are analyst content of some log entry.
@@ -231,6 +238,8 @@ class Commands:
     def log_info(self):
         return {"loaded": bool(self.path), "limitations": [*self.limitations,
                 "CloudTrail requests do not prove execution or session contents. Outputs are limited to the supplied export.",
+                "A request linked by exact account, region and command ID appears inside each of that command's "
+                "machine/plugin entries, not as its own entry; their time is the output's.",
                 "Output time uses execution/response start when present, otherwise command requested time; unknown times sort last.",
                 "Exported session metadata uses StartDate; external session transcript files are not loaded."]}
 

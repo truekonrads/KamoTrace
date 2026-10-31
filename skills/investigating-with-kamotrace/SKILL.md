@@ -213,7 +213,9 @@ Available only when the analyst loaded an SSM export.
   rerun page 1 rather than guessing. Raw-only and empty searches need no revision. It includes CloudTrail activity even
   without an SSM export: failed SendCommand without a command ID, StartSession,
   ResumeSession and TerminateSession. Exported command outputs keep each
-  machine/plugin distinct; exported session metadata retains its reported target,
+  machine/plugin distinct; a request whose account, region and command ID
+  exactly match an exported command is not its own entry but a linked event
+  (with `request` parameters) of each of that command's machine/plugin entries; exported session metadata retains its reported target,
   status, start/end and document. Time bounds apply to entry time, inclusive/exclusive;
   unknown times do not match a bounded query.
 - This is **not a terminal recording**. Do not infer execution from API
@@ -241,6 +243,9 @@ Available only when the analyst loaded an SSM export.
   and findings are **not** event tags or shared Markdown notes: use `tag_events`
   and `create_note` with linked original `record_sha256` values to record shared
   evidence findings. Supplemental/unlinked entries can still carry entry reviews.
+  `search_ssm_log` also returns `unmatched_reviews`: saved reviews whose
+  `entry_id` is no longer a current entry. They are read-only history; do not
+  copy them onto another entry without checking it is the same source content.
 
 Example: read `search_ssm_log(search="i-alpha")`, inspect the original streams
 and linked events, then call `edit_ssm_log_entry` with that entry's exact

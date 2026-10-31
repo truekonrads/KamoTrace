@@ -751,6 +751,12 @@ main {
   box-shadow: 0 2px 8px #103b5533;
   pointer-events: none;
 }
+#app-loading {
+  position: fixed;
+  top: 64px;
+  bottom: auto;
+  z-index: 100;
+}
 .grid-loading::before {
   content: "";
   width: 16px;
@@ -1576,6 +1582,41 @@ dialog::backdrop {
   line-height: 1.4;
   color: #17313f;
 }
+.ssm-log-hit {
+  padding: 0;
+  border-radius: 2px;
+  background: #e000e0;
+  color: #fff;
+}
+.ssm-log-hit.current {
+  outline: 2px solid #17313f;
+  outline-offset: 1px;
+}
+.ssm-log-lanes-head #log-matches {
+  font-weight: 400;
+}
+.ssm-log-lanes-head #log-matches button {
+  margin-left: 4px;
+  border-color: #b9cbd6;
+  color: #25475b;
+}
+.log-unmatched {
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border: 1px solid #e3c9a4;
+  border-radius: 4px;
+  background: #fff8ec;
+  font-size: 12px;
+}
+.log-unmatched > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #7a4a10;
+}
+.log-unmatched-item {
+  padding: 4px 0;
+  border-top: 1px solid #f0dfc4;
+}
 .ssm-log-field.stderr pre {
   color: #8a2f18;
 }
@@ -1606,6 +1647,23 @@ dialog::backdrop {
   flex-wrap: wrap;
   gap: 4px;
   margin-top: 3px;
+}
+.ssm-log-provenance {
+  margin-top: 2px;
+  font-size: 11px;
+  color: #5d7380;
+}
+.ssm-log-provenance > summary {
+  width: fit-content;
+  cursor: pointer;
+}
+.ssm-log-provenance[open] {
+  margin-bottom: 2px;
+  padding: 2px 0 2px 8px;
+  border-left: 2px solid #d5e2ea;
+}
+.ssm-log-provenance[open] > summary {
+  margin-bottom: 3px;
 }
 .ssm-log-links button {
   padding: 0 6px;
