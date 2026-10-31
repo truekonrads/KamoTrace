@@ -1,5 +1,6 @@
 """HTTP, MCP and Suzaku contract tests with a disposable, real CloudTrail DuckDB database."""
 from datetime import datetime, timezone
+from contextlib import ExitStack
 from functools import partial
 import gc
 import gzip
@@ -24,6 +25,7 @@ import duckdb
 
 from kamotrace.importer import build
 from kamotrace.server import Handler, Store
+from kamotrace.mcp_server import http_transport
 from kamotrace.enrich import build as enrich
 from kamotrace.suzaku import import_timeline
 
@@ -89,12 +91,15 @@ class BrowserContract(unittest.TestCase):
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.url = f"http://127.0.0.1:{cls.server.server_port}"
+        cls.transports = ExitStack()
+        cls.server.mcp_request = cls.transports.enter_context(http_transport(cls.url))
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.thread.join()
         cls.server.server_close()
+        cls.transports.close()
         cls.store.reviews.close()
         cls.store.connection.close()
         assert hashlib.sha256(cls.database.read_bytes()).hexdigest() == cls.before
@@ -111,10 +116,16 @@ class BrowserContract(unittest.TestCase):
                 return error.code, json.load(error)
 
     def test_serve_reports_startup_progress_and_ready_url(self):
+        for transport in ("http", "stdio"):
+            with self.subTest(transport=transport):
+                self.check_startup(transport)
+
+    def check_startup(self, transport):
         with tempfile.TemporaryDirectory() as temporary:
             process = subprocess.Popen([sys.executable, "-m", "kamotrace", "serve",
                 "--database", str(self.database), "--ssm-export", str(self.ssm_export),
-                "--annotations", str(Path(temporary) / "reviews.sqlite3"), "--bind", "127.0.0.1", "--port", "0"],
+                "--annotations", str(Path(temporary) / "reviews.sqlite3"), "--bind", "127.0.0.1", "--port", "0",
+                *(["--mcp-transport", "stdio"] if transport == "stdio" else [])],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             lines = Queue()
 
@@ -136,7 +147,25 @@ class BrowserContract(unittest.TestCase):
                     output += line
                     if line.startswith("KamoTrace: http://"):
                         url = line.split()[1]
+                    if line.startswith("  claude mcp add"):
                         break
+                if transport == "http":
+                    self.assertIn(f"MCP (HTTP): {url}/mcp", output)
+                    self.assertIn(f"amp mcp add kamotrace {url}/mcp", output)
+                    self.assertIn(f"claude mcp add --transport http kamotrace {url}/mcp", output)
+                    async def session():
+                        async with Client(url + "/mcp") as client:
+                            result = await client.call_tool("describe_schema")
+                            self.assertEqual(result.structured_content["first_event"], "2026-10-24T16:59:59+00:00")
+                    anyio.run(session)
+                else:
+                    self.assertIn("MCP (stdio):", output)
+                    for agent in ("amp", "claude"):
+                        self.assertIn(f"{agent} mcp add kamotrace -- kamotrace mcp --url {url}", output)
+                    with self.assertRaises(HTTPError) as error:
+                        urlopen(url + "/mcp", timeout=15)
+                    self.assertEqual(error.exception.code, 404)
+                    error.exception.close()
                 for stage in ("Opening evidence database (read-only)", "Validating findings/tags evidence identity",
                               "Loading IP enrichment", "Loading and linking SSM commands", "Loading Suzaku detections",
                               "Calculating event counts", "Binding HTTP server", "Startup complete in"):
@@ -317,17 +346,16 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(self.call("/api/events", {"annotation_id": nid})[1]["last_row"], 0)
         self.assertEqual(self.call("/api/reviews")[1]["annotations"], [])
 
-    def test_mcp_stdio_session_shares_the_browser_servers_reviews(self):
-        # A real MCP client session over stdio. The adapter holds no database handle: every agent
+    def test_mcp_sessions_share_the_browser_servers_reviews(self):
+        # Real MCP sessions over HTTP and stdio. The adapter holds no database handle: every agent
         # write must be visible through the browser's own API immediately, and vice versa.
         def rest(path, body=None):
             status, result = self.call(path, body)
             self.assertEqual(status, 200, result)
             return result
 
-        async def session():
-            params = StdioServerParameters(command=sys.executable, args=["-m", "kamotrace", "mcp", "--url", self.url])
-            async with Client(params) as client:
+        async def session(transport):
+            async with Client(transport) as client:
                 async def tool(name, **arguments):
                     result = await client.call_tool(name, arguments)
                     return ("error", result.content[0].text) if result.is_error else result.structured_content
@@ -427,7 +455,16 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual((await tool("delete_note", id=created["id"], updated=note["updated"]))["deleted"], True)
                 self.assertNotIn(created["id"], [n["id"] for n in rest("/api/reviews")["annotations"]])
 
-        anyio.run(session)
+        for transport in (self.url + "/mcp", StdioServerParameters(
+                command=sys.executable, args=["-m", "kamotrace", "mcp", "--url", self.url])):
+            with self.subTest(transport=str(transport)):
+                anyio.run(session, transport)
+
+    def test_mcp_http_rejects_cross_site_requests_and_oversized_bodies(self):
+        for headers in ({"Host": "evil.example"}, {"Origin": "https://evil.example"}):
+            self.assertEqual(self.call("/mcp", {}, headers=headers)[0], 403)
+        self.assertEqual(self.call("/mcp", {}, headers={"Content-Length": "1048577"})[0], 400)
+        self.assertEqual(self.call("/mcp", {}, headers={"Content-Length": "-1"})[0], 400)
 
     def test_suzaku_detections_link_exactly_and_filter_like_tags(self):
         # A Suzaku 3.x `aws-ct-timeline -t duckdb` file, with the schema Suzaku 3.0.0 actually writes.
@@ -533,6 +570,62 @@ class BrowserContract(unittest.TestCase):
             store.reviews.close()
         self.assertEqual(hashlib.sha256(sidecar.read_bytes()).hexdigest(), before)
 
+    def test_special_use_ip_classification_without_sidecar(self):
+        cases = {
+            "(private)": ["10.0.0.0", "10.255.255.255", "172.16.0.0", "172.31.255.255",
+                          "192.168.0.0", "192.168.255.255", "fc00::", "FD12:0000::1", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                          "::ffff:192.168.1.2"],
+            "(loopback)": ["127.4.3.2", "::1"],
+            "(link-local)": ["169.254.3.4", "fe80::1234"],
+            "(multicast)": ["224.0.0.1", "239.255.255.255", "ff02::1"],
+            "(unspecified)": ["0.0.0.0", "::"],
+            "(shared address space)": ["100.64.0.0", "100.127.255.255"],
+            "(documentation)": ["192.0.2.1", "198.51.100.8", "203.0.113.10", "2001:db8::1", "3fff::1"],
+            "(benchmarking)": ["198.18.0.1", "2001:2::1"],
+            "(limited broadcast)": ["255.255.255.255"],
+            "(reserved)": ["240.0.0.1", "fe00::1"],
+            "(site-local)": ["fec0::1"],
+            "(unmapped / service / private)": ["9.255.255.255", "11.0.0.0", "172.15.255.255", "172.32.0.0",
+                                                "192.167.255.255", "192.169.0.0", "100.63.255.255", "100.128.0.0",
+                                                "8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8",
+                                                "ec2.amazonaws.com", "not-an-ip"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, database = root / "events.json", root / "case.duckdb"
+            expected = {ip: label for label, ips in cases.items() for ip in ips}
+            source.write_text(json.dumps({"Records": [{"eventID": f"scope-{i}", "eventTime": "2026-10-24T01:00:00Z",
+                "eventName": "GetCallerIdentity", "eventSource": "sts.amazonaws.com", "sourceIPAddress": ip,
+                "awsRegion": "us-east-1"} for i, ip in enumerate(expected)]}), encoding="utf-8")
+            build(source, database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            store = Store(database)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                def request(path, body=None):
+                    req = Request(f"http://127.0.0.1:{server.server_port}" + path,
+                                  data=json.dumps(body).encode() if body is not None else None,
+                                  headers={"Content-Type": "application/json"})
+                    with urlopen(req, timeout=15) as response:
+                        return json.load(response)
+
+                rows = request("/api/events", {"size": 100})["data"]
+                self.assertEqual({row["source_ip"]: row["country"] for row in rows}, expected)
+                self.assertEqual(len(rows), len(expected))  # No duplicate joins.
+                self.assertTrue(all(row["city"] is None and row["asn"] is None and row["isp"] is None for row in rows))
+                for label, ips in cases.items():
+                    result = request("/api/events", {"filters": [{"field": "country", "op": "eq", "value": label}]})
+                    self.assertEqual(result["last_row"], len(ips), label)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                store.connection.close()
+                store.reviews.close()
+            self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+
     def test_enrichment_layers_geolite2_and_neutral_jsonl_by_priority(self):
         from mmdb_writer import MMDBWriter
         from netaddr import IPSet
@@ -576,7 +669,7 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(rows, {
             "192.0.2.10": ("Netherlands", "Amsterdam", "AS64500", "Example Hosting", None),
             "198.51.100.7": ("Germany", "Amsterdam", "AS64500", "Example Hosting", "spur.proxy_score=92; spur.tunnel=vpn-example"),
-            "2001:db8::1": ("(unmapped / service / private)", None, None, "IPv6 Example", "spur.residential=false"),
+            "2001:db8::1": ("(documentation)", None, None, "IPv6 Example", "spur.residential=false"),
             "ec2.amazonaws.com": ("(unmapped / service / private)", None, None, None, None)})
         self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
         # Invalid JSONL is rejected with its line; nothing replaces the existing sidecar.

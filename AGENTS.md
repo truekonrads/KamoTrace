@@ -47,7 +47,7 @@ only reads them.
   enrichment, detections, and SQLite annotation/tag persistence.
 - `ssm.py`: local SSM export loading, account/region/command joins, separate
   system/plugin outputs, and command/spreadsheet query endpoints.
-- `mcp_server.py`: stdio MCP adapter (official `mcp` SDK). It owns no database or
+- `mcp_server.py`: HTTP/stdio MCP adapter (official `mcp` SDK). It owns no database or
   sidecar handle; every tool calls `server.py`'s loopback REST endpoints, so the
   browser and agents share one Store, its validation and its review temp tables.
   Add capabilities to `server.py`/`ssm.py` first; keep the adapter a thin mapping.
@@ -93,9 +93,10 @@ only reads them.
   selection); counts and filtered results are refreshed explicitly, not silently.
 - Note edit/delete require the note's current `updated` stamp (optimistic
   concurrency between browser tabs and MCP agents); never make them last-write-wins.
-- The MCP adapter has no authentication by request: keep it stdio-only and its
-  `--url` restricted to loopback. Do not add a network MCP listener, SQL/path
-  tools, or bulk writes without explicit event hashes.
+- The MCP adapter has no authentication: serve HTTP MCP only at `/mcp` on the
+  existing web server, with the same Host/Origin checks and loopback defaults.
+  Keep the optional stdio adapter's `--url` restricted to loopback. Do not add
+  a separate MCP listener, SQL/path tools, or bulk writes without explicit event hashes.
 - Keep loopback binding, Host/Origin checks, CSP, parameter binding and sort/field
   allowlists. Do not introduce an arbitrary-SQL, arbitrary-path or network-fetch
   endpoint. Server startup paths come from CLI arguments, not browser requests.

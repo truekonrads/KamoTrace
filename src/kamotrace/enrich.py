@@ -22,10 +22,43 @@ from .suzaku import check_output, evidence_identity, sha256
 SCHEMA = 1
 FIELDS = ("country", "country_code", "city", "asn", "as_org")  # Provider-neutral JSONL fields
 ATTRIBUTE_KEY = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+SPECIAL_NETWORKS = [(ipaddress.ip_network(network), label) for network, label in (
+    ("10.0.0.0/8", "private"), ("172.16.0.0/12", "private"), ("192.168.0.0/16", "private"),
+    ("fc00::/7", "private"), ("100.64.0.0/10", "shared address space"),
+    ("192.0.2.0/24", "documentation"), ("198.51.100.0/24", "documentation"),
+    ("203.0.113.0/24", "documentation"), ("2001:db8::/32", "documentation"),
+    ("3fff::/20", "documentation"), ("198.18.0.0/15", "benchmarking"),
+    ("2001:2::/48", "benchmarking"), ("255.255.255.255/32", "limited broadcast"),
+)]
 
 
 def canonical_ip(value):
     return str(ipaddress.ip_address(value))
+
+
+def address_class(value):
+    """Classify special-use addresses, not countries or inferred physical locations."""
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None  # AWS service names are not IP addresses.
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    # Order matters: unspecified and loopback are also reserved on IPv6.
+    for label, matches in (("unspecified", address.is_unspecified), ("loopback", address.is_loopback),
+                           ("multicast", address.is_multicast), ("link-local", address.is_link_local)):
+        if matches:
+            return f"({label})"
+    for network, label in SPECIAL_NETWORKS:
+        if address in network:
+            return f"({label})"
+    if isinstance(address, ipaddress.IPv6Address) and address.is_site_local:
+        return "(site-local)"
+    if address.is_reserved:
+        return "(reserved)"
+    if not address.is_global:
+        return "(special-purpose)"
+    return None
 
 
 def read_jsonl(path):
@@ -177,20 +210,20 @@ def load_enrichment(connection, path):
     """Server side: merge sources by priority into a temp table. Returns the run metadata or None."""
     connection.execute("""CREATE TEMP TABLE ip_enrichment(ip VARCHAR, country VARCHAR, city VARCHAR,
         asn VARCHAR, isp VARCHAR, ip_info VARCHAR)""")
-    if path is None:
-        return None
-    # A separate read-only connection, as for detections: the evidence instance may disable file access.
-    sidecar = duckdb.connect(str(path), read_only=True)
-    try:
-        run = json.loads(sidecar.execute("SELECT metadata FROM enrichment_run").fetchone()[0])
-        if run.get("schema_version") != SCHEMA:
-            raise ValueError(f"{path}: unsupported enrichment sidecar; rebuild it with `kamotrace enrich --replace`")
-        if (run["evidence_source_sha256"], run["evidence_records"]) != evidence_identity(connection):
-            raise ValueError(f"{path} was built for a different evidence database; rebuild it with `kamotrace enrich`")
-        rows = sidecar.execute("""SELECT ip, source, country, country_code, city, asn, as_org, attributes
-            FROM ip_enrichment ORDER BY ip, priority""").fetchall()
-    finally:
-        sidecar.close()
+    run, rows = None, []
+    if path is not None:
+        # A separate read-only connection: the evidence instance may disable file access.
+        sidecar = duckdb.connect(str(path), read_only=True)
+        try:
+            run = json.loads(sidecar.execute("SELECT metadata FROM enrichment_run").fetchone()[0])
+            if run.get("schema_version") != SCHEMA:
+                raise ValueError(f"{path}: unsupported enrichment sidecar; rebuild it with `kamotrace enrich --replace`")
+            if (run["evidence_source_sha256"], run["evidence_records"]) != evidence_identity(connection):
+                raise ValueError(f"{path} was built for a different evidence database; rebuild it with `kamotrace enrich`")
+            rows = sidecar.execute("""SELECT ip, source, country, country_code, city, asn, as_org, attributes
+                FROM ip_enrichment ORDER BY ip, priority""").fetchall()
+        finally:
+            sidecar.close()
     merged = {}
     for ip, source, country, code, city, asn, org, attributes in rows:
         values, info = merged.setdefault(ip, ({}, []))
@@ -200,6 +233,12 @@ def load_enrichment(connection, path):
                 values.setdefault(name, value)
         for key, value in sorted(json.loads(attributes or "{}").items()):
             info.append(f"{source}.{key}={value if isinstance(value, str) else json.dumps(value)}")
+    # Use original source text as the join key, including non-canonical IPv6 spellings.
+    for (ip,) in connection.execute("SELECT DISTINCT source_ip FROM events WHERE source_ip IS NOT NULL").fetchall():
+        label = address_class(ip)
+        if label is not None:
+            values, _ = merged.setdefault(ip, ({}, []))
+            values.setdefault("country", label)
     if merged:
         connection.executemany("INSERT INTO ip_enrichment VALUES (?,?,?,?,?,?)",
                                [(ip, v.get("country"), v.get("city"), v.get("asn"), v.get("isp"), "; ".join(i) or None)

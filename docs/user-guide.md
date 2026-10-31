@@ -118,7 +118,7 @@ Install the
 
 ```powershell
 Copy-Item -Recurse C:\path\to\KamoTrace\skills\investigating-with-kamotrace $HOME\.claude\skills\
-claude mcp add kamotrace -- kamotrace mcp --url http://127.0.0.1:8765
+claude mcp add --transport http kamotrace http://127.0.0.1:8765/mcp
 ```
 
 Then ask, for example: *"Use KamoTrace to check whether any access key was used
@@ -167,11 +167,12 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | Option | Purpose | Default |
 | --- | --- | --- |
 | `--database PATH` | Imported evidence database (required) | — |
-| `--enrichment PATH` | IP enrichment sidecar from `kamotrace enrich` | `<database stem>.enrichment.duckdb` if present; otherwise countries show as unmapped |
+| `--enrichment PATH` | IP enrichment sidecar from `kamotrace enrich` | `<database stem>.enrichment.duckdb` if present; otherwise special-use addresses are classified and other countries show as unmapped |
 | `--annotations PATH` | Notes and tags SQLite sidecar | `<database stem>.annotations.sqlite3` |
 | `--detections PATH` | Suzaku detections sidecar | `<database stem>.detections.duckdb` if present |
 | `--ssm-export PATH` | Consolidated SSM command/output JSON | None; optional |
 | `--port NUMBER` | Local listening port | `8765` |
+| `--mcp-transport http\|stdio` | Serve MCP at `/mcp`, or print local stdio adapter setup commands; also accepted by `auto` | `http` |
 | `--bind ADDRESS` | Listening address; only for containers (see [Docker](#docker)) | `127.0.0.1` (`0.0.0.0` in the image) |
 
 Paths are relative to your terminal's current folder unless absolute. Quote
@@ -304,19 +305,21 @@ use `--port 8766 -p 127.0.0.1:8766:8766`. Other containers on the same Docker
 network can also reach the port; don't attach the container to shared
 networks.
 
-Agents connect with the MCP adapter inside the running container (no extra
-port). For Claude Code:
+Agents connect to `/mcp` on the same published port (no extra port or local
+KamoTrace installation). For Claude Code:
 
 ```powershell
-claude mcp add kamotrace -- docker exec -i kamotrace kamotrace mcp --url http://127.0.0.1:8765
+claude mcp add --transport http kamotrace http://127.0.0.1:8765/mcp
 ```
 
 or in a JSON MCP client configuration:
 
 ```json
-{"mcpServers": {"kamotrace": {"command": "docker",
-  "args": ["exec", "-i", "kamotrace", "kamotrace", "mcp", "--url", "http://127.0.0.1:8765"]}}}
+{"mcpServers": {"kamotrace": {"url": "http://127.0.0.1:8765/mcp"}}}
 ```
+
+For a stdio-only client, use
+`claude mcp add kamotrace -- docker exec -i kamotrace kamotrace mcp --url http://127.0.0.1:8765`.
 
 On Linux, add `--user "$(id -u):$(id -g)"` to `docker run` so files in the case
 folder belong to you.
@@ -408,6 +411,17 @@ Detections are automated leads: tag events or record a finding about what you ob
 Source IPs can be enriched offline with country, city, ASN and network, plus any
 extra fields your own provider supplies. Enrichment is a labelled lookup about
 an address, not evidence, and is never written into the evidence database.
+
+Without a provider country value, **Country** shows a built-in special-use label:
+`(private)` for RFC 1918 IPv4 and IPv6 unique-local addresses (`fc00::/7`),
+or `(loopback)`, `(link-local)`, `(multicast)`, `(unspecified)`,
+`(shared address space)` (carrier-grade NAT), `(documentation)`, `(benchmarking)`,
+`(limited broadcast)`, `(site-local)`, `(reserved)` or `(special-purpose)`.
+IPv4-mapped IPv6 addresses use the embedded IPv4 classification. These labels
+work without a sidecar or downloads and can be filtered like other Country values;
+they are address classifications, not geographic claims. Existing provider values
+and attributes retain their priority. Restart the server to pick up this behavior;
+there is no need to rebuild enrichment sidecars.
 
 ### Choose an IP data source
 
@@ -850,39 +864,45 @@ with `search_ssm_log`, `get_ssm_log_entry` and `edit_ssm_log_entry`.
 
 ## Agent access (MCP)
 
-`kamotrace mcp` lets local AI agents (Claude Code, Amp, Claude Desktop or any
+KamoTrace lets local AI agents (Claude Code, Amp, Claude Desktop or any
 [Model Context Protocol](https://modelcontextprotocol.io/) client) search the
-evidence, tag/untag events and read/write notes. It uses the official MCP
-Python SDK over **stdio**: the client starts it as a subprocess, so it opens no
-port of its own. It has **no authentication** and holds no database handle.
+evidence, tag/untag events and read/write notes. By default, `kamotrace serve`
+uses the official MCP Python SDK over **Streamable HTTP** at
+`http://127.0.0.1:8765/mcp`, sharing the web server's port. The optional
+`kamotrace mcp` adapter uses **stdio**, started as a subprocess by the client.
+Neither transport adds another listening port. MCP has **no authentication**
+and holds no database handle.
 Every tool calls the already running browser server's REST API on loopback, so
 the browser and agents share one authoritative state: the same read-only
 evidence connection, the same validation, and the same notes/tags sidecar.
 
 ```text
-agent client ──stdio──▶ kamotrace mcp ──HTTP, 127.0.0.1──┐
-browser tab ─────────────────────────────HTTP, 127.0.0.1──┴─▶ kamotrace serve ─┬─▶ evidence DuckDB (read-only)
-                                                                               ├─▶ detections DuckDB (read-only)
-                                                                               └─▶ notes/tags SQLite sidecar
+agent client -- HTTP --> /mcp ---------> loopback REST API
+agent client -- stdio -> kamotrace mcp -> loopback REST API
+browser tab --------------------------> loopback REST API
+                                              |
+                                        one shared Store
+                                              |
+                         evidence/detections DuckDB (read-only)
+                         notes/tags SQLite sidecar (writable)
 ```
 
 ### Connect your client
 
 Start the browser server first (as in the [end-to-end example](#end-to-end-example)), then register
-the adapter with your client. Use the browser's port if you changed it with
-`--port`. These examples assume `kamotrace` is installed (`uv tool install`);
-otherwise use `uv run --directory C:\path\to\KamoTrace kamotrace mcp ...`.
+the URL with your client. Startup prints the exact URL and commands for the
+selected port; use that port if you changed it with `--port`.
 
 Claude Code:
 
 ```powershell
-claude mcp add kamotrace -- kamotrace mcp --url http://127.0.0.1:8765
+claude mcp add --transport http kamotrace http://127.0.0.1:8765/mcp
 ```
 
 Amp:
 
 ```powershell
-amp mcp add kamotrace -- kamotrace mcp --url http://127.0.0.1:8765
+amp mcp add kamotrace http://127.0.0.1:8765/mcp
 ```
 
 Other clients (for example Claude Desktop's `claude_desktop_config.json`, or a
@@ -892,14 +912,25 @@ project `.mcp.json`; Amp's settings file uses the key `amp.mcpServers`):
 {
   "mcpServers": {
     "kamotrace": {
-      "command": "kamotrace",
-      "args": ["mcp", "--url", "http://127.0.0.1:8765"]
+      "url": "http://127.0.0.1:8765/mcp"
     }
   }
 }
 ```
 
-`--url` only accepts `http://127.0.0.1:<port>` or `http://localhost:<port>`, and
+For a local subprocess connection, start `serve` (or `auto`) with
+`--mcp-transport stdio`. This disables `/mcp` and prints commands to register the
+stdio adapter instead:
+
+```powershell
+amp mcp add kamotrace -- kamotrace mcp --url http://127.0.0.1:8765
+claude mcp add kamotrace -- kamotrace mcp --url http://127.0.0.1:8765
+```
+
+The stdio adapter also works while HTTP MCP is enabled. It requires `kamotrace`
+on the agent's PATH (`uv tool install`); otherwise replace `kamotrace mcp ...`
+with `uv run --directory C:\path\to\KamoTrace kamotrace mcp ...`.
+Its `--url` only accepts `http://127.0.0.1:<port>` or `http://localhost:<port>`, and
 the adapter ignores system proxies. If the browser server is not running, tools
 return a "cannot reach" error; start it and retry.
 
@@ -1097,8 +1128,8 @@ cross-origin rejection, BOM-prefixed inputs, sidecar-to-evidence binding, exact 
 integers, local histogram boundaries/custom widths/empty buckets, and a database
 SHA-256 before/after check. Coverage also includes annotation/tag persistence,
 stale note edit/delete rejection, SSM account/region linkage, multiple
-systems/plugins, missing/combined output, spreadsheet search/sorting, and a
-real stdio MCP client session (search, tag/untag, note create/edit/link/unlink,
+systems/plugins, missing/combined output, spreadsheet search/sorting, and
+real HTTP and stdio MCP client sessions (search, tag/untag, note create/edit/link/unlink,
 invalid input, raw-hash check) whose writes are checked through the browser API,
 and Suzaku import (exact eventID/region/time linkage, correlation rows linked to
 every member or not at all, unmatched rows kept but not shown, rule AND filters,

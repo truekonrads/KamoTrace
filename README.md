@@ -289,6 +289,10 @@ server running while you investigate. It loads the IP enrichment and Suzaku
 detection files beside `case.duckdb` automatically when they are present.
 Startup logs on stderr show timestamped loading stages and sidecar paths before
 the server accepts requests, followed by the total startup time and ready URL.
+MCP is served at **http://127.0.0.1:8765/mcp** on the same port by default.
+Startup prints the URL and Amp/Claude Code setup commands. For a local subprocess
+connection instead, use `--mcp-transport stdio`; startup then prints the stdio
+registration commands. Both `serve` and `auto` accept this option.
 If startup is slow, the last stage message identifies the work still in progress.
 
 ### 6. Find events and save findings

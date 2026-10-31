@@ -155,6 +155,8 @@ def parser():
     ui = parser.add_argument_group("browser UI (kamotrace serve)")
     ui.add_argument("--no-serve", action="store_true", help="Prepare the case and exit without starting the UI")
     ui.add_argument("--port", type=int, default=8765)
+    ui.add_argument("--mcp-transport", choices=("http", "stdio"), default="http",
+                    help="MCP over HTTP at /mcp (default), or local stdio adapter setup")
     return parser
 
 
@@ -376,7 +378,8 @@ def main(argv=None):
             return 0
         locks.close()  # Preparation is done; the server only reads the database and sidecars.
         say(stage, "starting the local browser UI (Ctrl+C to stop)")
-        run_command(server.main, ["--database", str(database), "--port", str(args.port)] +
+        run_command(server.main, ["--database", str(database), "--port", str(args.port),
+                                 "--mcp-transport", args.mcp_transport] +
                     (["--ssm-export", str(ssm_export)] if ssm_export else []), "serve")
         return 0
     except KeyboardInterrupt:

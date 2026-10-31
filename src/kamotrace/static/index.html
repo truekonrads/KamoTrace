@@ -136,8 +136,15 @@
           <div class="time-row">
             <strong>Time</strong>
             <label
-              >Timezone<select id="timezone" aria-label="Timezone"></select
-            ></label>
+              >Timezone<input
+                id="timezone"
+                aria-label="Timezone"
+                list="timezone-choices"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </label>
+            <datalist id="timezone-choices"></datalist>
             <span class="hint">[from, until)</span>
             <label
               >From<input
@@ -323,7 +330,12 @@
         <div id="error" role="alert" hidden></div>
         <span id="cell-feedback" class="sr-only" role="status"></span>
         <section class="results" aria-label="Event results">
-          <div id="events"></div>
+          <div class="grid-container">
+            <div id="events"></div>
+            <div id="events-loading" class="grid-loading" role="status" hidden>
+              Loading more events…
+            </div>
+          </div>
         </section>
 
         <section id="commands-panel" hidden aria-label="SSM command browser">
@@ -407,7 +419,12 @@
             hidden
             aria-label="Command output spreadsheet"
           >
-            <div id="command-sheet"></div>
+            <div class="grid-container">
+              <div id="command-sheet"></div>
+              <div id="sheet-loading" class="grid-loading" role="status" hidden>
+                Loading more rows…
+              </div>
+            </div>
             <div class="sheet-footer">
               <span id="sheet-load-status" role="status"></span>
               <button id="more-sheet" hidden>Load more rows</button>

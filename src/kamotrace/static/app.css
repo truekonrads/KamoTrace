@@ -731,6 +731,46 @@ main {
   color: var(--error);
 }
 
+.grid-container {
+  position: relative;
+}
+.grid-loading {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #fff;
+  color: var(--ink);
+  box-shadow: 0 2px 8px #103b5533;
+  pointer-events: none;
+}
+.grid-loading::before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--line);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: grid-spin 0.8s linear infinite;
+}
+@keyframes grid-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .grid-loading::before {
+    animation: none;
+  }
+}
+
 /* Event grid: dense fixed-height rows. */
 .results {
   background: white;

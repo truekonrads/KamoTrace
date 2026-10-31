@@ -20,7 +20,7 @@ COMMANDS = {
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),
     "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2-format .mmdb and/or provider-neutral JSONL"),
-    "serve": ("kamotrace.server", "Start the local browser UI on 127.0.0.1"),
+    "serve": ("kamotrace.server", "Start the local browser UI and HTTP MCP at /mcp on 127.0.0.1"),
     "mcp": ("kamotrace.mcp_server", "Stdio MCP adapter for agents, backed by a running `kamotrace serve`"),
 }
 

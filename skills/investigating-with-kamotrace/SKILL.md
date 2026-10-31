@@ -37,10 +37,16 @@ If the tools are missing or fail with "Cannot reach the CloudTrail browser",
 the analyst must start the server; don't start one yourself unless asked.
 
 ```text
-kamotrace serve --database C:\case\case.duckdb            # browser + API on 127.0.0.1:8765
-claude mcp add kamotrace -- kamotrace mcp --url http://127.0.0.1:8765
-# Docker: claude mcp add kamotrace -- docker exec -i kamotrace kamotrace mcp --url http://127.0.0.1:8765
+kamotrace serve --database C:\case\case.duckdb            # browser + API + HTTP MCP on 127.0.0.1:8765
+claude mcp add --transport http kamotrace http://127.0.0.1:8765/mcp
+amp mcp add kamotrace http://127.0.0.1:8765/mcp
 ```
+
+Startup prints the correct URL and setup commands for the selected port.
+For stdio-only clients, use `serve --mcp-transport stdio` and register
+`kamotrace mcp --url http://127.0.0.1:8765` as the subprocess; startup prints
+the full Amp and Claude Code commands. In Docker, HTTP uses the same published
+loopback port; stdio uses `docker exec -i kamotrace kamotrace mcp --url http://127.0.0.1:8765`.
 
 Loading data is a separate command-line step done before serving (only when the
 analyst asks you to). It never overwrites evidence:

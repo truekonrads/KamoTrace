@@ -611,11 +611,42 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def mcp_request(self):
+        transport = getattr(self.server, "mcp_request", None)
+        if transport is None:
+            self.respond({"error": "HTTP MCP is disabled; use the stdio adapter"}, 404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or length > 1048576 or self.headers.get("Transfer-Encoding"):
+                raise ValueError("Request must contain at most 1 MB of JSON with Content-Length")
+        except ValueError as error:
+            self.respond({"error": str(error)}, 400)
+            return
+        response = transport(self.command, self.path, dict(self.headers), self.rfile.read(length))
+        self.send_response(response.status_code)
+        for name, value in response.headers.items():
+            if name.lower() not in ("content-length", "transfer-encoding", "connection"):
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(response.content)))
+        self.end_headers()
+        self.wfile.write(response.content)
+
+    def do_DELETE(self):
+        if not self.allowed():
+            return
+        if urlsplit(self.path).path == "/mcp":
+            self.mcp_request()
+        else:
+            self.respond({"error": "Not found"}, 404)
+
     def do_GET(self):
         if not self.allowed():
             return
         path = urlsplit(self.path).path
-        if path == "/api/meta":
+        if path == "/mcp":
+            self.mcp_request()
+        elif path == "/api/meta":
             self.respond(self.store.meta)
         elif path == "/api/reviews":
             self.respond(self.store.reviews_list())
@@ -638,6 +669,9 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         if not self.allowed():
+            return
+        if urlsplit(self.path).path == "/mcp":
+            self.mcp_request()
             return
         if self.path not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review"):
             self.respond({"error": "Not found"}, 404)
@@ -670,6 +704,8 @@ def main(argv=None):
     parser.add_argument("--enrichment", type=Path,
                         help="IP enrichment from `kamotrace enrich` (default: <database>.enrichment.duckdb if present)")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--mcp-transport", choices=("http", "stdio"), default="http",
+                        help="MCP over HTTP at /mcp (default), or setup instructions for the local stdio adapter")
     # Containers must listen on all interfaces so Docker can publish the port; the image sets
     # KAMOTRACE_BIND=0.0.0.0 and the README publishes it on the host's 127.0.0.1 only.
     parser.add_argument("--bind", default=os.environ.get("KAMOTRACE_BIND", "127.0.0.1"),
@@ -698,10 +734,23 @@ def main(argv=None):
         print(f"Listening on {args.bind}:{args.port}: anyone who can reach this port gets unauthenticated "
               f"access. Publish it only as 127.0.0.1:{args.port}:{args.port}.", flush=True)
     detections = (f" | {store.suzaku_run['linked_rows']:,} Suzaku detections" if store.suzaku_run else "")
-    logger.info("Startup complete in %.1fs", time.monotonic() - started)
-    print(f"KamoTrace: http://127.0.0.1:{server.server_port} | {store.meta['total']:,} events{detections} | read-only", flush=True)
     try:
-        server.serve_forever()
+        with ExitStack() as transports:
+            base = f"http://127.0.0.1:{server.server_port}"
+            if args.mcp_transport == "http":
+                from .mcp_server import http_transport
+                server.mcp_request = transports.enter_context(http_transport(base))
+                setup = (f"MCP (HTTP): {base}/mcp\nConnect your agent using this URL, or run:\n"
+                         f"  amp mcp add kamotrace {base}/mcp\n"
+                         f"  claude mcp add --transport http kamotrace {base}/mcp")
+            else:
+                setup = ("MCP (stdio): add the local adapter to your agent (keep this server running):\n"
+                         f"  amp mcp add kamotrace -- kamotrace mcp --url {base}\n"
+                         f"  claude mcp add kamotrace -- kamotrace mcp --url {base}")
+            logger.info("Startup complete in %.1fs", time.monotonic() - started)
+            print(f"KamoTrace: {base} | {store.meta['total']:,} events{detections} | read-only", flush=True)
+            print(setup, flush=True)
+            server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:

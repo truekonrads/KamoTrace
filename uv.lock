@@ -502,8 +502,10 @@ name = "kamotrace"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "boto3", extra = ["crt"] },
     { name = "duckdb" },
+    { name = "httpx2" },
     { name = "ijson" },
     { name = "maxminddb" },
     { name = "mcp" },
@@ -518,8 +520,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4,<5" },
     { name = "boto3", extras = ["crt"], specifier = ">=1.35,<2" },
     { name = "duckdb", specifier = ">=2.0,<2.1" },
+    { name = "httpx2", specifier = ">=2.16,<3" },
     { name = "ijson", specifier = ">=3.3,<4" },
     { name = "maxminddb", specifier = ">=2.6,<4" },
     { name = "mcp", specifier = ">=2.3,<3" },

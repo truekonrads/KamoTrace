@@ -1,4 +1,4 @@
-"""MCP (stdio) adapter for a running KamoTrace browser. Run with: kamotrace mcp --url http://127.0.0.1:8765
+"""MCP adapter: HTTP at the browser's /mcp, or stdio with kamotrace mcp --url http://127.0.0.1:8765.
 
 The browser server (`kamotrace serve`) stays the single owner of the read-only evidence database and the
 annotation sidecar. This process opens neither: every tool is a call to the browser's existing
@@ -6,6 +6,8 @@ loopback REST API, so validation, timezone handling, tag/note writes and their t
 refresh happen in one place and the browser and agents see each other's changes.
 """
 import argparse
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import hashlib
@@ -15,12 +17,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
+from anyio.from_thread import start_blocking_portal
+import httpx2
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 BASE = "http://127.0.0.1:8765"
+HTTP_BASE = ContextVar("kamotrace_http_base", default=None)
 NEW_TAG_COLOR = "#c45436"  # Same default as the browser's quick-tag colour picker.
 OPENER = build_opener(ProxyHandler({}))  # Never route loopback evidence traffic through a system proxy.
 
@@ -80,7 +85,8 @@ class Sort(BaseModel):
 
 
 def call(path, body=None):
-    request = Request(BASE + path, method="POST" if body is not None else "GET",
+    base = HTTP_BASE.get() or BASE
+    request = Request(base + path, method="POST" if body is not None else "GET",
                       data=None if body is None else json.dumps(body).encode("utf-8"),
                       headers={"Content-Type": "application/json"})
     try:
@@ -93,7 +99,27 @@ def call(path, body=None):
             message = None
         raise ToolError(message or f"Browser server returned HTTP {error.code}") from None
     except URLError as error:
-        raise ToolError(f"Cannot reach the CloudTrail browser at {BASE} ({error.reason}); start `kamotrace serve` first") from None
+        raise ToolError(f"Cannot reach the CloudTrail browser at {base} ({error.reason}); start `kamotrace serve` first") from None
+
+
+@contextmanager
+def http_transport(base):
+    """Bridge the SDK's stateless ASGI transport to the existing threaded HTTP server."""
+    app = mcp.streamable_http_app(json_response=True, stateless_http=True)
+    with ExitStack() as stack:
+        portal = stack.enter_context(start_blocking_portal())
+        stack.enter_context(portal.wrap_async_context_manager(app.router.lifespan_context(app)))
+        client = stack.enter_context(portal.wrap_async_context_manager(
+            httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=base)))
+
+        async def request(method, path, headers, body):
+            token = HTTP_BASE.set(base)
+            try:
+                return await client.request(method, path, headers=headers, content=body)
+            finally:
+                HTTP_BASE.reset(token)
+
+        yield lambda method, path, headers, body: portal.call(request, method, path, headers, body)
 
 
 def rows(result):

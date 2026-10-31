@@ -480,6 +480,7 @@ function commandLayout(sheet, log = false) {
   ++sheetRequest;
   // A layout switch abandons any in-flight log request; let the next one start.
   logBusy = false;
+  $("sheet-loading").hidden = true;
   $("command-browser-panel").hidden = sheet || log;
   $("command-sheet-panel").hidden = !sheet;
   $("command-log-panel").hidden = !log;
@@ -1276,6 +1277,7 @@ function createCommandSheet() {
     ajaxURL: "/api/ssm-sheet",
     ajaxRequestFunc: async (_url, _config, params) => {
       const token = ++sheetRequest;
+      $("sheet-loading").hidden = true;
       sheetBusy = true;
       sheetPage = 1;
       sheetTotal = 0;
@@ -1372,6 +1374,7 @@ async function loadMoreSheet() {
     return;
   const token = sheetRequest;
   sheetBusy = true;
+  $("sheet-loading").hidden = false;
   sheetStatus();
   try {
     const result = await request("/api/ssm-sheet", {
@@ -1386,6 +1389,7 @@ async function loadMoreSheet() {
   } finally {
     if (token === sheetRequest) {
       sheetBusy = false;
+      $("sheet-loading").hidden = true;
       sheetStatus();
     }
   }
@@ -2507,6 +2511,7 @@ async function loadMore() {
     return;
   const requestId = latestQuery;
   loadingMore = true;
+  $("events-loading").hidden = false;
   $("load-status").textContent = "Loading more…";
   try {
     const result = await request("/api/events", {
@@ -2528,7 +2533,10 @@ async function loadMore() {
         "Could not load more. Scroll up and down to retry.";
     }
   } finally {
-    if (requestId === latestQuery) loadingMore = false;
+    if (requestId === latestQuery) {
+      loadingMore = false;
+      $("events-loading").hidden = true;
+    }
   }
 }
 
@@ -3117,12 +3125,18 @@ async function init() {
   if (meta.timezones.includes(preferred))
     meta = await request("/api/meta", { timezone: preferred });
   for (const zone of meta.timezones)
-    $("timezone").append(new Option(zone, zone));
+    $("timezone-choices").append(new Option(zone, zone));
   $("timezone").value = meta.timezone;
   $("start").setAttribute("aria-label", `From (inclusive), ${meta.timezone}`);
   $("end").setAttribute("aria-label", `Until (exclusive), ${meta.timezone}`);
-  $("timezone").onchange = () =>
-    apply({ ...applied, timezone: $("timezone").value });
+  $("timezone").onchange = () => {
+    const zone = $("timezone").value;
+    if (meta.timezones.includes(zone)) {
+      if (zone !== meta.timezone) apply({ ...applied, timezone: zone });
+    } else {
+      $("timezone").value = meta.timezone;
+    }
+  };
   applied = normalize({});
   queryHistory.push(applied);
   historyPos = 0;
@@ -3467,6 +3481,7 @@ async function init() {
       const requestId = ++latestQuery;
       loadingFirst = true;
       loadingMore = false;
+      $("events-loading").hidden = true;
       nextPage = 2;
       selectedEvents.clear();
       selectionStatus();
