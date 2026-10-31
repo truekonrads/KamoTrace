@@ -71,6 +71,10 @@ def matches_request(manifest, args):
               "compress": args.compress, "session_s3": sorted(set(args.session_s3)),
               "session_log_groups": sorted(set(args.session_log_group)),
               "start": download.iso(download.timestamp(args.start)) if args.start else None}
+    source = "auto" if args.cloudtrail_source == "auto" and args.start and args.end else "history"
+    # Legacy history snapshots predate source selection; the new default must not recollect them.
+    if manifest.get("cloudtrail_source", source) != source or manifest.get("cloudtrail_s3", []):
+        return False
     if any(manifest.get(key, False if key == "compress" else None) != value for key, value in wanted.items()):
         return False
     if args.end:
@@ -128,6 +132,8 @@ def parser():
     aws.add_argument("--start", help="Inclusive ISO timestamp with offset, or UTC date (default: all available history)")
     aws.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date (default: first run's start time, kept on resume)")
     aws.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm"), default=["cloudtrail", "ssm"])
+    aws.add_argument("--cloudtrail-source", choices=("auto", "history"), default="auto",
+                     help="With explicit --start/--end, prefer S3 only when trailcheck verifies every Region/day; history disables S3")
     aws.add_argument("--compress", action="store_true", help="Gzip generated CloudTrail/SSM/CloudWatch JSON")
     aws.add_argument("--progress", choices=("auto", "bar", "log", "off"), default="auto")
     aws.add_argument("--session-s3", action="append", default=[], metavar="s3://BUCKET/PREFIX")
@@ -286,6 +292,8 @@ def main(argv=None):
                     else f"collecting into {folder} with the existing AWS login")
                 argv = ["--dest", str(folder), "--regions", *args.regions, "--services", *args.services,
                         "--progress", args.progress]
+                if args.cloudtrail_source == "auto" and args.start and args.end:
+                    argv += ["--cloudtrail-source", "auto"]
                 for flag, value in (("--profile", args.profile), ("--start", args.start), ("--end", args.end)):
                     if value:
                         argv += [flag, value]

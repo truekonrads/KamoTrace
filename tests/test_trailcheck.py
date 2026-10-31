@@ -239,6 +239,27 @@ class TrailcheckContract(unittest.TestCase):
                                          "Transitions": [{"Days": 90, "StorageClass": "GLACIER"}]}]}}})}
         return FakeAWS(routes, objects)
 
+    def test_requested_range_requires_every_day_and_region_not_just_endpoints(self):
+        for missing in (None, ("us-east-1", "2026-10-02"), ("ap-southeast-1", "2026-10-01")):
+            with self.subTest(missing=missing):
+                aws = self.scenario()
+                for region in ("us-east-1", "ap-southeast-1"):
+                    for day in ("2026-10-01", "2026-10-02", "2026-10-03"):
+                        owner = OTHER if (region, day) == missing else ACCOUNT
+                        aws.objects["synthetic-trail-logs"].append(log_key("audit/", owner, region, day))
+                        if (region, day) == missing:
+                            nested = log_key("audit/", ACCOUNT, region, day).rsplit("/", 1)
+                            aws.objects["synthetic-trail-logs"].append(nested[0] + "/backup/" + nested[1])
+                stdout, _ = self.run_cli(aws, "--regions", "us-east-1", "ap-southeast-1",
+                                         "--start", "2026-10-01", "--end", "2026-10-03", "--json", "-", status=1)
+                requested = json.loads(stdout)["requested_range"]
+                self.assertEqual(requested["verified"], missing is None)
+                checked = {(item["region"], day["date"]): day["verification"]
+                           for item in requested["locations"] for day in item["days"]}
+                self.assertEqual(len(checked), 6)
+                if missing:
+                    self.assertEqual(checked[missing], "not_verified")
+
     def test_reports_configuration_observed_prefixes_verified_days_and_unknowns(self):
         aws = self.scenario()
         stdout, stderr = self.run_cli(aws, "--json", "-", status=1)

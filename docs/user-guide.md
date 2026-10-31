@@ -246,7 +246,7 @@ other commands' code in dependency order, printing `[N/7 stage]` progress to std
 | --- | --- | --- |
 | 1. `get-suzaku` | Newest Suzaku installed in the tools folder; otherwise download and verify the latest 3.x | `--suzaku EXE`, `--suzaku-version X.Y.Z` (that exact version, installed or downloaded), `--timeline FILE`, `--skip-suzaku` |
 | 2. `get-dbip` | Newest complete DB-IP Lite folder in the tools folder; otherwise download and verify | `--geolite2 FOLDER` and/or `--jsonl FILE` (earlier wins), `--skip-enrich` |
-| 3. `download` | `CASE_FOLDER/download`, all enabled regions, CloudTrail and SSM, maximum available history | `--download-dir`, `--profile`, `--regions`, `--start`, `--end`, `--services`, `--compress`, `--progress`, `--session-s3`, `--session-log-group`; `--source FILE...` or `--skip-download` to use existing data |
+| 3. `download` | `CASE_FOLDER/download`, all enabled regions, CloudTrail and SSM, maximum available history; with explicit dates, S3 only after every Region/day is verified | `--download-dir`, `--profile`, `--regions`, `--start`, `--end`, `--cloudtrail-source auto\|history`, `--services`, `--compress`, `--progress`, `--session-s3`, `--session-log-group`; `--source FILE...` or `--skip-download` to use existing data |
 | 4. `import` | `CASE_FOLDER/case.duckdb` from `cloudtrail.json[.gz]` | `--database` |
 | 5. `enrich` | `<database stem>.enrichment.duckdb` from DB-IP Lite | as stage 2 |
 | 6. `suzaku` | `<database stem>.detections.duckdb`, running Suzaku on the imported CloudTrail file | `--rules`, `--min-level` |
@@ -321,6 +321,7 @@ Event History's 90 days, or to judge the gaps in what you have:
 ```powershell
 kamotrace trailcheck --profile investigation
 kamotrace trailcheck --regions us-east-1 ap-southeast-1 --json C:\cases\example\trailcheck.json
+kamotrace trailcheck --regions us-east-1 ap-southeast-1 --start 2026-10-01 --end 2026-10-03
 kamotrace trailcheck --json - --probe-buckets > C:\cases\example\trailcheck.json
 ```
 
@@ -329,6 +330,33 @@ Get and List APIs. It changes nothing in AWS, and it lists log objects without
 downloading them. The readable summary goes to stdout. `--json PATH` also
 writes the full report to a new file; it refuses to overwrite an existing one.
 `--json -` writes the JSON to stdout and moves the summary to stderr.
+
+With `--start` and `--end` together, trailcheck additionally verifies each UTC
+day in that inclusive range for every selected Region, using only the current
+account's paths. `requested_range.locations` records each location's day results;
+`requested_range.verified` is true only when every Region/day has a matching
+nonempty log object. This is independent of unreadable bucket settings that may
+make the overall audit partial. Verification samples at most 20 objects per day,
+within the shared S3 call budget: an unverified day is not proof of absence.
+
+Dated `auto` (both dates explicitly supplied) and `download --cloudtrail-source auto`
+use this result to select S3; otherwise they retain Event History and warn about
+its 90-day management-event retention. The audit is saved as `trailcheck.json`
+in the collection directory, and the source choice is frozen for resume.
+After the presence gate passes, every requested date at every discovered
+current-account/Region root is fully listed, not just dates whose 20-object
+sample verified. Failed or denied collection listings stop the run; they do
+not silently remove a root from the collection. Existing history checkpoints
+keep their original source, even when resuming a pre-S3 dated auto run with the
+new default. Completed legacy cases still reuse without AWS calls.
+`auto --cloudtrail-source history` disables discovery. Known destinations can
+instead be collected directly with `download --cloudtrail-s3
+s3://BUCKET/[prefix/]AWSLogs/[o-org/]ACCOUNT/CloudTrail/` and explicit dates.
+The account must match the authenticated account. See the
+[S3 download example and limitations](../README.md#download-from-an-existing-aws-login).
+Only selected UTC delivery-date folders are collected; records are then filtered
+by event time. Late deliveries outside those folders are not recovered. Original
+gzip objects, ETags and checksums are retained; digest validation is not performed.
 
 The report keeps four kinds of statement apart:
 

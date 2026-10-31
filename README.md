@@ -72,6 +72,21 @@ including the collection's frozen time range. See
 [full-auto preparation](docs/user-guide.md#full-auto-preparation) for all
 options and recovery rules.
 
+With explicit `--start` **and** `--end`, auto first runs trailcheck and prefers
+S3 only if it verifies a matching nonempty CloudTrail log object for **every
+requested Region and UTC day**, for the authenticated account. Missing, denied
+or budget-limited verification keeps Event History (90-day management-event
+retention only); it does not claim that S3 logs are absent. Use
+`--cloudtrail-source history` to disable this check. Without both dates, auto
+keeps its existing Event History behavior. The source decision and discovered
+locations are frozen in the checkpoint; the audit is saved as `download/trailcheck.json`.
+Once the presence gate passes, collection fully lists every requested day at
+every discovered current-account/Region root, including roots whose sample
+found no matching object. A denied collection listing stops the run rather than
+silently dropping that root. Existing history checkpoints, including those from
+before S3 support, retain their original source on resume; use a new destination
+to collect a different source.
+
 #### Current AWS network inventory
 
 ```powershell
@@ -142,6 +157,32 @@ The bundled SDK dependency includes CRT support for credentials created by `aws 
 kamotrace download --profile investigation --dest C:\cases\example\download --regions all --start 2026-10-01 --end 2026-10-02
 ```
 
+To download a known S3 trail instead of Event History, point at the
+`CloudTrail/` root, **before** the Region/date directories (repeat
+`--cloudtrail-s3` for multiple roots):
+
+```powershell
+kamotrace download --profile investigation --dest C:\cases\example\s3-download --regions ap-southeast-1 us-east-1 --start 2026-10-01 --end 2026-10-02 --services cloudtrail --cloudtrail-s3 s3://example-trail-logs/audit/AWSLogs/123456789012/CloudTrail/
+```
+
+Use your authenticated account ID in the path. Organization paths such as
+`AWSLogs/o-example/123456789012/CloudTrail/` also work. Both dates are required.
+This direct mode does not require trail discovery permissions; it needs
+`s3:GetBucketLocation`, `s3:ListBucket`, `s3:GetObject` and, for KMS-encrypted
+objects, `kms:Decrypt`. Alternatively `download --cloudtrail-source auto` uses
+the same trailcheck gate as dated auto mode (including its Describe/Get/List permissions).
+
+S3 collection lists all pages under the selected UTC delivery-date folders,
+downloads only matching nonempty account/Region/date `.json.gz` log files,
+and filters records by the inclusive event-time range. Original compressed
+objects, ETags and SHA-256 hashes are retained under `logs/`; the importable
+`cloudtrail.json` preserves numeric precision, removes identical records and
+keeps differing records even when they share an event ID. Log objects are
+parsed but not CloudTrail digest-validated. **Late deliveries into folders
+outside the requested dates are not included**, and presence of a log object
+does not establish complete delivery. No CloudTrail Lake, Insights or digest
+objects are collected. Completed listings are snapshots, not refreshed on resume.
+
 - `--regions all` selects enabled regions in the current account/partition
   (requires `ec2:DescribeRegions`). Or choose explicit regions, e.g.
   `--regions ap-southeast-1 us-east-1`. Set your AWS default region for the
@@ -209,8 +250,8 @@ account/partition, range, regions, services, compression or log locations. Use a
 for a fresh snapshot: completed requests are not refreshed, including active
 commands/sessions or logs delivered later. Do not run two collectors in one directory.
 
-The destination contains `cloudtrail.json` (one importable `Records` array, with
-original event JSON preserved), `ssm.json` (commands, per-system/plugin outputs,
+The destination contains `cloudtrail.json` (one importable `Records` array:
+original Event History JSON, or precision-preserving S3 records backed by original gzip objects), `ssm.json` (commands, per-system/plugin outputs,
 active and historical session records), `logs/`, `manifest.json` (coverage and log
 source/file mapping), and `checkpoint.sqlite`. Keep the whole directory private
 and outside Git (or under ignored `data/`). Import and browse with:
@@ -253,6 +294,12 @@ before you collect or import, run this read-only check:
 ```powershell
 kamotrace trailcheck --profile investigation --json C:\cases\example\trailcheck.json
 ```
+
+Add `--start 2026-10-01 --end 2026-10-02 --regions ap-southeast-1 us-east-1`
+to verify every requested Region/day, not only the first and last observed days.
+The JSON `requested_range.verified` reports this presence check independently
+of the overall audit's `complete` flag; unreadable bucket settings can still
+make the overall report partial.
 
 The report shows each trail's Region scope, event selectors, logging and
 delivery state, and its S3 bucket's restrictions: public access block, policy,

@@ -1,6 +1,6 @@
 """Public download CLI contracts against AWS SDK-validated synthetic responses (no AWS access)."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import closing, ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from decimal import Decimal
 import gzip
@@ -484,7 +484,7 @@ class DownloadContract(unittest.TestCase):
         self.assertEqual(files[0].read_bytes(), b"old")
 
         # Emulate an older checkpoint: matching size/hash alone cannot establish an ETag binding.
-        with sqlite3.connect(self.folder / "checkpoint.sqlite") as checkpoint:
+        with closing(sqlite3.connect(self.folder / "checkpoint.sqlite")) as checkpoint:
             checkpoint.executescript("""
                 CREATE TABLE legacy_objects (name TEXT PRIMARY KEY, sha256 TEXT NOT NULL);
                 INSERT INTO legacy_objects SELECT name, sha256 FROM objects;
@@ -497,6 +497,37 @@ class DownloadContract(unittest.TestCase):
         _, error = self.run_cli(*options, status=1)
         self.assertIn("S3 object version conflict", error)
         self.assertEqual(files[0].read_bytes(), b"old")
+        for stub in self.stubs.values():
+            stub.assert_no_pending_responses()
+
+    def test_cloudtrail_s3_dates_precision_original_objects_and_resume(self):
+        root = "audit/AWSLogs/123456789012/CloudTrail/"
+        prefix = root + "us-east-1/2026/10/01/"
+        key = prefix + "123456789012_CloudTrail_us-east-1_20261001T1200Z_abc123.json.gz"
+        records = [{"eventID": "same-id", "awsRegion": "us-east-1", "eventTime": stamp,
+                    "eventName": "Synthetic", "number": Decimal("1234567890.1234567890123456789")}
+                   for stamp in ("2026-09-30T23:59:59.999999Z", "2026-10-01T00:00:00Z",
+                                 "2026-10-01T23:59:59.999999Z", "2026-10-02T00:00:00Z")]
+        data = gzip.compress(simplejson.dumps({"Records": [*records, records[1]]}, use_decimal=True).encode())
+        self.identity()
+        self.stubs["s3", "us-east-1"].add_response("get_bucket_location", {}, {"Bucket": "synthetic-logs"})
+        self.s3_page(prefix, key, data, extra_key=prefix + "notes.txt", interrupt=True)
+        options = ("--services", "cloudtrail", "--cloudtrail-s3", "s3://synthetic-logs/" + root)
+        self.run_cli(*options, status=1)
+        self.identity()
+        self.run_cli(*options)
+        exported = simplejson.loads((self.folder / "cloudtrail.json").read_text(), use_decimal=True)["Records"]
+        self.assertEqual(sorted(exported, key=lambda r: r["eventTime"]), records[1:3])
+        manifest = json.loads((self.folder / "manifest.json").read_text())
+        self.assertEqual(manifest["cloudtrail_plan"]["source"], "s3")
+        self.assertEqual(len(manifest["logs"]), 1)
+        original = self.folder / manifest["logs"][0]["file"]
+        self.assertEqual(original.read_bytes(), data)
+        self.assertEqual(manifest["logs"][0]["sha256"], hashlib.sha256(data).hexdigest())
+        # Reuse verified objects without any new list, location or GetObject calls.
+        self.identity()
+        self.run_cli(*options)
+        self.assertEqual(original.read_bytes(), data)
         for stub in self.stubs.values():
             stub.assert_no_pending_responses()
 

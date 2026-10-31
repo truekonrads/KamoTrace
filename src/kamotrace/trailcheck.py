@@ -5,7 +5,7 @@ listed, never downloaded. Denied or failed checks are reported as unknown, never
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
@@ -202,7 +202,7 @@ class Check:
             return {"date": day, "verification": "unknown", "reason": f"listing {state}"}
         compact = day.replace("-", "")
         for item in response.get("Contents", []):
-            match = LOG_NAME.match(item["Key"].rsplit("/", 1)[-1])
+            match = LOG_NAME.fullmatch(item["Key"].removeprefix(prefix))
             if match and match.groups() == (account, log_region, compact) and item.get("Size", 0) > 0:
                 return {"date": day, "verification": "verified", "object_key": item["Key"], "size": item["Size"],
                         "last_modified": item.get("LastModified")}
@@ -313,6 +313,14 @@ def valid(month, day):
         return True
     except ValueError:
         return False
+
+
+def days(start, end):
+    """UTC delivery dates touched by an inclusive collection range."""
+    day = start.date()
+    while day <= end.date():
+        yield day.isoformat()
+        day += timedelta(days=1)
 
 
 def selectors(response, state):
@@ -475,6 +483,20 @@ def audit(session, args, log):
         record["regions"].append(result)
         if result["coverage"] != "complete":
             record["coverage"] = "partial" if record["coverage"] == "complete" else record["coverage"]
+    requested = None
+    if getattr(args, "start", None) is not None:
+        requested = {"start": iso(args.start), "end": iso(args.end), "locations": []}
+        for (bucket, region, base, owner, log_region), _ in tasks:
+            if owner != account or log_region not in regions:
+                continue
+            verified = [check.verify(bucket, region, f"{base}{log_region}/{day.replace('-', '/')}/",
+                                     owner, log_region, day) for day in days(args.start, args.end)]
+            requested["locations"].append({"bucket": bucket, "bucket_region": region, "prefix": base,
+                                          "region": log_region, "days": verified})
+        requested["verified"] = all(any(
+            location["region"] == region and any(item["date"] == day and item["verification"] == "verified"
+                                                   for item in location["days"])
+            for location in requested["locations"]) for region in regions for day in days(args.start, args.end))
     for bucket in buckets:
         # Listing coverage only; unreadable restrictions are separate unknowns in errors.
         coverages = [location["coverage"] for location in bucket["locations"]]
@@ -510,6 +532,7 @@ def audit(session, args, log):
                               "with_cloudtrail": with_cloudtrail,
                               "probe_unknown": sorted(name for name, item in probed.items()
                                                       if item["coverage"] != "complete")},
+            "requested_range": requested,
             "s3_list_calls": check.s3_calls, "errors": check.errors, "truncated": check.truncated}
 
 
@@ -520,6 +543,11 @@ def render(report):
                            f"PARTIAL ({len(report['errors'])} unknown checks, {len(report['truncated'])} "
                            "truncated listings; see below)"), ""]
     lines.append(f"Trails ({len(report['trails'])})")
+    if report.get("requested_range"):
+        requested = report["requested_range"]
+        lines.append(f"Requested range {requested['start']} .. {requested['end']}: "
+                     + ("matching objects verified for every Region/day" if requested["verified"]
+                        else "NOT verified for every Region/day (missing or unknown; not proof of absence)"))
     for trail in report["trails"]:
         scope = ["multi-Region" if trail["multi_region"] else "single-Region"]
         if trail["organization_trail"]:
@@ -681,6 +709,8 @@ def main(argv=None):
         epilog="Exit status: 0 complete, 1 report produced but partial/unknown, 2 usage or credential failure.")
     parser.add_argument("--profile", help="Existing AWS profile; otherwise use the normal SDK credential chain")
     parser.add_argument("--regions", nargs="+", default=["all"], help="Region names, or all enabled Regions (default)")
+    parser.add_argument("--start", help="Verify each requested UTC day; inclusive date or ISO timestamp (requires --end)")
+    parser.add_argument("--end", help="Inclusive end timestamp or entire UTC date (requires --start)")
     parser.add_argument("--json", metavar="PATH", help="Write the full JSON report to a new file; '-' for stdout "
                         "(the readable summary then goes to stderr)")
     parser.add_argument("--max-items", type=int, default=1000,
@@ -690,6 +720,16 @@ def main(argv=None):
     parser.add_argument("--probe-buckets", action="store_true",
                         help="Also list AWSLogs/ in every other bucket of the account, to find former trail logs")
     args = parser.parse_args(argv)
+    if bool(args.start) != bool(args.end):
+        parser.error("--start and --end must be supplied together")
+    if args.start:
+        from .download import timestamp
+        try:
+            args.start, args.end = timestamp(args.start), timestamp(args.end, end=True)
+            if args.start > args.end:
+                raise ValueError("Start must not be after end")
+        except ValueError as error:
+            parser.error(str(error))
     if "all" in args.regions and args.regions != ["all"]:
         parser.error("use all alone, or explicit Region names")
     if args.max_items < 1 or args.max_s3_calls < 1:

@@ -21,9 +21,13 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 import simplejson as json
 
+from . import trailcheck
+
 
 LIMITATIONS = [
     "CloudTrail Event History: available management events only, last 90 days; not S3 trails, data events or CloudTrail Lake.",
+    "S3 trails: only selected UTC delivery-date folders are collected; late delivery outside those dates is not included. "
+    "Matching objects do not prove complete delivery; contents are not digest-validated. Original gzip objects are retained.",
     "SSM Run Command and terminated session history generally retain only 30 days; no recovery of expired records.",
     "Range selects event time / command RequestedDateTime / session StartDate, not overlapping sessions.",
     "Inline Run Command output may be truncated. Configured command S3/CloudWatch output is also collected.",
@@ -396,6 +400,33 @@ class Collector:
         # Oldest first: with default bounds the oldest window is the next to expire from Event History.
         self.parallel(lambda window: self.window(region, *window), self.windows(), WINDOW_WORKERS)
 
+    def cloudtrail_s3(self, region, locations, account, logs):
+        for location in locations:
+            if location["region"] != region:
+                continue
+            for day in location.get("dates", trailcheck.days(self.start, self.end)):
+                prefix = f"{location['prefix']}{region}/{day.replace('-', '/')}/"
+                objects = {}
+                self.s3(location["bucket_region"], location["bucket"], prefix, objects,
+                        cloudtrail=(account, region, day.replace("-", "")))
+                for identity, item in objects.items():
+                    with gzip.open(self.folder / item["file"], "rt", encoding="utf-8") as source:
+                        document = json.load(source, use_decimal=True)
+                    if not isinstance(document, dict) or not isinstance(document.get("Records"), list):
+                        raise ValueError(f"Invalid CloudTrail Records in s3://{item['bucket']}/{item['key']}")
+                    with self.lock, self.db:
+                        for record in document["Records"]:
+                            if not isinstance(record, dict):
+                                raise ValueError(f"Invalid CloudTrail record in {item['key']}")
+                            if record.get("awsRegion") != region:
+                                raise ValueError(f"CloudTrail record Region differs from object path: {item['key']}")
+                            if self.selected(record, "eventTime"):
+                                raw = encode(record)
+                                # Identical records deduplicate across trails; conflicting IDs remain evidence.
+                                digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                                self.db.execute("INSERT OR IGNORE INTO events VALUES (?,?,?)", (region, digest, raw))
+                    logs[identity] = item
+
     def window(self, region, lower, upper):
         self.progress.window_started(region)
         self.progress.tick(f"{region}: CloudTrail batch {iso(lower)} to {iso(upper)}")
@@ -426,11 +457,15 @@ class Collector:
         logs[identity] = {"region": region, "log_group": group, "stream_prefix": prefix,
                           "file": "logs/" + name, "events": len(events)}
 
-    def s3(self, region, bucket, prefix, logs, session_ids=None):
+    def s3(self, region, bucket, prefix, logs, session_ids=None, cloudtrail=None):
         for page in self.pages("s3", region, "list_objects_v2", {"Bucket": bucket, "Prefix": prefix},
                                token="ContinuationToken", result_token="NextContinuationToken"):
             for item in page.get("Contents", []):
                 key = item["Key"]
+                if cloudtrail is not None:
+                    match = trailcheck.LOG_NAME.fullmatch(key.removeprefix(prefix))
+                    if not match or match.groups() != cloudtrail or item.get("Size", 0) <= 0:
+                        continue
                 if session_ids is not None and not any(
                         part in session_ids or part.removesuffix(".log") in session_ids for part in key.split("/")):
                     continue
@@ -537,6 +572,10 @@ def main(argv=None):
     parser.add_argument("--start", help="Inclusive ISO timestamp with offset, or YYYY-MM-DD at UTC midnight; default: all available history")
     parser.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date YYYY-MM-DD; default: collection start time")
     parser.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm"), default=["cloudtrail", "ssm"])
+    parser.add_argument("--cloudtrail-source", choices=("history", "auto"), default="history",
+                        help="auto: use S3 only after trailcheck verifies every requested Region/day; otherwise Event History")
+    parser.add_argument("--cloudtrail-s3", action="append", default=[], metavar="s3://BUCKET/ROOT/AWSLogs/ACCOUNT/CloudTrail/",
+                        help="Download this account's CloudTrail root directly (repeatable); requires --start and --end")
     parser.add_argument("--compress", action="store_true", help="Gzip generated CloudTrail, SSM and CloudWatch JSON exports (not original S3 objects)")
     parser.add_argument("--progress", choices=("auto", "bar", "log", "off"), default="auto",
                         help="auto: bar on a terminal, timestamped tick log otherwise; off disables progress (stderr)")
@@ -551,6 +590,10 @@ def main(argv=None):
         end = timestamp(args.end, end=True) if args.end else datetime.now(timezone.utc)
         if start is not None and start > end:
             raise ValueError("Start must not be after end")
+        if args.cloudtrail_s3 and (not args.start or not args.end or "cloudtrail" not in args.services):
+            raise ValueError("--cloudtrail-s3 requires --start, --end and the cloudtrail service")
+        if args.cloudtrail_s3 and args.cloudtrail_source != "history":
+            raise ValueError("--cloudtrail-s3 selects S3 directly; omit --cloudtrail-source")
         if "all" in args.regions and args.regions != ["all"]:
             raise ValueError("Use all alone, or explicit region names")
         for location in args.session_s3:
@@ -566,6 +609,14 @@ def main(argv=None):
         region = session.region_name or "us-east-1"
         progress.tick("Checking existing AWS login")
         identity = session.client("sts", region_name=region).get_caller_identity()
+        locations = []
+        for location in sorted(set(args.cloudtrail_s3)):
+            parsed = urlsplit(location)
+            prefix = parsed.path.lstrip("/").rstrip("/") + "/"
+            if (parsed.scheme != "s3" or not parsed.netloc or parsed.query or parsed.fragment
+                    or not prefix.endswith(f"/{identity['Account']}/CloudTrail/")):
+                raise ValueError("--cloudtrail-s3 must name a CloudTrail/ root for the authenticated account")
+            locations.append({"bucket": parsed.netloc, "prefix": prefix})
         folder = args.dest.resolve()
         if folder.exists() and not (folder / "checkpoint.sqlite").exists() and any(folder.iterdir()):
             raise ValueError("Destination is not an existing download or an empty directory")
@@ -578,6 +629,11 @@ def main(argv=None):
                     "session_log_groups": sorted(set(args.session_log_group))}
         previous = collector.db.execute("SELECT value FROM settings").fetchone()
         previous_settings = json.loads(previous[0]) if previous else None
+        if previous_settings is not None and "cloudtrail_source" not in previous_settings and args.cloudtrail_source == "auto":
+            # Resume legacy history checkpoints without changing or mixing their evidence source.
+            args.cloudtrail_source = "history"
+        if args.cloudtrail_source != "history" or args.cloudtrail_s3:
+            settings.update(cloudtrail_source=args.cloudtrail_source, cloudtrail_s3=sorted(set(args.cloudtrail_s3)))
         if previous_settings is not None:
             previous_settings.setdefault("compress", False)
         if args.end is None:
@@ -595,9 +651,40 @@ def main(argv=None):
             regions = sorted(item["RegionName"] for item in response["Regions"])
         else:
             regions = settings["regions"]
+        # Freeze the verified source choice in the checkpoint, just like paginated AWS responses.
+        collector.db.execute("CREATE TABLE IF NOT EXISTS cloudtrail_plan (value TEXT)")
+        saved_plan = collector.db.execute("SELECT value FROM cloudtrail_plan").fetchone()
+        if saved_plan:
+            plan = json.loads(saved_plan[0])
+        else:
+            plan = {"source": "history", "locations": []}
+            if locations:
+                for location in locations:
+                    response = session.client("s3", region_name=region).get_bucket_location(Bucket=location["bucket"])
+                    constraint = response.get("LocationConstraint")
+                    bucket_region = {None: "us-east-1", "EU": "eu-west-1"}.get(constraint, constraint)
+                    plan["locations"].extend({**location, "bucket_region": bucket_region, "region": name} for name in regions)
+                plan["source"] = "s3"
+            elif args.cloudtrail_source == "auto" and args.start and args.end and "cloudtrail" in args.services:
+                progress.tick("Verifying S3 CloudTrail presence for every requested Region/day")
+                report = trailcheck.audit(session, argparse.Namespace(regions=regions, max_items=1000,
+                    max_s3_calls=2000, probe_buckets=False, start=collector.start, end=collector.end), progress.tick)
+                atomic_json(folder / "trailcheck.json", report)
+                requested = report["requested_range"]
+                if requested["verified"] and not report["unknown_regions"]:
+                    # A negative sample is not absence: fully list every discovered root/day.
+                    # Denied listings then fail collection rather than silently omitting evidence.
+                    plan.update(source="s3", locations=[{key: value for key, value in item.items() if key != "days"}
+                                                       for item in requested["locations"]])
+                else:
+                    print("Warning: S3 range not verified; retaining CloudTrail Event History "
+                          "(last 90 days, management events only). See trailcheck.json.", file=sys.stderr, flush=True)
+            with collector.db:
+                collector.db.execute("INSERT INTO cloudtrail_plan VALUES (?)", (encode(plan),))
         progress.total = len(regions) * len(settings["services"])
         progress.plan(regions, len(collector.windows()) if "cloudtrail" in args.services else 0, "ssm" in args.services)
-        manifest = {**settings, "resolved_regions": regions, "complete": False, "limitations": LIMITATIONS}
+        manifest = {**settings, "resolved_regions": regions, "complete": False, "limitations": LIMITATIONS,
+                    "cloudtrail_plan": plan}
         atomic_json(folder / "manifest.json", manifest)
         (folder / "logs").mkdir(exist_ok=True)
         document = {"account_id": identity["Account"], "commands": [], "invocations": [],
@@ -611,7 +698,10 @@ def main(argv=None):
         def collect(job):
             selected_region, service = job
             if service == "cloudtrail":
-                collector.cloudtrail(selected_region)
+                if plan["source"] == "s3":
+                    collector.cloudtrail_s3(selected_region, plan["locations"], identity["Account"], parts[selected_region][1])
+                else:
+                    collector.cloudtrail(selected_region)
             else:
                 collector.ssm(selected_region, *parts[selected_region], args.session_s3, args.session_log_group)
             progress.tick(f"{selected_region}: {'CloudTrail' if service == 'cloudtrail' else 'SSM'} complete", done=1)
@@ -634,7 +724,7 @@ def main(argv=None):
         for limitation in LIMITATIONS:
             print(f"Note: {limitation}", file=sys.stderr)
         return 0
-    except (BotoCoreError, ClientError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+    except (BotoCoreError, ClientError, OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, EOFError) as error:
         progress.close()
         print(f"Download stopped: {error}\nRenew your AWS login if needed, then rerun the same command to resume.", file=sys.stderr)
         return 1

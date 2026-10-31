@@ -1,5 +1,5 @@
 """Full-auto CLI contracts: real stages on synthetic data, stubbed AWS and tool downloads (no network)."""
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import closing, ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 import gzip
 import hashlib
@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -600,6 +601,158 @@ class AutoInventoryContract(unittest.TestCase):
         with redirect_stdout(output), redirect_stderr(output):
             status = main(["auto", str(self.target), "--skip-enrich", "--skip-suzaku", *map(str, args)])
         return status, output.getvalue()
+
+    def test_dated_auto_resumes_completed_and_interrupted_legacy_history(self):
+        from test_trailcheck import ACCOUNT, FakeAWS, fail
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                self.target = self.root / ("interrupted" if interrupted else "complete")
+                folder = self.target / "download"
+                finish = not interrupted
+                records = [record(name, "2026-10-01T12:00:00Z") for name in ("first", "second")]
+
+                def lookup(region, **params):
+                    if params.get("NextToken") and not finish:
+                        fail("ExpiredToken")
+                    item = records[1 if params.get("NextToken") else 0]
+                    return {"Events": [{"EventId": item["eventID"],
+                        "EventTime": datetime.fromisoformat("2026-10-01T12:00:00+00:00"),
+                        "CloudTrailEvent": json.dumps(item)}],
+                        **({} if params.get("NextToken") else {"NextToken": "second-page"})}
+
+                aws = FakeAWS({
+                    ("sts", "get_caller_identity"): lambda region: {"Account": ACCOUNT, "UserId": "x",
+                        "Arn": f"arn:aws:sts::{ACCOUNT}:assumed-role/reader/test"},
+                    ("cloudtrail", "lookup_events"): lookup}, {})
+                session = Mock(region_name="us-east-1", client=aws.client)
+                bounds = ["--regions", "us-east-1", "--start", "2026-10-01", "--end", "2026-10-01",
+                          "--services", "cloudtrail", "--progress", "off"]
+                output = io.StringIO()
+                with patch("boto3.Session", return_value=session), patch("kamotrace.download.clock.sleep"), \
+                        redirect_stdout(output), redirect_stderr(output):
+                    status = main(["download", "--dest", str(folder), *bounds])
+                self.assertEqual(status, 1 if interrupted else 0, output.getvalue())
+                # Pre-feature snapshots have the same settings/pages but no source plan.
+                with closing(sqlite3.connect(folder / "checkpoint.sqlite")) as checkpoint:
+                    checkpoint.execute("DROP TABLE cloudtrail_plan")
+                    checkpoint.commit()
+                manifest = json.loads((folder / "manifest.json").read_text())
+                manifest.pop("cloudtrail_plan")
+                self.assertNotIn("cloudtrail_source", manifest)
+                (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                before = digest(folder / "cloudtrail.json") if not interrupted else None
+                finish = True
+                with patch("boto3.Session", **({"return_value": session} if interrupted else
+                           {"side_effect": AssertionError("completed legacy case must not contact AWS")})), \
+                        patch("kamotrace.download.clock.sleep"):
+                    status, log = self.run_auto(*bounds, "--skip-inventory", "--no-serve")
+                self.assertEqual(status, 0, log)
+                exported = json.loads((folder / "cloudtrail.json").read_text())["Records"]
+                self.assertEqual(sorted(exported, key=lambda r: r["eventID"]), records)
+                if before:
+                    self.assertEqual(digest(folder / "cloudtrail.json"), before)
+                else:
+                    manifest = json.loads((folder / "manifest.json").read_text())
+                    self.assertTrue(manifest["complete"])
+                    self.assertEqual(manifest["cloudtrail_plan"]["source"], "history")
+
+    def test_dated_auto_selects_s3_only_after_real_trailcheck_and_reuses_snapshot(self):
+        from botocore.response import StreamingBody
+        from test_trailcheck import ACCOUNT, FakeAWS, bucket_routes, fail, log_key, trail
+        for state in ("present", "middle_day_missing", "listing_denied", "budget", "history",
+                      "multi_root_sample", "multi_root_unverified", "multi_root_denied"):
+            with self.subTest(state=state):
+                self.target = self.root / state
+                keys, payloads = [], {}
+                regions = ("us-east-1", "ap-southeast-1")
+                for region in regions:
+                    for day in ("2026-10-01", "2026-10-02", "2026-10-03"):
+                        if state == "middle_day_missing" and region == "ap-southeast-1" and day == "2026-10-02":
+                            continue
+                        key = log_key("audit/", ACCOUNT, region, day)
+                        keys.append(key)
+                        payloads[key] = gzip.compress(json.dumps({"Records": [
+                            record(region + day, day + "T12:00:00Z", region=region)]}).encode())
+                if state.startswith("multi_root"):
+                    for key in list(keys):
+                        other_key = key.replace("audit/", "second/", 1)
+                        keys.append(other_key)
+                        other = json.loads(gzip.decompress(payloads[key]))["Records"][0]
+                        other["eventID"] += "-second"
+                        payloads[other_key] = gzip.compress(json.dumps({"Records": [other]}).encode())
+                    sampled_prefix = log_key("second/", ACCOUNT, "ap-southeast-1", "2026-10-02").rsplit("/", 1)[0] + "/"
+                    sampled_prefixes = ([key.rsplit("/", 1)[0] + "/" for key in keys if key.startswith("second/")]
+                                        if state == "multi_root_unverified" else [sampled_prefix])
+                    keys.extend(prefix + f"000-unrelated-{i:02}.txt" for prefix in sampled_prefixes for i in range(20))
+                routes = {
+                    ("sts", "get_caller_identity"): lambda region: {"Account": ACCOUNT, "UserId": "x",
+                        "Arn": f"arn:aws:sts::{ACCOUNT}:assumed-role/reader/test"},
+                    ("cloudtrail", "describe_trails"): lambda region, **kw: {"trailList": [
+                        trail("main", "us-east-1", True, "synthetic-logs", "audit"),
+                        *([trail("second", "us-east-1", True, "synthetic-logs", "second")]
+                          if state.startswith("multi_root") else [])]},
+                    ("cloudtrail", "get_trail_status"): lambda region, **kw: {"IsLogging": True},
+                    ("cloudtrail", "get_event_selectors"): lambda region, **kw: {"EventSelectors": [
+                        {"IncludeManagementEvents": True, "ReadWriteType": "All"}]},
+                    ("cloudtrail", "lookup_events"): lambda region, **kw: {"Events": [{
+                        "EventId": region + "-history", "EventTime": datetime.fromisoformat("2026-10-01T12:00:00+00:00"),
+                        "CloudTrailEvent": json.dumps(record(region + "-history", "2026-10-01T12:00:00Z", region=region))}]},
+                    ("s3", "list_buckets"): lambda region, **kw: {"Buckets": [{"Name": "synthetic-logs"}]},
+                    **bucket_routes({"synthetic-logs": {"location": "us-east-1"}}),
+                    ("s3", "get_object"): lambda region, Bucket, Key, IfMatch: {
+                        "Body": StreamingBody(io.BytesIO(payloads[Key]), len(payloads[Key]))}}
+                aws = FakeAWS(routes, {"synthetic-logs": keys})
+
+                def listing(region, **params):
+                    if state == "listing_denied" or (state == "multi_root_denied" and params["Prefix"] == sampled_prefix):
+                        fail("AccessDenied")
+                    result = aws.list_objects(**params)
+                    for item in result.get("Contents", []):
+                        item.update(Size=len(payloads.get(item["Key"], b"unrelated")), ETag='"synthetic"')
+                    return result
+
+                routes["s3", "list_objects_v2"] = listing
+                session = Mock(region_name="us-east-1", client=aws.client)
+                bounds = ["--regions", *regions, "--start", "2026-10-01", "--end", "2026-10-03",
+                          "--services", "cloudtrail", "--skip-inventory", "--no-serve", "--progress", "off"]
+                if state == "history":
+                    bounds += ["--cloudtrail-source", "history"]
+                # Spend the real bounded listing budget immediately in the budget control.
+                from kamotrace import trailcheck
+                original_call = trailcheck.Check.call
+
+                def call(check, service, region, operation, *args, **kwargs):
+                    if state == "budget":
+                        check.max_s3_calls = 1
+                    return original_call(check, service, region, operation, *args, **kwargs)
+
+                with patch("kamotrace.download.boto3.Session", return_value=session), \
+                        patch("kamotrace.download.clock.sleep"), patch.object(trailcheck.Check, "call", call):
+                    status, log = self.run_auto(*bounds)
+                self.assertEqual(status, 1 if state == "multi_root_denied" else 0, log)
+                manifest = json.loads((self.target / "download" / "manifest.json").read_text())
+                s3_selected = state == "present" or state.startswith("multi_root")
+                self.assertEqual(manifest["cloudtrail_plan"]["source"], "s3" if s3_selected else "history")
+                if state == "multi_root_denied":
+                    self.assertFalse(manifest["complete"])
+                    self.assertFalse((self.target / "case.duckdb").exists())
+                    continue
+                self.assertEqual("get_object" in aws.operations(), s3_selected)
+                self.assertEqual("lookup_events" in aws.operations(), not s3_selected)
+                self.assertEqual("describe_trails" in aws.operations(), state != "history")
+                db = duckdb.connect(str(self.target / "case.duckdb"), read_only=True)
+                try:
+                    expected_ids = ({region + day + suffix for region in regions
+                                     for day in ("2026-10-01", "2026-10-02", "2026-10-03")
+                                     for suffix in (("", "-second") if state.startswith("multi_root") else ("",))}
+                                    if s3_selected else {region + "-history" for region in regions})
+                    self.assertEqual({row[0] for row in db.execute("SELECT event_id FROM events").fetchall()}, expected_ids)
+                    self.assertEqual(db.execute("SELECT count(*) FROM events").fetchone()[0], len(expected_ids))
+                finally:
+                    db.close()
+                with patch("kamotrace.download.boto3.Session", side_effect=AssertionError("no AWS on reuse")):
+                    status, log = self.run_auto(*bounds)
+                self.assertEqual(status, 0, log)
 
     def collection(self):
         from kamotrace import auto
