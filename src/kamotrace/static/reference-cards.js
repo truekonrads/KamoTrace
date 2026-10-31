@@ -1,4 +1,4 @@
-/* Exact-match, read-only context. Never inspect command output or raw evidence JSON. */
+/* Read-only reference context. Never inspect command output or raw evidence JSON. */
 (() => {
   "use strict";
   const attached = new WeakSet();
@@ -13,7 +13,7 @@
   card.hidden = true;
   card.tabIndex = -1;
   card.setAttribute("role", "region");
-  card.setAttribute("aria-label", "Exact-match reference");
+  card.setAttribute("aria-label", "Reference context");
   card.setAttribute("aria-live", "polite");
   // The popover top layer also works above the spreadsheet's modal dialog.
   card.setAttribute("popover", "manual");
@@ -71,6 +71,7 @@
     public_dns: "Public DNS",
     vpc_id: "VPC",
     subnet_id: "Subnet",
+    cidr: "Matching CIDR",
     availability_zone: "Availability zone",
     image_id: "Image ID",
     ip: "IP",
@@ -140,7 +141,8 @@
           `${data.matches.length} exact matches — separate candidates, not a resolved association.`,
           "reference-warning",
         );
-      for (const match of data.matches) {
+      const matches = [...data.matches, ...(data.network_matches || [])];
+      for (const match of matches) {
         const section = document.createElement("section");
         section.className = "reference-match";
         line(
@@ -154,15 +156,35 @@
           `Source: ${match.source || "unknown"} · Account: ${match.account || "not supplied"} · Region: ${match.region || "not supplied"}`,
           "reference-provenance",
         );
-        if (!match.resource && !match.identity && !match.enrichment)
+        if (match.network)
+          line(
+            section,
+            "p",
+            "Network range match — address is within this CIDR; no resource ownership is established.",
+            "reference-warning",
+          );
+        else if (data.kind === "ip" && match.source === "inventory")
+          line(
+            section,
+            "p",
+            "Exact resource address match",
+            "reference-provenance",
+          );
+        if (
+          !match.resource &&
+          !match.identity &&
+          !match.enrichment &&
+          !match.network
+        )
           details(section, match);
+        details(section, match.network);
         details(section, match.resource);
         details(section, match.resource?.details);
         details(section, match.enrichment);
         details(section, match.identity);
         card.append(section);
       }
-      if (data.matches.some((match) => match.source === "inventory")) {
+      if (matches.some((match) => match.source === "inventory")) {
         line(
           card,
           "p",
@@ -221,7 +243,7 @@
       if (sequence !== token || !element.isConnected) return;
       if (!Array.isArray(data.matches))
         throw new Error("Invalid reference response.");
-      if (data.matches.length) reveal(data);
+      if (data.matches.length || data.network_matches?.length) reveal(data);
       else if (active.persistent)
         reveal(null, "No known exact match in the loaded reference sources.");
       else close();

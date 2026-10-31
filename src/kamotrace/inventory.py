@@ -548,15 +548,24 @@ def add_forwarding_paths(report, regions):
 
 def analyze(metadata, regions, iam=None):
     iam = iam or {"profiles": {}, "errors": []}
-    report = {"metadata": {**metadata, "limitations": LIMITATIONS}, "errors": list(iam["errors"]), "resources": [], "vpcs": [], "security_groups": [], "relationships": []}
+    report = {"metadata": {**metadata, "limitations": LIMITATIONS}, "errors": list(iam["errors"]), "resources": [], "vpcs": [], "subnets": [], "security_groups": [], "relationships": []}
     if iam.get("completed_at_utc"):
         report["metadata"]["iam_completed_at_utc"] = iam["completed_at_utc"]
     for region in regions:
         rn = region["region"]
         report["errors"].extend(region["errors"])
         report["vpcs"].extend({"id": v["VpcId"], "name": name_of(v, v["VpcId"]), "region": rn,
-                               "cidr": ", ".join(a["CidrBlock"] for a in v.get("CidrBlockAssociationSet", []))}
+                               "cidr": ", ".join([a["CidrBlock"] for a in v.get("CidrBlockAssociationSet", [])
+                                                  if a.get("CidrBlockState", {}).get("State", "associated") == "associated"]
+                                                 + [a["Ipv6CidrBlock"] for a in v.get("Ipv6CidrBlockAssociationSet", [])
+                                                    if a.get("Ipv6CidrBlockState", {}).get("State") == "associated"])}
                               for v in region["describe_vpcs"])
+        report["subnets"].extend({"id": s["SubnetId"], "name": name_of(s, s["SubnetId"]), "region": rn,
+                                  "vpc_id": s.get("VpcId", ""), "availability_zone": s.get("AvailabilityZone", ""),
+                                  "cidr": ", ".join(([s["CidrBlock"]] if s.get("CidrBlock") else [])
+                                                    + [a["Ipv6CidrBlock"] for a in s.get("Ipv6CidrBlockAssociationSet", [])
+                                                       if a.get("Ipv6CidrBlockState", {}).get("State") == "associated"])}
+                                 for s in region.get("describe_subnets", []))
         resources = []
 
         def add(identifier, name, kind, vpc, subnets, state, addresses, groups, details):

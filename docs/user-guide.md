@@ -57,6 +57,15 @@ Cards label inventory, observed CloudTrail/SSM activity, and IP lookup informati
 separately. Exact names and addresses can match multiple systems: account and
 region narrow the results when available, and competing matches remain visible.
 A reused IP is not proof that its current owner generated historical traffic.
+IP cards also list every matching VPC/subnet CIDR (IPv4 or IPv6), with the network
+name, ID, region and, for subnets, parent VPC and availability zone. These are
+labelled **network range matches**, separate from **exact resource address
+matches**: being within a CIDR does not establish resource ownership. Overlapping
+ranges remain separate candidates, not a single chosen network. All inventory
+context describes the collected configuration, not incident-time state.
+Older reports without subnet ranges still provide their known VPC ranges; create
+a new snapshot (or analyze an existing raw export into a new folder) for subnet
+and IPv6 range context. No live AWS or DNS lookup occurs when opening a card.
 An assumed-role session is not silently matched to an IAM role by its name.
 These lookups do not change your filters, evidence, findings, or tags.
 

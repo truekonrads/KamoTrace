@@ -1,4 +1,4 @@
-"""Read-only current-configuration inventory and exact, scope-aware reference lookups."""
+"""Read-only inventory with scope-aware exact reference and IP network range lookups."""
 import ipaddress
 import json
 from pathlib import Path
@@ -11,6 +11,7 @@ class Inventory:
     def __init__(self, folder=None):
         self.report = {"loaded": False, "metadata": None, "counts": {}, **{key: [] for key in COLLECTIONS}}
         self.index = {}
+        self.networks = []
         if folder is None:
             return
         path = Path(folder) / "report.json"
@@ -23,6 +24,16 @@ class Inventory:
                 raise ValueError("Expected an AWS inventory report with metadata, resource lists and counts")
             self.report = {**report, "loaded": True}
             account = report["metadata"]["account"]
+            # Subnets are optional so older snapshots still supply VPC range context.
+            for collection, kind in (("vpcs", "VPC"), ("subnets", "Subnet")):
+                for network in report.get(collection, []):
+                    for cidr in network.get("cidr", "").split(","):
+                        if cidr.strip():
+                            prefix = ipaddress.ip_network(cidr.strip())
+                            match = {"kind": kind, "id": network["id"], "name": network.get("name", network["id"]),
+                                     "account": account, "region": network["region"], "source": "inventory",
+                                     "network": {**network, "kind": kind, "cidr": str(prefix)}}
+                            self.networks.append((prefix, match))
             for resource in report["resources"]:
                 if not isinstance(resource.get("id"), str) or not isinstance(resource.get("region"), str):
                     raise ValueError("Inventory resources must have an id and region")
@@ -55,7 +66,7 @@ class Inventory:
 
 
 def reference(body, inventory, connection, commands):
-    """Caller holds the Store lock. Context narrows exact matches; it never supplies missing evidence."""
+    """Caller holds the Store lock. Context narrows matches; it never supplies missing evidence."""
     kind, value = body.get("kind"), body.get("value")
     if kind not in ("identity", "machine", "ip") or not isinstance(value, str) or not 1 <= len(value) <= 2048:
         raise ValueError("Reference requires kind identity, machine or ip and a value up to 2048 characters")
@@ -69,6 +80,12 @@ def reference(body, inventory, connection, commands):
         except ValueError:
             raise ValueError("Reference ip must be an IPv4 or IPv6 address") from None
     matches = inventory.lookup(kind, lookup_value, account, region)
+    network_matches = []
+    if kind == "ip":
+        address = ipaddress.ip_address(lookup_value)
+        network_matches = [match for prefix, match in inventory.networks
+                           if address in prefix and (not account or match["account"] == account)
+                           and (not region or match["region"] == region)]
     if kind in ("identity", "ip"):
         # Group by account AND region: repeated names/addresses must never collapse scope.
         actor_account = "coalesce(e.user_identity->>'$.accountId', CASE WHEN starts_with(b.identity, 'arn:') THEN split_part(b.identity, ':', 5) END, e.recipient_account_id, '')"
@@ -118,5 +135,5 @@ def reference(body, inventory, connection, commands):
     else:
         entities = {(m["account"], "" if kind == "identity" else m["region"], m["id"]) for m in relevant}
         ambiguous = len(entities) > 1
-    return {"kind": kind, "value": value, "matches": matches, "ambiguous": ambiguous,
+    return {"kind": kind, "value": value, "matches": matches, "network_matches": network_matches, "ambiguous": ambiguous,
             "snapshot": inventory.report["metadata"]}

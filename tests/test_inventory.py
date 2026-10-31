@@ -70,6 +70,26 @@ class ExposureReportTest(unittest.TestCase):
     def report(self, data):
         return analyze({}, [data])["resources"][0]
 
+    def test_network_ranges_retain_only_associated_ipv4_and_ipv6(self):
+        data = fixture()
+        data["describe_vpcs"] = [{"VpcId": "vpc-test", "Tags": [{"Key": "Name", "Value": "Network"}],
+            "CidrBlockAssociationSet": [
+                {"CidrBlock": "10.0.0.0/16", "CidrBlockState": {"State": "associated"}},
+                {"CidrBlock": "10.1.0.0/16", "CidrBlockState": {"State": "disassociated"}}],
+            "Ipv6CidrBlockAssociationSet": [
+                {"Ipv6CidrBlock": "2001:db8:1234::/56", "Ipv6CidrBlockState": {"State": "associated"}},
+                {"Ipv6CidrBlock": "2001:db8:5678::/56", "Ipv6CidrBlockState": {"State": "associating"}}]}]
+        data["describe_subnets"] = [{"SubnetId": "subnet-test", "VpcId": "vpc-test",
+            "CidrBlock": "10.0.1.128/25", "AvailabilityZone": "test-a",
+            "Ipv6CidrBlockAssociationSet": [
+                {"Ipv6CidrBlock": "2001:db8:1234:80::/64", "Ipv6CidrBlockState": {"State": "associated"}},
+                {"Ipv6CidrBlock": "2001:db8:5678:80::/64", "Ipv6CidrBlockState": {"State": "disassociated"}}]}]
+        report = analyze({}, [data])
+        self.assertEqual(report["vpcs"], [{"id": "vpc-test", "name": "Network", "region": "test-region",
+                                          "cidr": "10.0.0.0/16, 2001:db8:1234::/56"}])
+        self.assertEqual(report["subnets"], [{"id": "subnet-test", "name": "subnet-test", "region": "test-region",
+            "vpc_id": "vpc-test", "availability_zone": "test-a", "cidr": "10.0.1.128/25, 2001:db8:1234:80::/64"}])
+
     def test_sg_address_route_and_missing_evidence(self):
         baseline = fixture()
         self.assertEqual(self.report(baseline)["status"], "Restricted")

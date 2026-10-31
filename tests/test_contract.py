@@ -64,8 +64,12 @@ def inventory_fixture(folder):
     report = {"metadata": {"account": "123", "started_at_utc": "2026-10-29T15:00:00Z",
         "completed_at_utc": "2026-10-29T15:01:00Z", "regions": ["ap-southeast-3", "us-east-1"],
         "limitations": ["Current configuration snapshot, not historical incident-time state.", "No active probes are performed."]},
-        "resources": resources, "vpcs": [{"id": "vpc-test", "region": region, "name": "Synthetic VPC", "cidr": "10.0.0.0/16"}
+        "resources": resources, "vpcs": [{"id": "vpc-test", "region": region, "name": "Synthetic VPC",
+                                          "cidr": "10.0.0.0/16, 2001:db8:1234::/56"}
             for region in ("ap-southeast-3", "us-east-1")],
+        "subnets": [{"id": "subnet-range", "name": "Synthetic subnet", "region": "ap-southeast-3",
+                     "vpc_id": "vpc-test", "availability_zone": "ap-southeast-3a",
+                     "cidr": "10.0.1.128/25, 2001:db8:1234:80::/64"}],
         "security_groups": [{"id": "sg-test", "name": "Application ingress", "region": "ap-southeast-3", "vpc_id": "vpc-test",
                              "ingress": [], "egress": [], "resources": ["i-example", "i-alpha"]}],
         "relationships": [], "forwarding_paths": [route], "listener_actions": [],
@@ -204,6 +208,37 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(self.call("/api/inventory", headers={"Origin": "https://attacker.invalid"})[0], 403)
         self.assertEqual(self.call("/api/reference", {"kind": "machine", "value": "i-alpha"},
                                    headers={"Host": "attacker.invalid"})[0], 403)
+
+    def test_ip_network_ranges_do_not_assert_resource_ownership(self):
+        for address, expected in [
+            ("10.0.1.127", {"vpc-test"}),
+            ("10.0.1.128", {"vpc-test", "subnet-range"}),
+            ("10.0.1.255", {"vpc-test", "subnet-range"}),
+            ("10.0.2.0", {"vpc-test"}),
+            ("10.1.0.0", set()),
+            ("2001:0db8:1234:0080::1", {"vpc-test", "subnet-range"}),
+            ("2001:db8:1234:81::", {"vpc-test"}),
+            ("2001:db8:1234:100::", set()),
+        ]:
+            with self.subTest(address=address):
+                status, card = self.call("/api/reference", {"kind": "ip", "value": address,
+                    "account": "123", "region": "ap-southeast-3"})
+                self.assertEqual(status, 200)
+                self.assertEqual(card["matches"], [])
+                self.assertEqual({m["id"] for m in card["network_matches"]}, expected)
+                self.assertTrue(all("resource" not in m for m in card["network_matches"]))
+        _, card = self.call("/api/reference", {"kind": "ip", "value": "10.0.1.129"})
+        self.assertEqual({(m["id"], m["region"]) for m in card["network_matches"]}, {
+            ("vpc-test", "ap-southeast-3"), ("vpc-test", "us-east-1"), ("subnet-range", "ap-southeast-3")})
+        subnet = next(m["network"] for m in card["network_matches"] if m["kind"] == "Subnet")
+        self.assertEqual((subnet["cidr"], subnet["vpc_id"], subnet["availability_zone"]),
+                         ("10.0.1.128/25", "vpc-test", "ap-southeast-3a"))
+        _, card = self.call("/api/reference", {"kind": "ip", "value": "10.0.1.129", "account": "other"})
+        self.assertEqual(card["network_matches"], [])
+        _, card = self.call("/api/reference", {"kind": "ip", "value": "10.0.1.5", "region": "ap-southeast-3"})
+        self.assertEqual([m["id"] for m in card["matches"]], ["i-example"])
+        self.assertEqual([m["id"] for m in card["network_matches"]], ["vpc-test"])
+        self.assertFalse(card["ambiguous"])  # The containing VPC is not a competing resource owner.
 
     def test_serve_reports_startup_progress_and_ready_url(self):
         for transport in ("http", "stdio"):
