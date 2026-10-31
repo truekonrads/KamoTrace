@@ -1044,6 +1044,11 @@ jsDelivr; no package manager is needed to serve the app.
 Markdown uses vendored `marked@15.0.12` (MIT) and `dompurify@3.2.7`
 (Apache-2.0 or MPL-2.0); their licences are also in `src/kamotrace/static/vendor/`.
 
+The interface typeface is [Geist](https://vercel.com/font): the unmodified
+variable `Geist-Variable.woff2` and `GeistMono-Variable.woff2` from the
+`geist@1.9.0` npm package, self-hosted so the app works offline. They are
+licensed under the SIL Open Font License 1.1, in `GEIST-LICENSE.txt` in the same folder.
+
 ## Verification
 
 ### Read CI results

@@ -1,13 +1,40 @@
+/* Geist (SIL OFL 1.1), self-hosted from vendor/ so the app stays offline. */
+@font-face {
+  font-family: "Geist";
+  src: url("/vendor/Geist-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/vendor/GeistMono-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
 :root {
-  font-family: "Segoe UI", Arial, sans-serif;
-  color: #123449;
+  --font-sans: "Geist", "Segoe UI", Arial, sans-serif;
+  --font-mono: "Geist Mono", Consolas, "Courier New", monospace;
+  font-family: var(--font-sans);
+  color: var(--ink);
   background: #fff;
   font-size: 13px;
+  --ink: #103b55;
+  /* Secondary text: hints, counts, captions, axis labels. */
+  --muted: #546f82;
   --blue: #21616b;
+  --blue-dark: #174b53;
   --red: #b84435;
   --amber: #a8650c;
+  --error: #a52e2b;
+  --warn-ink: #7a4a05;
+  --warn-bg: #fdf0d5;
+  /* Borders: --line for panels, dialogs and tables; --control-line for buttons and inputs. */
   --line: #9eb9c3;
-  --ink: #103b55;
+  --control-line: #789ba9;
+  /* Surfaces: code/JSON wells and the grid header strip. */
+  --surface: #f3f7fa;
+  --header: #edf4f5;
+  --context: #6895a2;
   --selected: #d9eeef;
   --sidebar: 300px;
   --rail: 148px;
@@ -25,10 +52,16 @@ button,
 input,
 select {
   font: inherit;
+  line-height: 16px;
+}
+code,
+kbd,
+samp {
+  font-family: var(--font-mono);
 }
 button {
   background: #fff;
-  border: 1px solid #789ba9;
+  border: 1px solid var(--control-line);
   color: var(--ink);
   padding: 4px 9px;
   border-radius: 2px;
@@ -49,7 +82,7 @@ button:disabled {
   border-color: var(--blue);
 }
 .primary:hover {
-  background: #174b53;
+  background: var(--blue-dark);
 }
 .primary.pulse {
   box-shadow: 0 0 0 3px #f2c66d;
@@ -65,12 +98,13 @@ button:disabled {
   font-size: 17px;
   line-height: 20px;
 }
-input,
+input:not([type="checkbox"], [type="radio"]),
 select {
+  height: 26px;
   padding: 4px 7px;
-  border: 1px solid #89a7b3;
+  border: 1px solid var(--control-line);
   border-radius: 2px;
-  color: #193d55;
+  color: var(--ink);
   background: #fff;
 }
 button:focus-visible,
@@ -82,7 +116,7 @@ summary:focus-visible {
 }
 .hint {
   font-size: 11px;
-  color: #5f7686;
+  color: var(--muted);
 }
 h2 {
   font-size: 13px;
@@ -91,6 +125,7 @@ h2 {
 }
 .check {
   display: inline-flex;
+  align-self: center;
   align-items: center;
   gap: 4px;
   font-size: 11px;
@@ -162,7 +197,7 @@ h1 {
   box-shadow: inset 0 -2px #e28b77;
 }
 .topbar button[aria-pressed="true"]:hover {
-  background: #174b53;
+  background: var(--blue-dark);
 }
 .topbar button:focus-visible {
   outline-color: #fff;
@@ -170,7 +205,7 @@ h1 {
 .readonly {
   border: 1px solid #aac9ce;
   color: #fff;
-  background: #21616b;
+  background: var(--blue);
   padding: 3px 8px;
   border-radius: 4px;
   font-size: 11px;
@@ -290,7 +325,7 @@ main {
   padding: 0 4px;
   border-radius: 7px;
   background: #e8f0f2;
-  color: #4f6778;
+  color: var(--muted);
   font-size: 10px;
   font-weight: 600;
 }
@@ -329,7 +364,7 @@ main {
 }
 .count {
   font-variant-numeric: tabular-nums;
-  color: #4f6778;
+  color: var(--muted);
   font-size: 11px;
   margin-left: auto;
 }
@@ -396,6 +431,8 @@ main {
   border-radius: 2px;
   padding: 6px 10px 4px;
 }
+/* Rows that mix plain labels of different sizes with controls share one text baseline;
+   rows made only of equal-height controls are centred. */
 .time-row,
 .chart-head,
 .query-row,
@@ -403,16 +440,21 @@ main {
 .review-toolbar,
 .command-status-row {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
   flex-wrap: wrap;
 }
-.time-row label {
+.query-row,
+.scope-row {
+  align-items: center;
+}
+.time-row label,
+#sheet-density-label {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   font-size: 12px;
-  color: #546f82;
+  color: var(--muted);
 }
 .time-input {
   width: 158px;
@@ -422,6 +464,10 @@ main {
   display: inline-flex;
   gap: 4px;
   margin-left: auto;
+}
+/* Keep the link's text, not its padding, on the panel's left edge. */
+#toggle-charts {
+  margin-left: -4px;
 }
 .frequency-panel {
   margin-top: 4px;
@@ -437,7 +483,7 @@ main {
   gap: 6px;
   align-items: center;
   font-size: 12px;
-  color: #536d80;
+  color: var(--muted);
 }
 #custom-bucket {
   width: 80px;
@@ -456,16 +502,14 @@ main {
 }
 #frequency text,
 #timeline text {
-  font:
-    10px "Segoe UI",
-    sans-serif;
-  fill: #5f7686;
+  font: 10px var(--font-sans);
+  fill: var(--muted);
 }
 .frequency-bar {
   fill: var(--blue);
 }
 .frequency-bar.zero-bucket {
-  fill: #a85d0a;
+  fill: var(--amber);
 }
 .frequency-bar:hover,
 .frequency-bar:focus-visible {
@@ -493,14 +537,14 @@ main {
   gap: 6px;
   align-items: center;
   font-size: 11px;
-  color: #5e7483;
+  color: var(--muted);
 }
 .blue-dot,
 .red-dot {
   width: 8px;
   height: 8px;
   display: inline-block;
-  background: #6895a2;
+  background: var(--context);
 }
 .red-dot {
   background: var(--red);
@@ -513,7 +557,7 @@ main {
   height: 46px;
 }
 #timeline rect.bar {
-  fill: #6895a2;
+  fill: var(--context);
   cursor: pointer;
 }
 #timeline rect.bar:hover {
@@ -553,7 +597,7 @@ main {
   top: 0;
   z-index: 5;
   background: #fff;
-  padding: 6px 0 4px;
+  padding: 6px 0 0;
   box-shadow: 0 6px 6px -6px #19374a33;
 }
 .query-row #search,
@@ -572,8 +616,8 @@ main {
   background: #e5f5ec;
 }
 .state.draft {
-  color: #7a4a05;
-  background: #fdf0d5;
+  color: var(--warn-ink);
+  background: var(--warn-bg);
   font-weight: 600;
 }
 .scope-row {
@@ -644,8 +688,14 @@ main {
 #filter-value {
   width: 220px;
 }
+/* The selection toolbar is the grid's own header band, so its labels sit in a defined strip. */
 .review-toolbar {
   margin-top: 4px;
+  padding: 5px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
 }
 #selected-count {
   font-weight: 600;
@@ -653,8 +703,8 @@ main {
 }
 #stale {
   font-size: 11px;
-  background: #fdf0d5;
-  color: #7a4a05;
+  background: var(--warn-bg);
+  color: var(--warn-ink);
   padding: 1px 6px;
   border-radius: 4px;
 }
@@ -667,25 +717,25 @@ main {
 #load-status,
 #query-time {
   font-size: 11px;
-  color: #536d80;
+  color: var(--muted);
 }
 #error {
   background: #fff0ef;
   border: 1px solid #dfb2af;
-  color: #912e2a;
+  color: var(--error);
   padding: 6px 10px;
   margin: 4px 0;
   border-radius: 4px;
 }
 .error-text {
-  color: #a72b28;
+  color: var(--error);
 }
 
 /* Event grid: dense fixed-height rows. */
 .results {
   background: white;
   border: 1px solid var(--line);
-  border-radius: 2px;
+  border-radius: 0 0 2px 2px;
   overflow: hidden;
 }
 .tabulator {
@@ -695,15 +745,24 @@ main {
   font-size: 12px;
 }
 .tabulator .tabulator-header {
-  background: #edf4f5;
-  border-bottom: 1px solid #789ba9;
+  background: var(--header);
+  border-bottom: 1px solid var(--control-line);
   color: var(--ink);
   font-weight: 600;
 }
 .tabulator .tabulator-header .tabulator-col {
-  background: #edf4f5;
+  background: var(--header);
   border-right: 1px solid #e1eaf0;
   padding: 1px 0;
+}
+.tabulator .tabulator-header .tabulator-col .tabulator-col-title {
+  line-height: 18px;
+}
+/* Centre the 13px selection checkboxes on the 16px text line. */
+.tabulator .tabulator-cell[tabulator-field="review"] input,
+.tabulator .tabulator-col[tabulator-field="review"] input {
+  margin: 1.5px 0 0 3px;
+  vertical-align: top;
 }
 .tabulator-row {
   border-bottom: 1px solid #e9eff3;
@@ -740,7 +799,7 @@ main {
   .tabulator-placeholder-contents {
   font-size: 13px;
   font-weight: 400;
-  color: #647b8b;
+  color: var(--muted);
   padding: 16px;
 }
 .column-heading {
@@ -800,6 +859,14 @@ main {
 .tabulator-cell:focus-within .cell-actions {
   opacity: 1;
   pointer-events: auto;
+}
+/* Identifiers read better in Geist Mono; timestamps keep Geist Sans with aligned digits. */
+.mono-cell .cell-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.tabular-cell .cell-text {
+  font-variant-numeric: tabular-nums;
 }
 .tabulator-cell:hover .cell-text,
 .tabulator-cell:focus-within .cell-text {
@@ -923,14 +990,12 @@ main {
   margin: 0;
   max-width: calc(100vw - 16px);
   padding: 10px;
-  border: 1px solid #9ab4c5;
+  border: 1px solid var(--line);
   border-radius: 5px;
   box-shadow: 0 5px 20px #19374a33;
-  color: #193d55;
+  color: var(--ink);
 }
-#cell-filter-menu {
-  width: 260px;
-}
+#cell-filter-menu,
 #tag-popover {
   width: 260px;
 }
@@ -1021,7 +1086,7 @@ summary {
 }
 summary span {
   font-weight: 400;
-  color: #698090;
+  color: var(--muted);
   font-size: 11px;
   margin-left: 10px;
 }
@@ -1037,17 +1102,14 @@ summary span {
 pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font:
-    12px/1.55 Consolas,
-    "Courier New",
-    monospace;
-  color: #25475b;
+  font: 12px/1.55 var(--font-mono);
+  color: var(--ink);
 }
 #sql {
   clear: both;
 }
 footer {
-  color: #6a7e8b;
+  color: var(--muted);
   font-size: 11px;
   margin: 10px 0;
   line-height: 1.5;
@@ -1057,7 +1119,7 @@ footer {
 dialog {
   width: min(1050px, 94vw);
   max-height: 87vh;
-  border: 1px solid #9ab4c5;
+  border: 1px solid var(--line);
   border-radius: 6px;
   padding: 16px;
   box-shadow: 0 12px 50px #1a34494d;
@@ -1103,10 +1165,8 @@ dialog::backdrop {
 }
 #detail-id,
 #record-hash {
-  font:
-    11px/1.6 Consolas,
-    monospace;
-  color: #5b7282;
+  font: 11px/1.6 var(--font-mono);
+  color: var(--muted);
 }
 #detail-findings > div {
   display: flex;
@@ -1123,7 +1183,7 @@ dialog::backdrop {
 #raw-event {
   flex: 1;
   overflow: auto;
-  background: #f3f7fa;
+  background: var(--surface);
   padding: 12px;
   border-radius: 4px;
   min-height: 200px;
@@ -1136,10 +1196,8 @@ dialog::backdrop {
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 4px;
-  background: #f3f7fa;
-  font:
-    13px/1.6 Consolas,
-    monospace;
+  background: var(--surface);
+  font: 13px/1.6 var(--font-mono);
   white-space: pre-wrap;
 }
 .value-rankings {
@@ -1198,7 +1256,7 @@ dialog::backdrop {
   resize: vertical;
 }
 #review-error {
-  color: #a72b28;
+  color: var(--error);
 }
 .markdown {
   line-height: 1.55;
@@ -1207,7 +1265,7 @@ dialog::backdrop {
 }
 .markdown pre {
   white-space: pre-wrap;
-  background: #edf3f6;
+  background: var(--surface);
   padding: 10px;
 }
 .markdown table {
@@ -1219,7 +1277,7 @@ dialog::backdrop {
   border: 1px solid var(--line);
 }
 #note-preview {
-  background: #f3f7fa;
+  background: var(--surface);
   padding: 0 12px;
   margin-bottom: 12px;
   max-height: 240px;
@@ -1259,25 +1317,23 @@ dialog::backdrop {
   overflow-wrap: anywhere;
   overflow: hidden;
   height: 36px;
-  font:
-    11px/18px Consolas,
-    "Courier New",
-    monospace;
+  font: 11px/18px var(--font-mono);
   cursor: zoom-in;
 }
 #command-sheet.expanded .sheet-value {
   height: 162px;
 }
 #command-sheet .sheet-missing {
-  color: #6a7e8b;
+  color: var(--muted);
   font-style: italic;
 }
 #command-sheet .sheet-failed {
-  color: #a52e2b;
+  color: var(--error);
   font-weight: 650;
 }
 #command-sheet .sheet-open {
   display: block;
+  width: 100%;
   padding: 0;
   border: 0;
   border-radius: 0;
@@ -1285,19 +1341,22 @@ dialog::backdrop {
   color: var(--blue);
   text-align: left;
   text-decoration: underline;
-  font: inherit;
+  font-weight: 500;
+  /* Top-align like the neighbouring cells; buttons centre their content by default. */
+  display: flex;
+  align-items: flex-start;
   cursor: pointer;
 }
 #sheet-load-status {
   font-size: 12px;
-  color: #536d80;
+  color: var(--muted);
 }
 #sheet-cell-value {
   max-height: 58vh;
   overflow: auto;
   padding: 12px;
   border: 1px solid var(--line);
-  background: #f3f7fa;
+  background: var(--surface);
 }
 .command-workspace {
   display: grid;
@@ -1333,7 +1392,7 @@ dialog::backdrop {
 }
 .command-entry span {
   font-size: 11px;
-  color: #4f6778;
+  color: var(--muted);
 }
 .command-entry[aria-pressed="true"] {
   background: var(--selected);
@@ -1348,7 +1407,7 @@ dialog::backdrop {
   overflow-wrap: anywhere;
   max-height: 320px;
   overflow: auto;
-  background: #f3f7fa;
+  background: var(--surface);
   padding: 10px;
   border: 1px solid var(--line);
   font-size: 12px;
