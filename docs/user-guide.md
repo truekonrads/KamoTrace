@@ -10,6 +10,7 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 - [Follow a worked investigation](#end-to-end-example)
 - [Look up commands and server options](#commands)
 - [Prepare a case with one command](#full-auto-preparation)
+- [Download and import data manually](preparation.md)
 - [Check trails and S3 log coverage](#cloudtrail-trail-check)
 - [Run KamoTrace in Docker](#docker)
 - [Add Suzaku detections](#suzaku-detections)
@@ -116,7 +117,7 @@ The importer preserves nested JSON and numeric precision, hashes every record,
 records every source file's hash, and refuses to overwrite an existing database.
 A UTF-8 byte-order mark is fine. Combine regions using repeatable `--source`
 arguments or pass a CloudTrail-only folder; `.json.gz` files and binary stdin
-(`--source -`) work too. See the [multi-file and stream examples](../README.md#multiple-files-gzip-and-stdin).
+(`--source -`) work too. See the [multi-file and stream examples](preparation.md#multiple-files-gzip-and-stdin).
 Existing databases are never appended to; select the whole set for a new import.
 The downloader's `--compress` option produces gzip CloudTrail and SSM exports
 that `import` and `serve --ssm-export` can read directly.
@@ -268,7 +269,7 @@ and DB-IP Lite are still downloaded only from their official sources and
 verified as described for [`get-suzaku`](#download-and-run-suzaku) and
 [IP enrichment](#ip-enrichment). Credit DB-IP Lite data (CC BY 4.0).
 
-AWS access uses your existing login, exactly as [`download`](../README.md#download-from-an-existing-aws-login)
+AWS access uses your existing login, exactly as [`download`](preparation.md#download-from-an-existing-aws-login)
 does; there is no login prompt, so it is safe for unattended use with `--no-serve`
 and `--progress log`. `--services` must include `cloudtrail`. Running Suzaku needs a
 single CloudTrail file or folder; with several `--source` files, pass `--timeline`
@@ -362,7 +363,7 @@ new default. Completed legacy cases still reuse without AWS calls.
 instead be collected directly with `download --cloudtrail-s3
 s3://BUCKET/[prefix/]AWSLogs/[o-org/]ACCOUNT/CloudTrail/` and explicit dates.
 The account must match the authenticated account. See the
-[S3 download example and limitations](../README.md#download-from-an-existing-aws-login).
+[S3 download example and limitations](preparation.md#download-from-an-existing-aws-login).
 Only selected UTC delivery-date folders are collected; records are then filtered
 by event time. Late deliveries outside those folders are not recovered. Original
 gzip objects, ETags and checksums are retained; digest validation is not performed.
@@ -881,7 +882,7 @@ stay pinned and the grid fills the rest of the window.
 ## SSM command browser (desktop)
 
 To collect a compatible export using an existing AWS login, use
-[`kamotrace download`](../README.md#download-from-an-existing-aws-login).
+[`kamotrace download`](preparation.md#download-from-an-existing-aws-login).
 Its `ssm.json` can be passed directly to `--ssm-export`. Session records and
 downloaded transcripts remain separate from the Run Command viewer.
 

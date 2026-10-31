@@ -53,7 +53,7 @@ shapes and critical usability bugs. Fixed, with regression tests where noted:
 
 | Issue | Fix |
 | --- | --- |
-| One database accepted only one plain CloudTrail JSON file | `import --source` now accepts multiple files, recursive folders, gzip and binary stdin, with per-source provenance and record hashes. Multi-source identity uses ordered file hashes so reordered record IDs cannot reuse a sidecar; single-source identities stay unchanged. See [import examples](../README.md#multiple-files-gzip-and-stdin). |
+| One database accepted only one plain CloudTrail JSON file | `import --source` now accepts multiple files, recursive folders, gzip and binary stdin, with per-source provenance and record hashes. Multi-source identity uses ordered file hashes so reordered record IDs cannot reuse a sidecar; single-source identities stay unchanged. See [import examples](preparation.md#multiple-files-gzip-and-stdin). |
 | Search missed values containing `"` or `\` (Windows paths, command lines), because raw JSON stores them escaped | Search also matches the JSON-escaped form (test) |
 | Suzaku 3 correlation rules (several eventIDs joined by ` ¦ `) were always `no_match`, hiding critical multi-step detections | Each member eventID links exactly; partial chains stay unlinked (test, plus a real Suzaku 3.0.0 run) |
 | `get-suzaku` chose the gnu Linux build on glibc < 2.39, where it cannot run | gnu only on glibc 2.39+, otherwise musl; aarch64 on old glibc asks for a manual download |
