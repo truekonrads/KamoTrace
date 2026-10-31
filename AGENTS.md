@@ -13,7 +13,7 @@ Package layout: `src/kamotrace/`, installed as the `kamotrace` command
 (`pyproject.toml`). Loading data and enrichment are CLI steps; the browser UI
 only reads them.
 
-- `cli.py`: `kamotrace auto | import | download | get-suzaku | suzaku | get-dbip | enrich | serve | mcp` dispatcher.
+- `cli.py`: `kamotrace auto | import | download | trailcheck | ssmcheck | get-suzaku | suzaku | get-dbip | enrich | serve | mcp` dispatcher.
 - `auto.py`: full-auto, rerunnable pipeline over the other modules (tools, download, import, enrich,
   suzaku, serve). It holds no logic of its own beyond deciding per stage whether verified
   completed work can be reused; never let it overwrite evidence or trust unpublished partials.
@@ -43,6 +43,10 @@ only reads them.
   DB-IP's download pages, verifies the published SHA-1 of each decompressed file
   and its `DBIP-` database type, and installs into `$KAMOTRACE_TOOLS/dbip-lite-YYYY-MM`.
   Keep the CC BY 4.0 attribution in its output and docs.
+- `trailcheck.py`: read-only trail audit (Describe/Get/List only, never `GetObject`).
+  It keeps configured scope, logging/delivery state, observed S3 date prefixes and
+  verified days apart, and never claims complete logs from prefixes. Denied/failed is
+  unknown, never absent; S3 listing is bounded and caps are reported as truncated.
 - `server.py`: loopback HTTP endpoints, allowlisted parameterized DuckDB queries,
   enrichment, detections, and SQLite annotation/tag persistence.
 - `ssm.py`: local SSM export loading, account/region/command joins, separate

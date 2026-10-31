@@ -3,6 +3,7 @@
   kamotrace auto     CASE_FOLDER [--profile NAME] [--start ...] [--no-serve] ...
   kamotrace import   --source event_history.json --database case.duckdb
   kamotrace download --dest CASE --regions all --start 2026-10-01 --end 2026-10-02
+  kamotrace trailcheck [--profile NAME] [--regions all] [--json report.json|-] [--probe-buckets]
   kamotrace get-suzaku [--version 3.0.0]
   kamotrace suzaku   --database case.duckdb (--source event_history.json [--suzaku suzaku.exe] | --timeline suzaku.duckdb)
   kamotrace get-dbip [--dest FOLDER]
@@ -16,6 +17,7 @@ COMMANDS = {
     "auto": ("kamotrace.auto", "Full-auto, resumable: tools, AWS download, import, enrichment, detections, then the UI"),
     "import": ("kamotrace.importer", "Load CloudTrail JSON/gzip files, folders or stdin into a new, read-only evidence DuckDB"),
     "download": ("kamotrace.download", "Resume CloudTrail and SSM collection using an existing AWS login"),
+    "trailcheck": ("kamotrace.trailcheck", "Read-only audit of trails, logging/delivery state, S3 destinations and log dates"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),

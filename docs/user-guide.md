@@ -10,6 +10,7 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 - [Follow a worked investigation](#end-to-end-example)
 - [Look up commands and server options](#commands)
 - [Prepare a case with one command](#full-auto-preparation)
+- [Check trails and S3 log coverage](#cloudtrail-trail-check)
 - [Run KamoTrace in Docker](#docker)
 - [Add Suzaku detections](#suzaku-detections)
 - [Add offline IP enrichment](#ip-enrichment)
@@ -153,6 +154,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `kamotrace auto CASE_FOLDER [options]` | [Full-auto](#full-auto-preparation): tools, AWS download, import, enrichment, detections, then `serve`; rerun to resume |
 | `kamotrace import --source FILE_OR_FOLDER... --database NEW.duckdb` | Combine CloudTrail JSON/gzip exports; repeat `--source`, or use `-` for binary stdin |
 | `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume CloudTrail/SSM collection with an existing AWS login; optional gzip output |
+| `kamotrace trailcheck [--regions all] [--json PATH\|-] [--max-items N] [--max-s3-calls N] [--probe-buckets]` | [Read-only audit](#cloudtrail-trail-check) of trails, logging/delivery state, S3 destinations and observed log dates |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
 | `kamotrace suzaku --database DB (--source FILE [--suzaku EXE] \| --timeline FILE)` | Run or import Suzaku detections into `<database>.detections.duckdb` |
 | `kamotrace get-dbip [--dest FOLDER]` | Download and verify the free DB-IP Lite City and ASN databases (CC BY 4.0, no account) |
@@ -267,6 +269,88 @@ command**. Each stage checks what already exists:
   database or sidecar, even from another case folder or with a custom
   `--output`, stops with a "being prepared by another KamoTrace process" error.
   Locks are released when the UI starts and if the process dies.
+
+## CloudTrail trail check
+
+`kamotrace trailcheck` reports, read-only, which CloudTrail trails exist, what
+they record, whether they are logging and delivering, and which log dates are
+present in their S3 buckets. Run it before collecting older evidence than
+Event History's 90 days, or to judge the gaps in what you have:
+
+```powershell
+kamotrace trailcheck --profile investigation
+kamotrace trailcheck --regions us-east-1 ap-southeast-1 --json C:\cases\example\trailcheck.json
+kamotrace trailcheck --json - --probe-buckets > C:\cases\example\trailcheck.json
+```
+
+It uses your existing AWS login, as `download` does, and only calls Describe,
+Get and List APIs. It changes nothing in AWS, and it lists log objects without
+downloading them. The readable summary goes to stdout. `--json PATH` also
+writes the full report to a new file; it refuses to overwrite an existing one.
+`--json -` writes the JSON to stdout and moves the summary to stderr.
+
+The report keeps four kinds of statement apart:
+
+| Kind | Meaning | Source |
+| --- | --- | --- |
+| Configured scope | What trails are set to record now: Regions, organization/global service events, management/data event selectors and exclusions, Insights, log file validation, KMS, CloudWatch Logs | `cloudtrail:DescribeTrails` (including shadow trails per Region), `GetEventSelectors`, `GetInsightSelectors` |
+| Logging and delivery state | Whether each trail is logging now, when logging started or stopped, latest S3/digest delivery times and errors | `cloudtrail:GetTrailStatus` in the trail's home Region |
+| Observed S3 date prefixes | Year/month prefixes found per account and Region under `[prefix/]AWSLogs/[o-org/]ACCOUNT/CloudTrail/REGION/`, the first and last observed day, and months missing between them | `s3:ListBucket` with `/` delimiters |
+| Verified days | For each Region's first and last observed day, a listed object whose CloudTrail log file name matches the account, Region and date and whose size is nonzero | `s3:ListBucket` |
+
+Prefixes and verified days are not proof of complete logs or events. A
+present month can still miss hours or Regions; a gap can come from logging being
+stopped, lifecycle expiry, deletion or a changed prefix. Object contents are
+not read, decrypted or digest-validated. Check the logs themselves before you
+rely on them as complete. Day prefixes are listed only in each Region's first
+and last observed month. Months are compared only when every month listing
+completed. "Configured Regions with no observed S3 prefix" compares the current
+configuration with the current account's prefixes. Time zones do not apply:
+CloudTrail S3 paths are UTC dates.
+
+For each bucket it also reports Region, public access block, whether the policy
+is public, whether the policy lets `cloudtrail.amazonaws.com` write and under
+which conditions, default encryption, versioning, object lock and lifecycle
+rules. Lifecycle expiry and transitions explain why older years may be missing
+or archived.
+
+Denied and failed checks are **unknown, not absent**. A denied Region shows
+`UNKNOWN (denied)`, never "no trail". A bucket in another account that you
+cannot read keeps its trail's destination, with unknown coverage. JSON
+findings carry a `state`:
+
+- `configured`: the API answered with the setting.
+- `not_configured`: the API answered that it is absent, such as `NoSuchLifecycleConfiguration`.
+- `denied` or `error`: unknown.
+
+Listings carry a `coverage`: `complete`, `partial` or `unknown`.
+`errors` lists `{region, api, code, state, resource}` without AWS's error
+messages, which can contain ARNs.
+
+Listing is bounded. `--max-items` (default 1000) caps each S3 prefix and bucket
+listing. `--max-s3-calls` (default 2000) caps all `ListObjectsV2` calls in a run.
+When a cap is reached, the affected section becomes `partial`, an entry is added
+to the top-level `truncated` list, and month-gap and scope comparisons are
+withheld rather than guessed. The current account is listed before other
+accounts in shared or organization buckets. Exit status is 0 for a complete
+report, 1 for a report with unknown or partial parts, and 2 for a usage or login
+failure (no report).
+
+By default only trail destinations are listed. `--probe-buckets` also lists
+`AWSLogs/` in every other bucket in the account. This finds logs left by deleted
+or changed trails in buckets at the root prefix. `AWSLogs/` folders of other
+services, such as VPC Flow Logs and ELB, are shown but not treated as CloudTrail.
+Custom prefixes in non-destination buckets are not guessed.
+
+Permissions: `sts:GetCallerIdentity`, `ec2:DescribeRegions` (for `--regions
+all`), `cloudtrail:DescribeTrails`, `cloudtrail:GetTrailStatus`,
+`cloudtrail:GetEventSelectors`, `cloudtrail:GetInsightSelectors`,
+`s3:ListAllMyBuckets`, `s3:ListBucket`, `s3:GetBucketLocation`,
+`s3:GetBucketPublicAccessBlock`, `s3:GetBucketPolicyStatus`, `s3:GetBucketPolicy`,
+`s3:GetEncryptionConfiguration`, `s3:GetBucketVersioning`,
+`s3:GetBucketObjectLockConfiguration` and `s3:GetLifecycleConfiguration`.
+CloudTrail Lake, Event History and CloudWatch Logs contents are not checked.
+Reports name accounts, buckets and trails: keep them private and out of Git.
 
 ## Docker
 

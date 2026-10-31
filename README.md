@@ -198,6 +198,24 @@ Permission failures stop with a nonzero status and leave resumable checkpoints;
 `manifest.json` is marked complete only after all selected collection succeeds.
 Missing, expired or not-yet-delivered logs cannot be recovered by this command.
 
+#### Check trail configuration and S3 log coverage
+
+Event History covers only 90 days. Older events, data events and complete
+records live in S3 trail logs, if a trail was configured. To see what exists
+before you collect or import, run this read-only check:
+
+```powershell
+kamotrace trailcheck --profile investigation --json C:\cases\example\trailcheck.json
+```
+
+The report shows each trail's Region scope, event selectors, logging and
+delivery state, and its S3 bucket's restrictions: public access block, policy,
+encryption, versioning and lifecycle. It also shows the year/month date
+prefixes observed per account and Region in S3. Observed prefixes are not proof
+of complete logs; denied checks are reported as unknown, not absent. Exit status
+1 means a partial report. Details and options are in
+[CloudTrail trail check](docs/user-guide.md#cloudtrail-trail-check).
+
 ### 3. Import the events
 
 Put `event_history.json` in a case folder, then run:
