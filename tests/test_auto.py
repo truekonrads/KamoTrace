@@ -659,13 +659,30 @@ class AutoInventoryContract(unittest.TestCase):
     def test_dated_auto_selects_s3_only_after_real_trailcheck_and_reuses_snapshot(self):
         from botocore.response import StreamingBody
         from test_trailcheck import ACCOUNT, FakeAWS, bucket_routes, fail, log_key, trail
-        for state in ("present", "middle_day_missing", "listing_denied", "budget", "history",
+        now = [datetime.fromisoformat("2026-10-03T13:00:00+00:00")]
+
+        class ClockMeta(type):
+            def __instancecheck__(cls, value):
+                return isinstance(value, datetime)
+
+        class Clock(datetime, metaclass=ClockMeta):
+            @classmethod
+            def now(cls, tz=None):
+                return now[0]
+
+        for state in ("present", "open_end", "middle_day_missing", "unused_region", "empty_range",
+                      "listing_denied", "day_denied", "budget", "history",
                       "multi_root_sample", "multi_root_unverified", "multi_root_denied"):
             with self.subTest(state=state):
                 self.target = self.root / state
                 keys, payloads = [], {}
                 regions = ("us-east-1", "ap-southeast-1")
                 for region in regions:
+                    if state == "unused_region" and region == "ap-southeast-1":
+                        continue
+                    if state == "empty_range":
+                        keys.append(log_key("audit/", ACCOUNT, region, "2026-09-30"))
+                        continue
                     for day in ("2026-10-01", "2026-10-02", "2026-10-03"):
                         if state == "middle_day_missing" and region == "ap-southeast-1" and day == "2026-10-02":
                             continue
@@ -673,6 +690,10 @@ class AutoInventoryContract(unittest.TestCase):
                         keys.append(key)
                         payloads[key] = gzip.compress(json.dumps({"Records": [
                             record(region + day, day + "T12:00:00Z", region=region)]}).encode())
+                        if state == "open_end" and day == "2026-10-03":
+                            payloads[key] = gzip.compress(json.dumps({"Records": [
+                                record(region + day, day + "T12:00:00Z", region=region),
+                                record(region + "-after-end", day + "T14:00:00Z", region=region)]}).encode())
                 if state.startswith("multi_root"):
                     for key in list(keys):
                         other_key = key.replace("audit/", "second/", 1)
@@ -704,7 +725,9 @@ class AutoInventoryContract(unittest.TestCase):
                 aws = FakeAWS(routes, {"synthetic-logs": keys})
 
                 def listing(region, **params):
-                    if state == "listing_denied" or (state == "multi_root_denied" and params["Prefix"] == sampled_prefix):
+                    if (state == "listing_denied"
+                            or (state == "day_denied" and params["Prefix"].endswith("ap-southeast-1/2026/10/02/"))
+                            or (state == "multi_root_denied" and params["Prefix"] == sampled_prefix)):
                         fail("AccessDenied")
                     result = aws.list_objects(**params)
                     for item in result.get("Contents", []):
@@ -715,6 +738,9 @@ class AutoInventoryContract(unittest.TestCase):
                 session = Mock(region_name="us-east-1", client=aws.client)
                 bounds = ["--regions", *regions, "--start", "2026-10-01", "--end", "2026-10-03",
                           "--services", "cloudtrail", "--skip-inventory", "--no-serve", "--progress", "off"]
+                if state == "open_end":
+                    bounds.remove("--end")
+                    bounds.remove("2026-10-03")
                 if state == "history":
                     bounds += ["--cloudtrail-source", "history"]
                 # Spend the real bounded listing budget immediately in the budget control.
@@ -727,24 +753,40 @@ class AutoInventoryContract(unittest.TestCase):
                     return original_call(check, service, region, operation, *args, **kwargs)
 
                 with patch("kamotrace.download.boto3.Session", return_value=session), \
-                        patch("kamotrace.download.clock.sleep"), patch.object(trailcheck.Check, "call", call):
+                        patch("kamotrace.download.clock.sleep"), patch.object(trailcheck.Check, "call", call), \
+                        patch("kamotrace.download.datetime", Clock):
                     status, log = self.run_auto(*bounds)
-                self.assertEqual(status, 1 if state == "multi_root_denied" else 0, log)
+                self.assertEqual(status, 1 if state in ("multi_root_denied", "empty_range") else 0, log)
                 manifest = json.loads((self.target / "download" / "manifest.json").read_text())
-                s3_selected = state == "present" or state.startswith("multi_root")
+                s3_selected = state in ("present", "open_end", "middle_day_missing", "unused_region", "empty_range") or state.startswith("multi_root")
                 self.assertEqual(manifest["cloudtrail_plan"]["source"], "s3" if s3_selected else "history")
+                if state in ("middle_day_missing", "unused_region", "empty_range"):
+                    audit = json.loads((self.target / "download" / "trailcheck.json").read_text())
+                    self.assertFalse(audit["requested_range"]["verified"])
+                    self.assertIn("without matching log objects", log)
+                if state == "open_end":
+                    self.assertTrue(manifest["end_default"])
+                    self.assertEqual(manifest["end"], "2026-10-03T13:00:00Z")
                 if state == "multi_root_denied":
                     self.assertFalse(manifest["complete"])
                     self.assertFalse((self.target / "case.duckdb").exists())
                     continue
-                self.assertEqual("get_object" in aws.operations(), s3_selected)
+                self.assertEqual("get_object" in aws.operations(), s3_selected and state != "empty_range")
                 self.assertEqual("lookup_events" in aws.operations(), not s3_selected)
                 self.assertEqual("describe_trails" in aws.operations(), state != "history")
+                if state == "empty_range":
+                    self.assertTrue(manifest["complete"])
+                    self.assertEqual(json.loads((self.target / "download" / "cloudtrail.json").read_text()), {"Records": []})
+                    self.assertIn("No CloudTrail Records found", log)
+                    self.assertFalse((self.target / "case.duckdb").exists())
+                    continue
                 db = duckdb.connect(str(self.target / "case.duckdb"), read_only=True)
                 try:
                     expected_ids = ({region + day + suffix for region in regions
                                      for day in ("2026-10-01", "2026-10-02", "2026-10-03")
-                                     for suffix in (("", "-second") if state.startswith("multi_root") else ("",))}
+                                     for suffix in (("", "-second") if state.startswith("multi_root") else ("",))
+                                     if not (state == "unused_region" and region == "ap-southeast-1")
+                                     and not (state == "middle_day_missing" and region == "ap-southeast-1" and day == "2026-10-02")}
                                     if s3_selected else {region + "-history" for region in regions})
                     self.assertEqual({row[0] for row in db.execute("SELECT event_id FROM events").fetchall()}, expected_ids)
                     self.assertEqual(db.execute("SELECT count(*) FROM events").fetchone()[0], len(expected_ids))
@@ -753,6 +795,19 @@ class AutoInventoryContract(unittest.TestCase):
                 with patch("kamotrace.download.boto3.Session", side_effect=AssertionError("no AWS on reuse")):
                     status, log = self.run_auto(*bounds)
                 self.assertEqual(status, 0, log)
+                if state == "open_end":
+                    export = self.target / "download" / "cloudtrail.json"
+                    before = digest(export)
+                    export.unlink()
+                    now[0] = datetime.fromisoformat("2026-10-04T15:00:00+00:00")
+                    with patch("kamotrace.download.boto3.Session", return_value=session), \
+                            patch("kamotrace.download.datetime", Clock):
+                        status, log = self.run_auto(*bounds)
+                    self.assertEqual(status, 0, log)
+                    self.assertEqual(digest(export), before)
+                    resumed = json.loads((export.parent / "manifest.json").read_text())
+                    self.assertEqual(resumed["end"], manifest["end"])
+                    self.assertEqual(resumed["cloudtrail_plan"], manifest["cloudtrail_plan"])
 
     def collection(self):
         from kamotrace import auto

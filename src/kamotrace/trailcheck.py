@@ -486,13 +486,14 @@ def audit(session, args, log):
     requested = None
     if getattr(args, "start", None) is not None:
         requested = {"start": iso(args.start), "end": iso(args.end), "locations": []}
-        for (bucket, region, base, owner, log_region), _ in tasks:
-            if owner != account or log_region not in regions:
-                continue
-            verified = [check.verify(bucket, region, f"{base}{log_region}/{day.replace('-', '/')}/",
-                                     owner, log_region, day) for day in days(args.start, args.end)]
-            requested["locations"].append({"bucket": bucket, "bucket_region": region, "prefix": base,
-                                          "region": log_region, "days": verified})
+        roots = sorted({task[:4] for task, _ in tasks if task[3] == account})
+        for bucket, region, base, owner in roots:
+            # An unused Region may have no prefix at all; still check its requested dates.
+            for log_region in regions:
+                verified = [check.verify(bucket, region, f"{base}{log_region}/{day.replace('-', '/')}/",
+                                         owner, log_region, day) for day in days(args.start, args.end)]
+                requested["locations"].append({"bucket": bucket, "bucket_region": region, "prefix": base,
+                                              "region": log_region, "days": verified})
         requested["verified"] = all(any(
             location["region"] == region and any(item["date"] == day and item["verification"] == "verified"
                                                    for item in location["days"])

@@ -39,9 +39,12 @@ use a new case folder for a fresh collection.
 By default, collection requests the maximum available history: CloudTrail Event
 History retains 90 days of management events; SSM command and terminated session
 history generally retain 30 days. For a specific window, add
-`--start 2026-10-01 --end 2026-10-02` (both UTC dates included). With both dates,
-auto prefers S3 trail logs only after verifying log presence for every requested
-region/day; otherwise it uses Event History. Neither source guarantees complete coverage.
+`--start 2026-10-01 --end 2026-10-02` (both UTC dates included). With `--start`,
+auto prefers discovered S3 trail locations with readable listings for every requested
+Region, allowing empty days and unused Regions; otherwise it uses Event History.
+Empty days are reported, not treated as proof of missing logs or complete coverage.
+Omit `--end` to collect through now
+(the first run's start time, frozen on resume). Neither source guarantees complete coverage.
 
 Already have a CloudTrail JSON export? Skip AWS collection:
 

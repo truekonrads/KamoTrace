@@ -46,15 +46,20 @@ including the collection's frozen time range. See
 [full-auto preparation](user-guide.md#full-auto-preparation) for all
 options and recovery rules.
 
-With explicit `--start` **and** `--end`, auto first runs trailcheck and prefers
-S3 only if it verifies a matching nonempty CloudTrail log object for **every
-requested Region and UTC day**, for the authenticated account. Missing, denied
-or budget-limited verification keeps Event History (90-day management-event
-retention only); it does not claim that S3 logs are absent. Use
-`--cloudtrail-source history` to disable this check. Without both dates, auto
+With explicit `--start`, auto first runs trailcheck and prefers discovered
+current-account S3 locations when every requested Region has at least one root
+whose requested day listings succeed. Empty days and Regions with no existing
+prefix are allowed: unused Regions need not contain logs. Samples without matching
+objects and unknown samples are counted separately in the collection output;
+per-day results remain in the audit. Empty listings do not prove missing logs or
+complete coverage. Missing locations, unknown Region scope, or denied, failed or
+budget-limited checks that leave no readable root for a Region keep Event History
+(90-day management-event retention only); they do not prove S3 logs are absent. Use
+`--cloudtrail-source history` to disable this check. An omitted `--end` means
+now (the first run's start time, frozen on resume). Without `--start`, auto
 keeps its existing Event History behavior. The source decision and discovered
 locations are frozen in the checkpoint; the audit is saved as `download/trailcheck.json`.
-Once the presence gate passes, collection fully lists every requested day at
+Once the readability gate passes, collection fully lists every requested day at
 every discovered current-account/Region root, including roots whose sample
 found no matching object. A denied collection listing stops the run rather than
 silently dropping that root. Existing history checkpoints, including those from
