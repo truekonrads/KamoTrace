@@ -59,6 +59,18 @@ CloudTrail time range. Select a system to inspect its addresses, assigned IAM
 roles, security groups, and exposure assessment. Collection failures remain
 visible as coverage gaps; a denied read does not mean the resource is absent.
 
+Choose **Explore full window** to keep the map, filters, tables and evidence
+inspector together in a full-window dialog. Close it or press Escape to return;
+filters and selection are retained. Drag the map background to pan, scroll to
+zoom around the pointer, or focus the map and use + / −. **Reset** (or Home)
+returns to a width-fitting overview; **Fit all** fits the entire topology.
+Load balancers occupy the first VPC column, with other systems to their right.
+Service icons identify resource types; labelled status dots distinguish
+configuration assessments. Selected nodes use a blue outline.
+The exposure filter separates systems with a configured public load-balancer
+route from those with **no recorded public LB route**. Neither option proves
+reachability or safety; missing routes may reflect collection gaps.
+
 Inventory is a **current, non-atomic configuration snapshot**, not a reconstruction
 of the incident. A permitted path means the exported configuration allows it,
 not that a service was listening or a connection succeeded. No active network
@@ -1452,6 +1464,12 @@ The interface typeface is [Geist](https://vercel.com/font): the unmodified
 variable `Geist-Variable.woff2` and `GeistMono-Variable.woff2` from the
 `geist@1.9.0` npm package, self-hosted so the app works offline. They are
 licensed under the SIL Open Font License 1.1, in `GEIST-LICENSE.txt` in the same folder.
+
+Topology diagrams use a small, unmodified subset of the free official
+[AWS architecture icons](https://aws.amazon.com/architecture/icons/) (2026-07-31
+package), served locally with no external requests. AWS permits these assets
+for architecture diagrams; they are AWS assets, not MIT-licensed KamoTrace code.
+Source paths and usage attribution are in `static/vendor/aws-icons/NOTICE.md`.
 
 ## Verification
 

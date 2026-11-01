@@ -57,6 +57,24 @@
       str(p.target_resource_id) === str(r.id));
   const routesFor = (r) =>
     list(data.forwarding_paths).filter((p) => related(p, r));
+  // A configured public forwarding route is not proof of successful access.
+  const viaPublic = (r) =>
+    routesFor(r).some(
+      (p) =>
+        (p.scheme === "internet-facing" || p.public_entry) &&
+        str(p.target_resource_region || p.region) === str(r.region) &&
+        !!p.target_resource_id &&
+        str(p.target_resource_id) === str(r.id),
+    );
+  const isLoadBalancer = (r) =>
+    /load\s*balancer|^elb|^alb|^nlb/i.test(str(r.kind)) ||
+    list(data.forwarding_paths).some(
+      (p) =>
+        str(p.region) === str(r.region) &&
+        str(p.load_balancer_id) === str(r.id),
+    );
+  const serviceIcon = (r) =>
+    `/vendor/aws-icons/${{ EC2: "ec2", RDS: "rds", Lambda: "lambda", "Load balancer": "elb" }[r.kind] || "resource"}.svg`;
   const title = (r) =>
     str(
       r.name ||
@@ -109,7 +127,25 @@
   function inspect(kind, item) {
     selected = item;
     const host = $("evidence");
-    host.replaceChildren(el("h3", title(item)));
+    const heading = el("div", null, "inventory-resource-heading"),
+      icon = el("img"),
+      label = el("div");
+    icon.src = serviceIcon(kind === "route" ? { kind: "Load balancer" } : item);
+    icon.alt = "";
+    label.append(
+      el("h3", title(item)),
+      el(
+        "p",
+        kind === "resource"
+          ? display(item.kind)
+          : kind === "route"
+            ? "Load balancer forwarding"
+            : "Collected configuration",
+        "hint",
+      ),
+    );
+    heading.append(icon, label);
+    host.replaceChildren(heading);
     if (kind === "resource") {
       facts(host, [
         ["Kind / status", `${display(item.kind)} / ${statusOf(item)}`],
@@ -172,7 +208,7 @@
         host,
         "Direct paths: security groups, routes and ACLs",
         item.paths || [],
-        true,
+        list(item.paths).length > 0,
       );
       raw(
         host,
@@ -395,11 +431,13 @@
     const q = $("search").value.trim().toLowerCase(),
       region = $("region").value,
       kind = $("kind").value,
-      status = $("assessment").value;
+      status = $("assessment").value,
+      exposure = $("exposure").value;
     const scope = (r) =>
       (!region || str(r.region) === region) &&
       (!kind || str(r.kind) === kind) &&
-      (!status || statusOf(r) === status);
+      (!status || statusOf(r) === status) &&
+      (!exposure || (exposure === "via" ? viaPublic(r) : !viaPublic(r)));
     // Do not let a match in one embedded forwarding path match every path on its LB.
     const resourceMatches = (r) =>
       searchable({ ...r, forwarding_paths: undefined }, q);
@@ -414,7 +452,7 @@
       (g) =>
         (!region || str(g.region) === region) &&
         searchable(g, q) &&
-        (!(kind || status) ||
+        (!(kind || status || exposure) ||
           list(data.resources).some((r) => scope(r) && attached(g, r))),
     );
     const routes = list(data.forwarding_paths).filter(
@@ -424,14 +462,14 @@
           list(data.resources).some(
             (r) => scope(r) && resourceMatches(r) && related(p, r),
           )) &&
-        (!(kind || status) ||
+        (!(kind || status || exposure) ||
           list(data.resources).some((r) => scope(r) && related(p, r))),
     );
     const actions = list(data.listener_actions).filter(
       (p) =>
         (!region || str(p.region) === region) &&
         searchable(p, q) &&
-        (!(kind || status) ||
+        (!(kind || status || exposure) ||
           list(data.resources).some((r) => scope(r) && related(p, r))),
     );
     if (view === "map") renderMap();
@@ -503,6 +541,19 @@
   function renderMap() {
     const svg = $("topology");
     svg.replaceChildren();
+    const defs = svgEl("defs"),
+      arrow = svgEl("marker", {
+        id: "inventory-arrow",
+        viewBox: "0 0 10 10",
+        refX: 9,
+        refY: 5,
+        markerWidth: 5,
+        markerHeight: 5,
+        orient: "auto-start-reverse",
+      });
+    arrow.append(svgEl("path", { d: "M0 0 L10 5 L0 10 Z", fill: "#228a9c" }));
+    defs.append(arrow);
+    svg.append(defs);
     const grouped = new Map(),
       positions = new Map();
     [...filtered]
@@ -519,30 +570,84 @@
       });
     let y = 18;
     grouped.forEach((resources) => {
-      const height = 52 + Math.ceil(resources.length / 3) * 112;
+      const balancers = resources.filter(isLoadBalancer),
+        backends = resources.filter((r) => !isLoadBalancer(r)),
+        rows = balancers.length
+          ? Math.max(balancers.length, Math.ceil(backends.length / 2))
+          : Math.ceil(resources.length / 3),
+        height = 116 + rows * 132;
       svg.append(
         svgEl("rect", {
           x: 12,
           y,
           width: 960,
           height,
-          rx: 4,
+          rx: 10,
           class: "inventory-vpc",
         }),
       );
+      const vpc = list(data.vpcs).find(
+        (v) =>
+          str(v.region) === str(resources[0].region) &&
+          str(v.id) === str(resources[0].vpc_id),
+      );
       svg.append(
+        svgEl("image", {
+          x: 28,
+          y: y + 18,
+          width: 30,
+          height: 30,
+          href: "/vendor/aws-icons/vpc.svg",
+        }),
         svgEl(
           "text",
-          { x: 28, y: y + 26 },
-          `${display(resources[0].region)} / ${display(resources[0].vpc_id)}`,
+          { x: 70, y: y + 30, class: "inventory-vpc-title" },
+          clip(display(vpc?.name || resources[0].vpc_id), 80),
+        ),
+        svgEl(
+          "text",
+          { x: 70, y: y + 48, class: "inventory-node-sub" },
+          `${display(resources[0].region)} · ${display(resources[0].vpc_id)} · ${resources.length} collected system${resources.length === 1 ? "" : "s"}`,
         ),
       );
-      resources.forEach((r, i) =>
-        positions.set(r, {
-          x: 32 + (i % 3) * 312,
-          y: y + 44 + Math.floor(i / 3) * 112,
-        }),
-      );
+      const lane = (x, width, label) => {
+        svg.append(
+          svgEl("rect", {
+            x,
+            y: y + 66,
+            width,
+            height: height - 82,
+            rx: 7,
+            class: "inventory-lane",
+          }),
+          svgEl(
+            "text",
+            { x: x + 14, y: y + 89, class: "inventory-lane-title" },
+            label,
+          ),
+        );
+      };
+      if (balancers.length) {
+        lane(26, 296, `Load balancers (${balancers.length})`);
+        lane(338, 620, `Systems (${backends.length})`);
+        balancers.forEach((r, i) =>
+          positions.set(r, { x: 40, y: y + 104 + i * 132 }),
+        );
+        backends.forEach((r, i) =>
+          positions.set(r, {
+            x: 352 + (i % 2) * 312,
+            y: y + 104 + Math.floor(i / 2) * 132,
+          }),
+        );
+      } else {
+        lane(26, 932, `Systems (${resources.length})`);
+        resources.forEach((r, i) =>
+          positions.set(r, {
+            x: 40 + (i % 3) * 312,
+            y: y + 104 + Math.floor(i / 3) * 132,
+          }),
+        );
+      }
       y += height + 20;
     });
     const edges = svgEl("g"),
@@ -561,12 +666,21 @@
       if (!a || !b) return;
       const pa = positions.get(a),
         pb = positions.get(b),
-        startX = pa.x + 270,
-        endX = pb.x;
-      const routeY = Math.max(pa.y, pb.y) + 98;
+        forward = pb.x > pa.x,
+        startX = pa.x + (forward ? 268 : 134),
+        startY = pa.y + (forward ? 54 : 110),
+        endX = pb.x - (forward ? 4 : -134),
+        endY = pb.y + (forward ? 54 : -4),
+        routeY = Math.max(pa.y, pb.y) + 122;
       const path = svgEl("path", {
-        d: `M${startX} ${pa.y + 43} H${startX + 10} V${routeY} H${endX - 10} V${pb.y + 43} H${endX}`,
+        d:
+          forward && pb.x - pa.x > 400
+            ? `M${startX} ${startY} C${startX + 16} ${startY} ${startX + 16} ${routeY} ${startX + 28} ${routeY} H${endX - 16} Q${endX - 4} ${routeY} ${endX - 4} ${routeY - 12} V${endY + 10} Q${endX - 4} ${endY} ${endX} ${endY}`
+            : forward
+              ? `M${startX} ${startY} C${startX + 22} ${startY} ${endX - 22} ${endY} ${endX} ${endY}`
+              : `M${startX} ${startY} C${startX} ${routeY} ${endX} ${routeY} ${endX} ${endY}`,
         class: `inventory-edge${forwarding ? " forwarding" : ""}`,
+        "marker-end": forwarding ? "url(#inventory-arrow)" : "",
         tabindex: 0,
         role: "button",
         "aria-label": `${forwarding ? "Load balancer path" : "Relationship"}: ${title(a)} to ${title(b)}. Inspect evidence.`,
@@ -611,28 +725,52 @@
         "aria-pressed": selected === r ? "true" : "false",
       });
       node.dataset.key = resourceKey(r);
+      node.dataset.status = statusOf(r);
       node.append(
         svgEl(
           "title",
           {},
           `${title(r)}\n${display(r.id)}\n${display(r.summary)}`,
         ),
-        svgEl("rect", { width: 270, height: 88, rx: 3 }),
-        svgEl("text", { x: 12, y: 20 }, clip(title(r))),
+        svgEl("rect", { width: 268, height: 110, rx: 7 }),
+        svgEl("image", {
+          x: 14,
+          y: 14,
+          width: 38,
+          height: 38,
+          href: serviceIcon(r),
+          "aria-hidden": "true",
+        }),
         svgEl(
           "text",
-          { x: 12, y: 39, class: "inventory-node-sub" },
-          clip(r.id),
+          { x: 64, y: 28, class: "inventory-node-title" },
+          clip(title(r), 25),
         ),
         svgEl(
           "text",
-          { x: 12, y: 58, class: "inventory-node-sub" },
-          `${display(r.kind)} · ${statusOf(r)}`,
+          { x: 64, y: 46, class: "inventory-node-sub" },
+          clip(r.id, 27),
         ),
         svgEl(
           "text",
-          { x: 12, y: 76, class: "inventory-node-sub" },
-          clip(display(r.addresses)),
+          { x: 14, y: 73, class: "inventory-node-sub" },
+          clip(display(r.addresses), 38),
+        ),
+        svgEl(
+          "text",
+          { x: 14, y: 96, class: "inventory-node-sub" },
+          display(r.kind),
+        ),
+        svgEl("circle", {
+          cx: 184,
+          cy: 92,
+          r: 4,
+          class: "inventory-status-dot",
+        }),
+        svgEl(
+          "text",
+          { x: 194, y: 96, class: "inventory-status-label" },
+          statusOf(r),
         ),
       );
       activate(node, () => selectResource(r));
@@ -657,11 +795,22 @@
     $("zoom").textContent = `${Math.round(zoom * 100)}%`;
   }
   function fitMap() {
-    zoom = Math.max(
-      0.3,
-      Math.min(1, ($("canvas").clientWidth - 18) / world.width),
-    );
+    if (!$("canvas").clientWidth) return;
+    setZoom(Math.min(1, ($("canvas").clientWidth - 18) / world.width), 0, 0);
+    $("canvas").scrollTo(0, 0);
+  }
+  function setZoom(
+    value,
+    x = $("canvas").clientWidth / 2,
+    y = $("canvas").clientHeight / 2,
+  ) {
+    const canvas = $("canvas"),
+      previous = zoom,
+      left = (canvas.scrollLeft + x) / previous,
+      top = (canvas.scrollTop + y) / previous;
+    zoom = Math.max(0.05, Math.min(3, value));
     resizeMap();
+    canvas.scrollTo(left * zoom - x, top * zoom - y);
   }
   function setView(next) {
     view = next;
@@ -702,15 +851,22 @@
         return;
       }
       $("status").textContent =
-        "Configuration snapshot, not a live availability test. Coverage failures are not evidence of safety.";
+        "Current configuration, not observed traffic. Coverage gaps are unknown.";
       const m = data.metadata || {};
       $("metadata").textContent =
-        `Account: ${display(m.account)} · Collection started (UTC): ${display(m.started_at_utc)} · Completed (UTC): ${display(m.completed_at_utc)}`;
+        `Account: ${display(m.account)} · Collected (UTC): ${display(m.completed_at_utc)}`;
+      $("metadata").title =
+        `Collection started (UTC): ${display(m.started_at_utc)}`;
       const errors = list(data.errors).length,
         limitations = list(m.limitations).length;
       $("warning").hidden = !(errors || limitations || !m.completed_at_utc);
-      $("warning").textContent =
-        `${errors} collection error(s) / denied operations; ${limitations} limitation(s). ${!m.completed_at_utc ? "Completion is not recorded. " : ""}Review Coverage before drawing conclusions; denied or failed is unknown, not absent.`;
+      $("warning").replaceChildren(
+        el(
+          "span",
+          `${errors} collection error(s) / denied operations; ${limitations} limitation(s). ${!m.completed_at_utc ? "Completion is not recorded. " : ""}Denied or failed is unknown, not absent.`,
+        ),
+      );
+      link($("warning"), "Review coverage", () => setView("coverage"));
       options("region", [
         ...list(m.regions),
         ...list(data.resources).map((r) => r.region),
@@ -726,6 +882,7 @@
       );
       options("assessment", statuses);
       $("content").hidden = false;
+      $("open-explorer").hidden = false;
       renderCoverage();
       render();
       fitMap();
@@ -761,7 +918,7 @@
     clearTimeout(searchTimer);
     searchTimer = setTimeout(render, 150);
   });
-  ["region", "kind", "assessment"].forEach((id) =>
+  ["region", "kind", "assessment", "exposure"].forEach((id) =>
     $(id).addEventListener("change", render),
   );
   $("clear").addEventListener("click", () => {
@@ -783,14 +940,92 @@
     );
     render();
   });
-  $("zoom-in").addEventListener("click", () => {
-    zoom = Math.min(2, zoom + 0.15);
-    resizeMap();
-  });
-  $("zoom-out").addEventListener("click", () => {
-    zoom = Math.max(0.3, zoom - 0.15);
-    resizeMap();
-  });
+  $("zoom-in").addEventListener("click", () => setZoom(zoom * 1.2));
+  $("zoom-out").addEventListener("click", () => setZoom(zoom / 1.2));
   $("fit").addEventListener("click", fitMap);
+  $("fit-all").addEventListener("click", () => {
+    const canvas = $("canvas");
+    setZoom(
+      Math.min(
+        (canvas.clientWidth - 18) / world.width,
+        (canvas.clientHeight - 18) / world.height,
+      ),
+      0,
+      0,
+    );
+    canvas.scrollTo(0, 0);
+  });
+  const canvas = $("canvas");
+  canvas.addEventListener(
+    "wheel",
+    (event) => {
+      if (!data?.loaded || !filtered.length) return;
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      setZoom(
+        zoom * Math.exp(-Math.max(-200, Math.min(200, event.deltaY)) * 0.002),
+        event.clientX - rect.left,
+        event.clientY - rect.top,
+      );
+    },
+    { passive: false },
+  );
+  let drag = null;
+  canvas.addEventListener("pointerdown", (event) => {
+    const rect = canvas.getBoundingClientRect();
+    if (
+      event.button !== 0 ||
+      event.target.closest(".inventory-node, .inventory-edge") ||
+      event.clientX >= rect.left + canvas.clientWidth ||
+      event.clientY >= rect.top + canvas.clientHeight
+    )
+      return;
+    drag = {
+      x: event.clientX,
+      y: event.clientY,
+      left: canvas.scrollLeft,
+      top: canvas.scrollTop,
+    };
+    canvas.setPointerCapture(event.pointerId);
+    canvas.classList.add("dragging");
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (drag)
+      canvas.scrollTo(
+        drag.left + drag.x - event.clientX,
+        drag.top + drag.y - event.clientY,
+      );
+  });
+  const stopDrag = () => {
+    drag = null;
+    canvas.classList.remove("dragging");
+  };
+  canvas.addEventListener("pointerup", stopDrag);
+  canvas.addEventListener("lostpointercapture", stopDrag);
+  canvas.addEventListener("keydown", (event) => {
+    if (event.target !== canvas) return;
+    if (["+", "=", "-", "Home"].includes(event.key)) {
+      event.preventDefault();
+      if (event.key === "Home") fitMap();
+      else setZoom(event.key === "-" ? zoom / 1.2 : zoom * 1.2);
+    }
+  });
+  const explorer = $("explorer"),
+    panel = $("panel"),
+    home = document.createComment("Inventory workspace home");
+  panel.before(home);
+  $("open-explorer").addEventListener("click", () => {
+    explorer.append(panel);
+    explorer.showModal();
+    fitMap();
+    redrawTables();
+  });
+  $("close-explorer").addEventListener("click", () => explorer.close());
+  explorer.addEventListener("close", () => {
+    home.after(panel);
+    fitMap();
+    redrawTables();
+    $("open-explorer").focus({ preventScroll: true });
+  });
   window.kamotraceInventory = { show, hide, selectResource };
 })();

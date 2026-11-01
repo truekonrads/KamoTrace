@@ -155,15 +155,30 @@
         </div>
       </aside>
       <main>
+        <dialog
+          id="inventory-explorer"
+          aria-labelledby="inventory-explorer-title"
+        >
+          <div class="inventory-heading">
+            <h2 id="inventory-explorer-title">Configuration explorer</h2>
+            <button id="inventory-close-explorer" type="button">
+              Close explorer
+            </button>
+          </div>
+        </dialog>
         <section id="inventory-panel" hidden aria-label="AWS inventory">
           <div class="inventory-heading">
             <h2>AWS inventory &amp; configuration map</h2>
-            <span class="hint">Collected snapshot · read-only</span>
+            <button id="inventory-open-explorer" type="button" hidden>
+              Explore full window
+            </button>
           </div>
-          <p id="inventory-metadata" class="hint"></p>
-          <p id="inventory-status" role="status" aria-live="polite">
-            Open inventory to load the local snapshot.
-          </p>
+          <div class="inventory-snapshot">
+            <p id="inventory-metadata" class="hint"></p>
+            <p id="inventory-status" role="status" aria-live="polite">
+              Open inventory to load the local snapshot.
+            </p>
+          </div>
           <button id="inventory-retry" type="button" hidden>
             Retry inventory
           </button>
@@ -195,6 +210,13 @@
               <label
                 >Status<select id="inventory-assessment">
                   <option value="">All statuses</option>
+                </select></label
+              >
+              <label
+                >Exposure<select id="inventory-exposure">
+                  <option value="">All exposure modes</option>
+                  <option value="via">Via public load balancer</option>
+                  <option value="direct">No recorded public LB route</option>
                 </select></label
               >
               <button id="inventory-clear" type="button">Clear filters</button>
@@ -238,8 +260,8 @@
                 >
                   <div class="inventory-map-tools">
                     <span class="hint"
-                      >Region / VPC groups · select a system or path for
-                      evidence</span
+                      >Scroll to zoom · drag background to pan · select a system
+                      or path for evidence</span
                     >
                     <div>
                       <button
@@ -255,8 +277,9 @@
                         aria-label="Zoom topology in"
                       >
                         +</button
-                      ><button id="inventory-fit" type="button">
-                        Fit width
+                      ><button id="inventory-fit" type="button">Reset</button>
+                      <button id="inventory-fit-all" type="button">
+                        Fit all
                       </button>
                     </div>
                   </div>
@@ -264,7 +287,7 @@
                     id="inventory-canvas"
                     tabindex="0"
                     role="region"
-                    aria-label="Scrollable configuration topology; Tab to nodes and paths, Enter to inspect"
+                    aria-label="Configuration topology; drag background to pan, scroll or plus and minus to zoom, Home to reset; Tab to nodes and paths, Enter to inspect"
                   >
                     <svg
                       id="inventory-topology"
