@@ -92,6 +92,47 @@ kamotrace auto C:\cases\offline --source C:\exports\cloudtrail.json
 See [auto options and recovery](docs/user-guide.md#full-auto-preparation) or
 the [manual preparation and collection reference](docs/preparation.md) for more control.
 
+#### Optional GuardDuty alerts
+
+Opt in to retained GuardDuty findings alongside the normal collection:
+
+```powershell
+kamotrace auto C:\cases\example-gd --profile investigation --services cloudtrail ssm guardduty
+```
+
+Or download findings separately and import them against existing evidence:
+
+```powershell
+kamotrace download --dest C:\cases\gd-export --profile investigation --regions all --services guardduty
+kamotrace guardduty --database C:\cases\example\case.duckdb --findings C:\cases\gd-export\guardduty.json
+```
+
+Existing AWS `GetFindings` JSON (`Findings` array), or a bare findings array, works
+offline too. Auto accepts `--guardduty-findings FILE` with existing CloudTrail inputs.
+The derived `<database>.guardduty.duckdb` sidecar is picked up by `serve` on restart
+(or pass `--guardduty PATH`). Use `--replace` to rebuild a recognised GuardDuty
+sidecar; original evidence is never modified. Auto reuses verified unchanged inputs.
+
+The **Detections** tab and MCP `list_detections` / `query.rules` include explicitly
+labelled **GuardDuty context (not exact)** leads. Context requires the finding's
+account to match `userIdentity.accountId`, region and exact access key, within
+`[EventFirstSeen, EventLastSeen)`. It does not establish that GuardDuty detected
+that particular CloudTrail event. Missing keys/times, zero-length intervals and
+other resource types remain unlinked, not guessed from IPs. All findings and their
+raw JSON remain in the source and sidecar; linked finding JSON is also available
+in event details and MCP `get_event`, separately from original CloudTrail JSON.
+
+Collection needs `guardduty:ListDetectors`, `guardduty:ListFindings` and
+`guardduty:GetFindings` **in addition to** the generated default collection policy
+(plus normal STS identity and, for `--regions all`, EC2 region discovery access).
+It never enables or changes a detector. Archived findings are included.
+`--start` / `--end` select **finding updatedAt**, not the activity's event time;
+omit them for all retained findings up to collection start. GuardDuty generally
+retains findings for 90 days. No enabled detector is reported separately from an
+empty findings list; denied calls fail collection, never masquerade as no findings.
+Downloads resume from checkpoints, not live sync; use a new destination to refresh.
+`--compress` does not compress `guardduty.json`. Treat exports as sensitive data.
+
 ### 3. Connect your AI assistant
 
 Auto serves MCP at **http://127.0.0.1:8765/mcp** alongside the browser. Keep it

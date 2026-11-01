@@ -35,6 +35,7 @@ LIMITATIONS = [
     "Session SSH/port forwarding is not logged. Missing, expired, disabled or not-yet-delivered logs cannot be recovered.",
     "Collection is a resumable snapshot, not a live sync; completed requests are not refreshed on resume.",
     "Session records/transcripts are saved but are not displayed by the Run Command viewer.",
+    "GuardDuty (when selected): retained findings, including archived findings, selected by updatedAt, not event time; generally only 90 days are retained. No detector is enabled or changed.",
 ]
 # LookupEvents permits two calls/second/account/Region. Each Region's daily windows share one pace,
 # so two workers keep a slow (high-latency) connection near that limit without exceeding it.
@@ -554,6 +555,28 @@ class Collector:
                 parsed = urlsplit(location)
                 self.s3(region, parsed.netloc, parsed.path.lstrip("/"), logs, set(sessions))
 
+    def guardduty(self, region):
+        """Read retained findings, checkpointing lists and GetFindings batches for resume."""
+        findings, detectors = {}, []
+        criterion = {"updatedAt": {"Lte": int(self.end.timestamp() * 1000)}}
+        if self.start is not None:
+            criterion["updatedAt"]["Gte"] = int(self.start.timestamp() * 1000)
+        for page in self.pages("guardduty", region, "list_detectors", {}):
+            detectors.extend(page["DetectorIds"])
+        for detector in detectors:
+            for page in self.pages("guardduty", region, "list_findings",
+                    {"DetectorId": detector, "FindingCriteria": {"Criterion": criterion}, "MaxResults": 50}):
+                ids = page["FindingIds"]
+                if ids:
+                    for response in self.pages("guardduty", region, "get_findings",
+                            {"DetectorId": detector, "FindingIds": ids}):
+                        returned = response["Findings"]
+                        if {f["Id"] for f in returned} != set(ids):
+                            raise ValueError(f"{region}: GuardDuty findings changed or disappeared during collection; use a fresh destination")
+                        findings.update((finding["Arn"], finding) for finding in returned)
+        return {"region": region, "detector_ids": detectors,
+                "status": "collected" if detectors else "not_enabled", "findings": list(findings.values())}
+
     def export_events(self):
         target = self.folder / ("cloudtrail.json.gz" if self.compress else "cloudtrail.json")
         with json_output(target) as output:
@@ -571,7 +594,7 @@ def main(argv=None):
     parser.add_argument("--regions", nargs="+", required=True, help="Region names, or all enabled regions (space separated)")
     parser.add_argument("--start", help="Inclusive ISO timestamp with offset, or YYYY-MM-DD at UTC midnight; default: all available history")
     parser.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date YYYY-MM-DD; default: collection start time")
-    parser.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm"), default=["cloudtrail", "ssm"])
+    parser.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm", "guardduty"), default=["cloudtrail", "ssm"])
     parser.add_argument("--cloudtrail-source", choices=("history", "auto"), default="history",
                         help="auto: with --start, prefer readable S3 locations, allowing empty days; omitted --end uses collection start time; otherwise Event History")
     parser.add_argument("--cloudtrail-s3", action="append", default=[], metavar="s3://BUCKET/ROOT/AWSLogs/ACCOUNT/CloudTrail/",
@@ -715,6 +738,7 @@ def main(argv=None):
         # SSM collects into its Region's own part; CloudTrail only into the checkpoint's events table.
         parts = {name: ({key: [] for key in ("commands", "invocations", "invocation_details", "sessions")}, {})
                  for name in regions}
+        guardduty = {}
 
         def collect(job):
             selected_region, service = job
@@ -723,9 +747,12 @@ def main(argv=None):
                     collector.cloudtrail_s3(selected_region, plan["locations"], identity["Account"], parts[selected_region][1])
                 else:
                     collector.cloudtrail(selected_region)
+            elif service == "guardduty":
+                guardduty[selected_region] = collector.guardduty(selected_region)
             else:
                 collector.ssm(selected_region, *parts[selected_region], args.session_s3, args.session_log_group)
-            progress.tick(f"{selected_region}: {'CloudTrail' if service == 'cloudtrail' else 'SSM'} complete", done=1)
+            label = {"cloudtrail": "CloudTrail", "ssm": "SSM", "guardduty": "GuardDuty"}[service]
+            progress.tick(f"{selected_region}: {label} complete", done=1)
         progress.idle()  # Setup messages give way to the workers' lines.
         jobs = [(name, service) for name in regions for service in settings["services"]]
         collector.parallel(collect, jobs, len(jobs))
@@ -739,6 +766,10 @@ def main(argv=None):
         manifest.update(complete=True, completed_at=iso(datetime.now(timezone.utc)), logs=list(logs.values()))
         if "ssm" in args.services:
             atomic_json(folder / ("ssm.json.gz" if args.compress else "ssm.json"), document)
+        if "guardduty" in args.services:
+            atomic_json(folder / "guardduty.json", {"coverage": manifest,
+                "regions": [{key: value for key, value in guardduty[name].items() if key != "findings"} for name in regions],
+                "Findings": [finding for name in regions for finding in guardduty[name]["findings"]]})
         atomic_json(folder / "manifest.json", manifest)
         progress.close()
         print(f"Collection complete: {folder}")

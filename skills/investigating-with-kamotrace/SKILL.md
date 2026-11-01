@@ -110,8 +110,8 @@ takes the same `query` object. **Everything combines with AND.**
   mean all of them.
 - `note_id`: only events linked to that note. `command_key`: only CloudTrail
   events linked to that SSM command.
-- `rules` (Suzaku rule IDs, from `list_detections`), all of which must match;
-  `min_level` is at least that Sigma level.
+- `rules` (Suzaku rule or GuardDuty context IDs, from `list_detections`), all of
+  which must match; `min_level` is at least that severity level.
 - **Time:** ISO 8601 **with an offset**. `start` is inclusive and `end` is
   exclusive. Set `query.timezone` to an IANA zone (default `UTC`), such as
   `{"timezone":"Asia/Singapore"}`. It controls `time_local` results/filters,
@@ -261,6 +261,18 @@ search_scope="enhanced")` now finds it, `search_scope="raw"` does not.
   linked event counts, plus provenance and unmatched/ambiguous counts. Search a
   rule's events with `query.rules: ["<rule_id>"]`, then verify them in the raw
   events before treating anything as a finding.
+- It also lists **GuardDuty context (not exact)** leads, with `guardduty` import
+  provenance, linked/unlinked finding counts and `link_basis`. `run` may be null
+  even when GuardDuty is loaded. IDs start with `guardduty:`; pass an exact ID
+  from `list_detections` to `search_events(query={rules: [id]})`, then inspect
+  `get_event(id).guardduty_findings[].raw_finding` separately from CloudTrail JSON.
+  Links require identity account + region + exact access key + observed interval
+  `[EventFirstSeen, EventLastSeen)`, not an exact event match or proof of compromise.
+  Missing keys/times and unsupported resources remain unlinked in the source JSON
+  and sidecar. Download ranges select finding **updatedAt**, not activity time.
+  Offline preparation: `kamotrace guardduty --database case.duckdb --findings guardduty.json`;
+  restart the server to load the sidecar. Do not infer "no findings" from denied
+  or incomplete collection.
 - `country`, `city`, `asn` and `isp` are offline lookups (DB-IP Lite/GeoLite2 and/or the
   analyst's provider JSONL), not evidence. `(unmapped / service / private)`
   means no lookup applied (AWS service names, private ranges, missing data).

@@ -32,7 +32,8 @@ OPENER = build_opener(ProxyHandler({}))  # Never route loopback evidence traffic
 # Tool/resource lists are fixed; the buffered HTTP bridge cannot stream subscriptions.
 mcp = MCPServer("kamotrace", subscriptions=False, instructions="""\
 Search and annotate CloudTrail evidence held by a local, read-only KamoTrace browser.
-If Suzaku detections were imported, list_detections shows Sigma rules; filter with query.rules / min_level.
+list_detections shows imported Suzaku rules and labelled GuardDuty contextual leads; filter with query.rules / min_level.
+GuardDuty context is not an exact CloudTrail event match. Verify original evidence before drawing conclusions.
 Call describe_schema first for valid fields, operators, sort fields, page sizes and time bounds.
 Times are ISO 8601 with an offset; query.timezone selects local display and bucket boundaries
 (default UTC). describe_schema(timezone=...) lists supported IANA zones. Ranges are
@@ -70,9 +71,9 @@ class Query(BaseModel):
     command_key: str | None = Field(None, description="Only CloudTrail events linked to this SSM command key.")
     start: str | None = Field(None, description="Inclusive start, ISO 8601 with offset, e.g. 2026-01-02T00:00:00+07:00.")
     end: str | None = Field(None, description="Exclusive end, ISO 8601 with offset.")
-    rules: list[str] = Field([], description="Suzaku rule IDs from list_detections; events must match every one (AND).")
+    rules: list[str] = Field([], description="Suzaku rule or GuardDuty context IDs from list_detections; events must match every one (AND).")
     min_level: Literal["informational", "low", "medium", "high", "critical"] | None = Field(
-        None, description="Only events with a Suzaku detection at or above this Sigma level.")
+        None, description="Only events with a detection or contextual lead at or above this severity level.")
 
     def body(self):
         return {"timezone": self.timezone, "search": self.search, "filters": [f.model_dump() for f in self.filters], "tags": self.tags,
@@ -359,7 +360,11 @@ def edit_ssm_log_entry(entry_id: str, text: str, tags: list[str], finding: str,
 def list_detections() -> dict[str, Any]:
     """Imported Suzaku Sigma rules (most severe first) with level, ATT&CK tactics/techniques and the
     number of linked evidence events, plus the import's provenance (Suzaku version, rules revision,
-    linked/unmatched/ambiguous counts). `run` is null when no detections were imported."""
+    linked/unmatched/ambiguous counts). `run` is null without Suzaku. `guardduty` contains GuardDuty
+    provenance, contextual/unlinked finding counts and link_basis, or null. GuardDuty IDs start with
+    guardduty: and titles explicitly say context (not exact); these are NOT exact event matches.
+    Raw findings, including unsupported/unlinked ones, remain in the source JSON and GuardDuty sidecar.
+    Linked original finding JSON is available in get_event.guardduty_findings[].raw_finding."""
     return call("/api/detections")
 
 

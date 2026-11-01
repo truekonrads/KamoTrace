@@ -419,10 +419,10 @@ function renderScopes() {
   for (const id of s.rules) {
     const rule = detections.rules.find((r) => r.rule_id === id);
     out.push(
-      chip(`Sigma: ${rule ? rule.title : id}`, {
+      chip(`Lead: ${rule ? rule.title : id}`, {
         kind: "rule",
         title:
-          "Suzaku detection (Sigma rule " +
+          "Detection or contextual lead (" +
           id +
           "). Several rule scopes must all match.",
         onClick: () => sidebarTab("detections"),
@@ -432,9 +432,9 @@ function renderScopes() {
   }
   if (s.min_level !== null)
     out.push(
-      chip(`Sigma ≥ ${s.min_level}`, {
+      chip(`Severity ≥ ${s.min_level}`, {
         kind: "rule",
-        title: `Only events with a Suzaku detection at level ${s.min_level} or above.`,
+        title: `Only events with a detection or contextual lead at level ${s.min_level} or above.`,
         onClick: () => sidebarTab("detections"),
         onRemove: () => apply({ ...s, min_level: null }),
       }),
@@ -2481,11 +2481,19 @@ function renderDetections() {
         : "") +
       ". Detections are automated leads: tag events or record a finding about what you observe."
     : "";
+  if (detections.guardduty) {
+    const gd = detections.guardduty;
+    $("detections-run").textContent +=
+      ` GuardDuty: ${number(gd.findings)} findings · ${number(gd.linked_findings)} with contextual links · ` +
+      `${number(gd.unlinked_findings)} unlinked (retained in the sidecar and source JSON). ` +
+      "Context requires identity account, region, access key and observed interval [first, last). " +
+      "These are not exact CloudTrail event matches or confirmed findings.";
+  }
 }
 
 async function loadDetections() {
   detections = await request("/api/detections");
-  $("detections-tab").hidden = !detections.run;
+  $("detections-tab").hidden = !detections.run && !detections.guardduty;
   tabLabel("detections-tab", "Detections", detections.rules.length);
   renderDetections();
 }
@@ -2499,13 +2507,16 @@ function detectionCell(cell) {
   b.append(levelBadge(list[0].level));
   if (list.length > 1) b.append(String(list.length));
   b.title = list.map((d) => `[${d.level}] ${d.title}`).join("\n");
-  b.setAttribute("aria-label", `${list.length} Suzaku detections; show them`);
+  b.setAttribute(
+    "aria-label",
+    `${list.length} detections or contextual leads; show them`,
+  );
   b.onclick = (e) => {
     e.stopPropagation();
     const menu = $("tag-popover");
     const title = document.createElement("p");
     title.className = "menu-title";
-    title.textContent = `Suzaku detections on this event (${list.length})`;
+    title.textContent = `Detections / context on this event (${list.length})`;
     const ul = document.createElement("ul");
     for (const d of list) {
       const li = document.createElement("li");
@@ -2679,9 +2690,9 @@ function scopeSummary(s) {
   if (s.annotation_id !== null) parts.push(`finding #${s.annotation_id}`);
   for (const r of s.rules || [])
     parts.push(
-      `Sigma ${detections.rules.find((d) => d.rule_id === r)?.title || r}`,
+      `Detection / context ${detections.rules.find((d) => d.rule_id === r)?.title || r}`,
     );
-  if (s.min_level) parts.push(`Sigma ≥ ${s.min_level}`);
+  if (s.min_level) parts.push(`Severity ≥ ${s.min_level}`);
   if (s.command_key !== null)
     parts.push(`SSM command ${s.command_label || ""}`);
   return parts.join(" · ");
@@ -2939,7 +2950,7 @@ function detailFindings() {
     const det = document.createElement("div");
     det.className = "detail-tags";
     const dlabel = document.createElement("strong");
-    dlabel.textContent = "Suzaku";
+    dlabel.textContent = "Detections / context";
     det.append(dlabel);
     for (const d of detailRow.detections) {
       const b = document.createElement("button");
@@ -2952,12 +2963,24 @@ function detailFindings() {
     }
     target.append(det);
   }
+  for (const finding of detailRow.guardduty_findings || []) {
+    const disclosure = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent =
+      "GuardDuty finding JSON — contextual lead, not an exact event match";
+    const raw = document.createElement("pre");
+    raw.textContent = finding.raw_finding;
+    disclosure.append(summary, raw);
+    target.append(disclosure);
+  }
 }
 
 async function detail(row) {
   try {
     const data = await request(`/api/events/${row.id}`);
-    detailRow = row.record_sha256 ? row : null;
+    detailRow = row.record_sha256
+      ? { ...row, guardduty_findings: data.guardduty_findings }
+      : null;
     $("detail-id").textContent =
       `${data.event_id} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
     const loaded = table
@@ -3965,13 +3988,14 @@ async function init() {
         formatter: noteCell,
       },
       {
-        title: "Sigma",
+        title: "Leads",
         field: "detections",
         width: 58,
         frozen: true,
         headerSort: false,
         visible: meta.detections_loaded,
-        headerTooltip: "Suzaku detections: most severe level and match count",
+        headerTooltip:
+          "Suzaku detections / GuardDuty context: most severe level and lead count",
         formatter: detectionCell,
       },
       textColumn("Local time", "time_local", 150, { cssClass: "tabular-cell" }),

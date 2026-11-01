@@ -23,6 +23,7 @@ COMMANDS = {
     "trailcheck": ("kamotrace.trailcheck", "Read-only audit of trails, logging/delivery state, S3 destinations and log dates"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
+    "guardduty": ("kamotrace.guardduty", "Enrich events with contextual GuardDuty findings from downloaded JSON"),
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),
     "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2-format .mmdb and/or provider-neutral JSONL"),
     "ssmcheck": ("kamotrace.ssmcheck", "Read-only report of what SSM sessions and commands log, and where"),

@@ -543,7 +543,7 @@ class BrowserContract(unittest.TestCase):
                 self.assertLessEqual({"describe_schema", "search_events", "get_event", "tag_events", "untag_events",
                                       "create_note", "edit_note", "link_note_events", "unlink_note_events",
                                       "search_ssm_commands", "get_ssm_command", "search_ssm_log", "get_ssm_log_entry", "edit_ssm_log_entry"}, names)
-                self.assertEqual(await tool("list_detections"), {"run": None, "rules": []})
+                self.assertEqual(await tool("list_detections"), {"run": None, "guardduty": None, "rules": []})
                 schema = await tool("describe_schema")
                 self.assertIn("not_missing", schema["operators"])
                 self.assertEqual(schema["timezone"], "UTC")
@@ -726,7 +726,7 @@ class BrowserContract(unittest.TestCase):
             store.reviews.close()
         # Without detections the same filter is valid and simply matches nothing.
         self.assertEqual(self.call("/api/events", {"rules": ["rule-low"]})[1]["last_row"], 0)
-        self.assertEqual(self.call("/api/detections")[1], {"run": None, "rules": []})
+        self.assertEqual(self.call("/api/detections")[1], {"run": None, "guardduty": None, "rules": []})
 
     def test_large_detection_sidecar_preserves_all_rules_and_lists(self):
         sidecar = Path(self.temp.name) / "bulk.detections.duckdb"
@@ -1557,6 +1557,116 @@ class BrowserContract(unittest.TestCase):
         for width in (0, "1;DROP TABLE events", 1.5):
             self.assertEqual(self.call("/api/histogram", {**body, "bucket_minutes": width})[0], 400)
         self.assertEqual(self.call("/api/histogram", {**body, "bucket_minutes": 1})[0], 400)
+
+
+class GuardDutyContract(unittest.TestCase):
+    def test_guardduty_context_http_mcp_and_evidence_safety(self):
+        from kamotrace.cli import main
+        from kamotrace.guardduty import build as import_findings
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as cleanup:
+            root = Path(temporary)
+            source, database, findings = root / "events.json", root / "case.duckdb", root / "guardduty.json"
+            base = {"eventSource": "sts.amazonaws.com", "eventName": "GetCallerIdentity", "awsRegion": "us-east-1",
+                    "userIdentity": {"accountId": "123456789012", "accessKeyId": "AKIASYNTHETIC", "type": "IAMUser"}}
+            records = [{**base, "eventID": str(i), "eventTime": stamp} for i, stamp in enumerate([
+                "2026-10-01T00:59:59Z", "2026-10-01T01:00:00Z", "2026-10-01T01:03:00Z", "2026-10-01T02:00:00Z"])]
+            for changes in ({"awsRegion": "eu-west-1"}, {"userIdentity": {"accountId": "other", "accessKeyId": "AKIASYNTHETIC"}},
+                            {"userIdentity": {"accountId": "123456789012", "accessKeyId": "other"}}):
+                records.append({**records[2], **changes, "eventID": str(len(records))})
+            source.write_text(json.dumps({"Records": records}))
+            build(source, database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            finding = {"Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/synthetic/finding/one",
+                "Id": "one", "AccountId": "123456789012", "Region": "us-east-1", "Type": "UnauthorizedAccess:IAMUser/Test",
+                "Title": "Synthetic API activity <script>neverRun()</script>", "Severity": 8.9,
+                "Resource": {"AccessKeyDetails": {"AccessKeyId": "AKIASYNTHETIC"}},
+                "Service": {"EventFirstSeen": "2026-10-01T01:00:00Z", "EventLastSeen": "2026-10-01T02:00:00Z", "Archived": True},
+                "large_number": 9007199254740993}
+            unsupported = {**finding, "Arn": finding["Arn"] + "-unsupported", "Id": "unsupported", "Resource": {}}
+            findings.write_text(json.dumps({"Findings": [finding, unsupported]}))
+            self.assertEqual(main(["guardduty", "--database", str(database), "--findings", str(findings)]), 0)
+            sidecar = database.with_suffix(".guardduty.duckdb")
+            with duckdb.connect(str(sidecar), read_only=True) as connection:
+                self.assertEqual(connection.execute("SELECT raw_finding->>'$.large_number' FROM findings LIMIT 1").fetchone()[0], "9007199254740993")
+            with self.assertRaises(FileExistsError):
+                import_findings(database, findings, sidecar)
+            with self.assertRaises(ValueError):
+                import_findings(database, findings, database, replace=True)
+            sidecar_hash = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+            bad = root / "bad.json"
+            for invalid in ({"Findings": [finding], "coverage": {"complete": False}},
+                            {"Findings": [{**finding, "Severity": True}]},
+                            {"Findings": [{**finding, "Service": {"EventFirstSeen": "2026-10-01T01:00:00"}}]}):
+                bad.write_text(json.dumps(invalid))
+                with self.assertRaises(ValueError):
+                    import_findings(database, bad, sidecar, replace=True)
+                self.assertEqual(hashlib.sha256(sidecar.read_bytes()).hexdigest(), sidecar_hash)
+            other = root / "other.duckdb"
+            bad.write_text(json.dumps({"Records": records[:1]}))
+            build(bad, other)
+            with self.assertRaisesRegex(ValueError, "different evidence"):
+                Store(other, guardduty=sidecar)
+            store = Store(database)
+            cleanup.callback(store.reviews.close)
+            cleanup.callback(store.connection.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            cleanup.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            cleanup.callback(thread.join)
+            cleanup.callback(server.shutdown)
+            url = f"http://127.0.0.1:{server.server_port}"
+
+            def request(path, body=None):
+                with urlopen(Request(url + path, data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})) as response:
+                    return json.load(response)
+
+            result = request("/api/detections")
+            self.assertIsNone(result["run"])
+            self.assertEqual((result["guardduty"]["linked_findings"], result["guardduty"]["unlinked_findings"]), (1, 1))
+            self.assertTrue(request("/api/meta")["detections_loaded"])
+            rule = result["rules"][0]
+            self.assertEqual((rule["events"], rule["level"]), (2, "high"))
+            query = {"rules": [rule["rule_id"]]}
+            events = request("/api/events", query)
+            self.assertEqual({r["event_id"] for r in events["data"]}, {"1", "2"})
+            self.assertIn("context (not exact)", events["data"][0]["detections"][0]["title"])
+            self.assertEqual(request("/api/events", {"min_level": "critical"})["last_row"], 0)
+
+            async def mcp_contract():
+                async with Client(StdioServerParameters(command=sys.executable,
+                    args=["-m", "kamotrace", "mcp", "--url", url])) as client:
+                    detections = await client.call_tool("list_detections", {})
+                    self.assertEqual(detections.structured_content["guardduty"]["findings"], 2)
+                    response = await client.call_tool("search_events", {"query": query})
+                    self.assertEqual(response.structured_content["total"], 2)
+                    event = await client.call_tool("get_event", {"id": events["data"][0]["id"]})
+                    self.assertEqual(json.loads(event.structured_content["guardduty_findings"][0]["raw_finding"]), finding)
+            anyio.run(mcp_contract)
+            # Both sources must coexist without numeric catalog-key collisions or altered rule filters.
+            suzaku = root / "suzaku.detections.duckdb"
+            info = json.loads(store.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
+            with duckdb.connect(str(suzaku)) as out:
+                out.execute("CREATE TABLE suzaku_run(metadata JSON)")
+                out.execute("INSERT INTO suzaku_run VALUES (?)", [json.dumps({"schema_version": 1,
+                    "evidence_source_sha256": info["source_sha256"], "evidence_records": len(records)})])
+                out.execute("""CREATE TABLE detections AS SELECT 2::BIGINT AS source_record,
+                    'sigma-test' AS rule_id, 'Synthetic Sigma' AS rule_title, 'low' AS level,
+                    1::TINYINT AS level_rank, ['Discovery']::VARCHAR[] AS tactics,
+                    ['T1087']::VARCHAR[] AS technique_ids, 'linked' AS link_status""")
+            combined = Store(database, detections=suzaku)
+            try:
+                self.assertEqual({r["rule_id"]: r["events"] for r in combined.detections_list()["rules"]},
+                                 {rule["rule_id"]: 2, "sigma-test": 1})
+                both = combined.query({"rules": [rule["rule_id"], "sigma-test"]})
+                self.assertEqual([row["event_id"] for row in both["data"]], ["1"])
+                self.assertEqual(len(both["data"][0]["detections"]), 2)
+                self.assertEqual(len(combined.detail(2)["guardduty_findings"]), 1)
+            finally:
+                combined.connection.close()
+                combined.reviews.close()
+            self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
 
 
 if __name__ == "__main__":
