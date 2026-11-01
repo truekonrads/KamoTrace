@@ -760,6 +760,9 @@ class AutoInventoryContract(unittest.TestCase):
                 manifest = json.loads((self.target / "download" / "manifest.json").read_text())
                 s3_selected = state in ("present", "open_end", "middle_day_missing", "unused_region", "empty_range") or state.startswith("multi_root")
                 self.assertEqual(manifest["cloudtrail_plan"]["source"], "s3" if s3_selected else "history")
+                self.assertEqual("WARNING: SLOW CLOUDTRAIL API COLLECTION" in log, not s3_selected)
+                if not s3_selected:
+                    self.assertIn("can take HOURS", log)
                 if state in ("middle_day_missing", "unused_region", "empty_range"):
                     audit = json.loads((self.target / "download" / "trailcheck.json").read_text())
                     self.assertFalse(audit["requested_range"]["verified"])

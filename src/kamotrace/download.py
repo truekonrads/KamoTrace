@@ -691,6 +691,17 @@ def main(argv=None):
                           "(last 90 days, management events only). See trailcheck.json.", file=sys.stderr, flush=True)
             with collector.db:
                 collector.db.execute("INSERT INTO cloudtrail_plan VALUES (?)", (encode(plan),))
+        if "cloudtrail" in settings["services"] and plan["source"] == "history":
+            if progress.mode == "bar" and progress.drawn:
+                # Leave the existing bar above the warning; redraw only below it from now on.
+                print(file=sys.stderr)
+                progress.drawn = 0
+            print("\n!!! WARNING: SLOW CLOUDTRAIL API COLLECTION !!!\n"
+                  "Using CloudTrail Event History (LookupEvents), NOT S3.\n"
+                  "This rate-limited API can take HOURS for busy accounts or large time ranges.\n"
+                  "Only the last 90 days of management events are available.\n"
+                  "S3 trail collection is usually much faster. The source is frozen on resume;\n"
+                  "use a new destination to change it.\n", file=sys.stderr, flush=True)
         progress.total = len(regions) * len(settings["services"])
         progress.plan(regions, len(collector.windows()) if "cloudtrail" in args.services else 0, "ssm" in args.services)
         manifest = {**settings, "resolved_regions": regions, "complete": False, "limitations": LIMITATIONS,

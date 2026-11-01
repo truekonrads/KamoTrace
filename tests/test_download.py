@@ -292,6 +292,8 @@ class DownloadContract(unittest.TestCase):
         stub.add_response("lookup_events", {"Events": [first], "NextToken": "old"}, params)
         stub.add_client_error("lookup_events", "ExpiredToken", expected_params={**params, "NextToken": "old"})
         _, log = self.run_cli("--services", "cloudtrail", "--progress", "log", status=1)
+        self.assertIn("WARNING: SLOW CLOUDTRAIL API COLLECTION", log)
+        self.assertIn("can take HOURS", log)
         self.assertIn("page 1 saved", log)
         self.assertIn("1 pages (0 cached) | CloudTrail ETA estimating |", log)
         self.assertNotIn("SSM", log)
@@ -305,6 +307,8 @@ class DownloadContract(unittest.TestCase):
         stub.add_response("lookup_events", {"Events": [], "NextToken": "final"}, {**params, "NextToken": "new"})
         stub.add_response("lookup_events", {"Events": [last, outside]}, {**params, "NextToken": "final"})
         _, bar = self.run_cli("--services", "cloudtrail", "--progress", "bar")
+        warning_end = bar.index("use a new destination to change it.\n\n") + len("use a new destination to change it.\n\n")
+        self.assertTrue(bar[warning_end:].startswith("\r\r\033[2K"), bar)
         self.assertIn("🦆", bar)
         self.assertIn("[" + "🦆" * 10 + "]", bar)
         self.assertNotIn("#", bar)
@@ -319,6 +323,7 @@ class DownloadContract(unittest.TestCase):
         # Completed collection resumes entirely from disk, including output regeneration.
         self.identity()
         _, quiet = self.run_cli("--services", "cloudtrail", "--progress", "off")
+        self.assertIn("WARNING: SLOW CLOUDTRAIL API COLLECTION", quiet)
         self.assertNotIn("page", quiet)
         self.assertTrue(json.loads((self.folder / "manifest.json").read_text())["complete"])
         self.identity()
@@ -355,7 +360,8 @@ class DownloadContract(unittest.TestCase):
             stub.add_response("describe_sessions", {"Sessions": []},
                               {"State": state, "Filters": self.filters, "MaxResults": 100})
 
-        self.run_cli("--services", "ssm", "--progress", "off")
+        _, stderr = self.run_cli("--services", "ssm", "--progress", "off")
+        self.assertNotIn("SLOW CLOUDTRAIL API COLLECTION", stderr)
 
         manifest = json.loads((self.folder / "manifest.json").read_text())
         self.assertTrue(manifest["complete"])
