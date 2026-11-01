@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import warnings
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -1356,6 +1357,28 @@ class BrowserContract(unittest.TestCase):
             self.assertEqual(self.call("/api/events", body)[0], 400)
         self.assertEqual(self.call("/api/meta", headers={"Origin": "https://attacker.invalid"})[0], 403)
         self.assertEqual(self.call("/api/meta", headers={"Host": "attacker.invalid"})[0], 403)
+
+    def test_portal_access_requires_configured_host_and_same_origin(self):
+        host = "preview.synthetic.invalid"
+        origin = f"https://{host}"
+        with patch.dict("os.environ", {"PUBLIC_URL": ""}):
+            self.assertEqual(self.call("/api/meta", headers={"Host": host})[0], 403)
+        with patch.dict("os.environ", {"PUBLIC_URL": origin}):
+            self.assertEqual(self.call("/api/meta", headers={"Host": host})[0], 200)
+            status, meta = self.call("/api/meta", {}, {"Host": host, "Origin": origin})
+            self.assertEqual(status, 200)
+            self.assertEqual(meta["timezone"], "UTC")
+            self.assertEqual(self.call("/api/meta")[0], 200)
+            for headers in [
+                {"Host": host, "Origin": "https://attacker.invalid"},
+                {"Host": host, "Origin": f"http://{host}"},
+                {"Host": host, "Origin": self.url},
+                {"Host": host + ".attacker.invalid", "Origin": origin},
+                {"Origin": origin},
+                {"Host": "attacker.invalid", "X-Forwarded-Host": host, "X-Forwarded-Proto": "https"},
+            ]:
+                with self.subTest(headers=headers):
+                    self.assertEqual(self.call("/api/meta", {}, headers)[0], 403)
 
     def test_duck_sprite_is_served_without_opening_arbitrary_paths(self):
         with urlopen(self.url + "/konami-duck.png", timeout=15) as response:

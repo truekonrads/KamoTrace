@@ -609,11 +609,17 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def allowed(self):
-        # Loopback-only plus Host/Origin checks prevent DNS rebinding and cross-site requests.
+        # Exact Host/Origin checks prevent DNS rebinding and cross-site requests.
+        # Amp supplies PUBLIC_URL to portaled services; never trust forwarded headers.
         host = self.headers.get("Host", "")
         allowed_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
         origin = self.headers.get("Origin")
-        if host not in allowed_hosts or (origin and origin not in {"http://" + h for h in allowed_hosts}):
+        local = host in allowed_hosts and (not origin or origin in {"http://" + h for h in allowed_hosts})
+        public_url = urlsplit(os.environ.get("PUBLIC_URL", ""))
+        portal = (public_url.scheme in {"http", "https"} and bool(public_url.netloc)
+                  and host == public_url.netloc
+                  and (not origin or origin == f"{public_url.scheme}://{public_url.netloc}"))
+        if not (local or portal):
             self.respond({"error": "Only local, same-origin access is allowed"}, 403)
             return False
         return True

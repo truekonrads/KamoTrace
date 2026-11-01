@@ -101,6 +101,10 @@ filters, value counts and the timeline.
 
 - **Keep access local.** The server has no authentication. Do not expose it to
   your network. For containers, follow the [Docker guide](docs/user-guide.md#docker).
+  For an Amp portal preview, the server also accepts the exact host and origin
+  in `PUBLIC_URL` (supplied automatically to services started with `--portal`).
+  Keep the portal private and use synthetic data for shared previews; this does
+  not add application authentication or change the loopback binding default.
 - **Check your AI provider's data policy.** KamoTrace runs locally, but your
   assistant may send evidence to its provider. Review AI findings before relying on them.
 - **Preserve and back up the case.** Keep original exports, the evidence database
