@@ -129,7 +129,11 @@
             </p>
             <ul id="tag-list"></ul>
           </section>
-          <section id="detections-pane" aria-label="Suzaku detections" hidden>
+          <section
+            id="detections-pane"
+            aria-label="Detections and GuardDuty context"
+            hidden
+          >
             <input
               id="rule-search"
               type="search"
@@ -137,8 +141,9 @@
               aria-label="Search detection rules"
             />
             <p class="hint">
-              Sigma rules Suzaku matched, most severe first, with linked event
-              counts. Click to filter; all rule filters must match.
+              Suzaku rule matches and labelled GuardDuty contextual leads, most
+              severe first, with event counts. Context is not an exact event
+              match. Click to filter; all lead filters must match.
             </p>
             <ul id="rule-list"></ul>
             <p id="detections-run" class="hint"></p>

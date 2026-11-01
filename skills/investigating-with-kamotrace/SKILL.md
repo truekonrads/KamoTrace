@@ -25,7 +25,7 @@ browser on the next refresh, and theirs show up for you.
   `entry_id`. Never tag or annotate "everything matching a query"
   without first listing those events and checking that they are the ones you
   mean.
-- **Leads are not findings.** Suzaku detections and IP geography are leads.
+- **Leads are not findings.** Suzaku detections, GuardDuty context and IP geography are leads.
   Tag or annotate only what the raw records support, and in notes, say which
   parts you observed and which you inferred.
 - Raw events can contain secrets (keys, tokens, passwords in parameters). Keep
@@ -55,6 +55,8 @@ analyst asks you to). It never overwrites evidence:
 | --- | --- |
 | Import a CloudTrail `Records` export | `kamotrace import --source export.json --database case.duckdb` |
 | Suzaku Sigma detections | `kamotrace get-suzaku`, then `kamotrace suzaku --database case.duckdb --source export.json` |
+| KamoTrace machine-role rule | `kamotrace detect --database case.duckdb --network-context historical-network.json` (context schema in README) |
+| KamoTrace statistical passes | `kamotrace detect --database case.duckdb --anomalies` (optional `--bucket-minutes 5`, `--enrichment FILE`) |
 | IP enrichment | `kamotrace get-dbip` (free DB-IP Lite, no account), then `kamotrace enrich --database case.duckdb --geolite2 FOLDER` and/or `--jsonl provider.jsonl` |
 
 The server must be restarted to pick up new detections or enrichment.
@@ -110,7 +112,7 @@ takes the same `query` object. **Everything combines with AND.**
   mean all of them.
 - `note_id`: only events linked to that note. `command_key`: only CloudTrail
   events linked to that SSM command.
-- `rules` (Suzaku rule IDs, from `list_detections`), all of which must match;
+- `rules` (Suzaku, KamoTrace rule or GuardDuty context IDs, from `list_detections`), all of which must match;
   `min_level` is at least that Sigma level.
 - **Time:** ISO 8601 **with an offset**. `start` is inclusive and `end` is
   exclusive. Set `query.timezone` to an IANA zone (default `UTC`), such as
@@ -261,6 +263,61 @@ search_scope="enhanced")` now finds it, `search_scope="raw"` does not.
   linked event counts, plus provenance and unmatched/ambiguous counts. Search a
   rule's events with `query.rules: ["<rule_id>"]`, then verify them in the raw
   events before treating anything as a finding.
+- KamoTrace's `kamotrace:ec2-credentials-unexpected-source` rule detects explicitly
+  EC2-issued (`sessionContext.ec2RoleDelivery`) credentials used outside supplied
+  expected instance egress or AWS ranges. It is a medium-severity heuristic, NOT
+  proof of theft or GuardDuty-equivalent coverage. Expected corporate/on-premises
+  egress is allowed. Missing EC2 markers are not inferred from session names.
+  `list_detections.native` contains the rule version, supplied historical context
+  and its SHA-256, plus assessment counters. Check `assessment.status`: `skipped`
+  means no context, not a clean result. Review unassessed counts (missing network
+  context, out-of-interval events, private/non-IP sources, service-mediated calls
+  and unmarked assumed roles). Current inventory is not historical egress proof.
+  Search with `query.rules: ["kamotrace:ec2-credentials-unexpected-source"]`.
+  `get_event.native_detections` provides `rule_id` and `details_json`, including
+  match reasons, source, session/access key and API error. Denied attempts can
+  match too. Read these details separately from original evidence `raw_json`.
+- Opt-in `--anomalies` adds low-severity `kamotrace:conditional-rarity`,
+  `kamotrace:volume-spike` and `kamotrace:breadth-spike` leads. These are independent
+  retrospective heuristics, NOT trained models, compromise probabilities or
+  GuardDuty-equivalent detections. Default windows are five UTC minutes, `[start,
+  end)`. Rarity needs 100 known events and 8 observed windows per identity/dimension
+  and frequency at most 1%. Volume/failure counts and distinct-operation/service/
+  region/resource breadth need 8 other observed windows, robust median/MAD score
+  at least 6 and fold at least 3, plus minimum counts (10 events, 5 failures or
+  5 distinct values). Failure counts are not failure rates; breadth is not API risk.
+  Search with `search_events(query={"rules": ["kamotrace:volume-spike"]})`, then
+  `get_event(id=...)`. Parse each `native_detections[].details_json` for `signals`:
+  identity `[account, type, issuer ARN or recorded principal]`, dimension/value,
+  observed count, reference windows/median/MAD, score and window boundaries.
+  Check `list_detections.native.rules[].assessment` for per-rule support and
+  `native.analysis` for exclusions/enrichment provenance. The root `native.assessment`
+  remains the machine-role assessment, not a summary of all rules.
+  Baselines include later case activity, exclude silent time gaps and partial
+  first/last buckets per account; the scored spike window is excluded. Unknown
+  geography is excluded, not considered rare; ASN/country are correlated and are
+  never added into a combined score. Role sessions group by session issuer ARN;
+  raw sessions/keys are preserved. Counts deduplicate canonical hashes and leads
+  attach to the first source-record representative. Sparse history, collection
+  gaps and sustained attacks limit coverage; zero leads do not mean clean logs.
+  `--replace` rebuilds the native sidecar, so repeat `--network-context` to retain
+  the machine assessment; restart `serve` after rebuilding. No online lookup occurs.
+- It also lists GuardDuty contextual leads, with IDs prefixed `guardduty:` and
+  titles labelled `GuardDuty context (not exact)`. Filter them with the same
+  `query.rules` IDs or `query.min_level`. The `guardduty` metadata includes
+  source provenance, linked/unlinked finding counts and `link_basis`.
+  Context requires the finding's account to match `userIdentity.accountId`,
+  region and exact access key, within `[EventFirstSeen, EventLastSeen)`.
+  Missing keys/times and zero-length intervals remain unlinked. This is NOT
+  proof that GuardDuty detected that particular event; no IP/time-only joins.
+  Other resource types are retained but not linked. Raw findings (including
+  unlinked ones) remain in the source JSON and separate GuardDuty sidecar.
+  `get_event` also returns linked `guardduty_findings` with `raw_finding` JSON
+  text, separate from the original CloudTrail `raw_json`; preserve its numeric
+  precision and do not describe it as CloudTrail evidence.
+  Prepare with `kamotrace download --dest CASE --regions all --services guardduty`,
+  then `kamotrace guardduty --database case.duckdb --findings CASE/guardduty.json`;
+  restart the server to pick up the sidecar.
 - `country`, `city`, `asn` and `isp` are offline lookups (DB-IP Lite/GeoLite2 and/or the
   analyst's provider JSONL), not evidence. `(unmapped / service / private)`
   means no lookup applied (AWS service names, private ranges, missing data).

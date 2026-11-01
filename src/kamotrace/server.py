@@ -159,7 +159,7 @@ def build_query(body):
 
 
 class Store:
-    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None):
+    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None):
         with ExitStack() as startup:
             logger.info("Opening evidence database (read-only): %s", database)
             self.connection = duckdb.connect(str(database), read_only=True)
@@ -237,6 +237,12 @@ class Store:
             detections = detections or (default if default.exists() else None)
             logger.info("Loading Suzaku detections: %s", detections or "none (no sidecar found)")
             self.suzaku_run = load_detections(self.connection, detections)
+            from .guardduty import load as load_guardduty
+            default = database.with_suffix(".guardduty.duckdb")
+            self.guardduty_run = load_guardduty(self.connection, guardduty or (default if default.exists() else None))
+            from .detect import load as load_native
+            default = database.with_suffix(".native.duckdb")
+            self.native_run = load_native(self.connection, default if default.exists() else None)
             # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
             self.connection.execute("SET enable_external_access=false")
             logger.info("Calculating event counts, time range and filter metadata")
@@ -468,7 +474,8 @@ class Store:
             for field in ("event_name", "event_source", "country", "identity_type", "error_code", "document_name")}
         return {**bounds, "histogram": histogram, "facets": facets, "fields": FIELDS,
                 "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
-                "levels": LEVELS, "detections_loaded": self.suzaku_run is not None,
+                "levels": LEVELS, "detections_loaded": any(run is not None for run in
+                    (self.suzaku_run, self.guardduty_run, self.native_run)),
                 "enrichment": self.enrichment_run,
                 "timezone": zone, "timezones": TIMEZONES, "database": "cloudtrail.duckdb", "read_only": True}
 
@@ -574,6 +581,12 @@ class Store:
             if rows:
                 rows[0]["ssm_commands"] = self.commands.for_record(record)
                 rows[0]["detections"] = self.row_detections([record]).get(record, [])
+                rows[0]["guardduty_findings"] = self.rows("""SELECT g.rule_id, g.raw_finding
+                    FROM guardduty_findings g WHERE g.rule_id IN
+                    (SELECT rule_id FROM detections WHERE source_record=?) ORDER BY g.rule_id""", [record])
+                if self.native_run is not None:
+                    rows[0]["native_detections"] = self.rows("""SELECT rule_id, details::VARCHAR AS details_json
+                        FROM native_details WHERE source_record=? ORDER BY rule_id""", [record])
         return rows[0] if rows else None
 
     def row_detections(self, records):
@@ -594,7 +607,8 @@ class Store:
                 FROM detections GROUP BY rule_id ORDER BY level_rank DESC, events DESC, title""")
         for rule in rules:
             del rule["level_rank"]
-        return {"run": self.suzaku_run, "rules": rules}
+        return {"run": self.suzaku_run, "guardduty": self.guardduty_run, "rules": rules,
+                **({"native": self.native_run} if self.native_run is not None else {})}
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -735,12 +749,14 @@ def main(argv=None):
                         help="AWS inventory export folder containing report.json; current configuration, not historical evidence")
     parser.add_argument("--detections", type=Path,
                         help="Suzaku detections from `kamotrace suzaku` (default: <database>.detections.duckdb if present)")
+    parser.add_argument("--guardduty", type=Path,
+                        help="GuardDuty context sidecar (default: <database>.guardduty.duckdb if present)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S%z")
     started = time.monotonic()
     logger.info("Starting KamoTrace; loading local data before accepting requests")
-    for name in ("database", "enrichment", "ssm_export", "detections"):
+    for name in ("database", "enrichment", "ssm_export", "detections", "guardduty"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             parser.error(f"--{name.replace('_', '-')} not found: {path}")
@@ -748,7 +764,8 @@ def main(argv=None):
         parser.error(f"--inventory-export folder not found: {args.inventory_export}")
     try:
         store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
-                      args.ssm_export, args.detections and args.detections.resolve(), inventory_export=args.inventory_export)
+                      args.ssm_export, args.detections and args.detections.resolve(), inventory_export=args.inventory_export,
+                      guardduty=args.guardduty and args.guardduty.resolve())
     except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
         parser.error(str(error))
     logger.info("Binding HTTP server to %s:%s", args.bind, args.port)

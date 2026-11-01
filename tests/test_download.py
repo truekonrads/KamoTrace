@@ -42,7 +42,7 @@ class DownloadContract(unittest.TestCase):
         self.clients, self.stubs = {}, {}
         for service, region in [("sts", "us-east-1"), ("ec2", "us-east-1"),
                 ("cloudtrail", "us-east-1"), ("cloudtrail", "ap-southeast-1"),
-                ("ssm", "us-east-1"), ("logs", "us-east-1"), ("s3", "us-east-1")]:
+                ("ssm", "us-east-1"), ("logs", "us-east-1"), ("s3", "us-east-1"), ("guardduty", "us-east-1")]:
             client = sdk.client(service, region_name=region)
             self.clients[service, region] = client
             self.stubs[service, region] = self.stack.enter_context(Stubber(client))
@@ -90,6 +90,40 @@ class DownloadContract(unittest.TestCase):
                 update_summary, update_detail = stderr.getvalue()[len(first):].split("\n", 1)
                 self.assertTrue(update_summary.startswith("\r\033[1A\r\033[2K"))
                 self.assertEqual(update_detail, "\r\033[2KDone\033[J\n")
+
+    def test_guardduty_download_paginates_resumes_and_keeps_denied_unknown(self):
+        self.identity()
+        stub = self.stubs["guardduty", "us-east-1"]
+        stub.add_response("list_detectors", {"DetectorIds": ["d" * 32]}, {})
+        parameters = {"DetectorId": "d" * 32, "MaxResults": 50,
+            "FindingCriteria": {"Criterion": {"updatedAt": {"Gte": 1790812800000, "Lte": 1790899199999}}}}
+        stub.add_response("list_findings", {"FindingIds": [], "NextToken": "page-two"}, parameters)
+        stub.add_client_error("list_findings", "AccessDeniedException", expected_params={**parameters, "NextToken": "page-two"})
+        self.run_cli("--services", "guardduty", status=1)
+        self.assertFalse(json.loads((self.folder / "manifest.json").read_text())["complete"])
+        self.assertFalse((self.folder / "guardduty.json").exists())
+        self.identity()
+        finding = {"AccountId": "123456789012", "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/" + "d" * 32 + "/finding/test",
+            "Id": "test", "CreatedAt": "2026-10-01T02:00:00Z", "UpdatedAt": "2026-10-01T02:00:00Z",
+            "Region": "us-east-1", "Resource": {"ResourceType": "AccessKey"}, "SchemaVersion": "2.0",
+            "Severity": 9.1, "Type": "UnauthorizedAccess:IAMUser/Test", "Service": {"Archived": True}}
+        stub.add_response("list_findings", {"FindingIds": ["test"]}, {**parameters, "NextToken": "page-two"})
+        stub.add_response("get_findings", {"Findings": [finding]}, {"DetectorId": "d" * 32, "FindingIds": ["test"]})
+        self.run_cli("--services", "guardduty")
+        report = json.loads((self.folder / "guardduty.json").read_text())
+        self.assertTrue(report["coverage"]["complete"])
+        self.assertEqual(report["regions"][0]["status"], "collected")
+        self.assertEqual(report["Findings"], [finding])
+        self.identity()
+        self.run_cli("--services", "guardduty")  # All GuardDuty calls now come from the checkpoint.
+        stub.assert_no_pending_responses()
+        self.folder = self.folder.parent / "disabled"
+        self.identity()
+        stub.add_response("list_detectors", {"DetectorIds": []}, {})
+        self.run_cli("--services", "guardduty")
+        disabled = json.loads((self.folder / "guardduty.json").read_text())
+        self.assertEqual(disabled["regions"][0]["status"], "not_enabled")
+        self.assertEqual(disabled["Findings"], [])
 
     def test_progress_bar_shows_one_line_per_busy_worker(self):
         stderr = io.StringIO()

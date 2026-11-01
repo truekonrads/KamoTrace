@@ -495,7 +495,7 @@ class BrowserContract(unittest.TestCase):
                 self.assertLessEqual({"describe_schema", "search_events", "get_event", "tag_events", "untag_events",
                                       "create_note", "edit_note", "link_note_events", "unlink_note_events",
                                       "search_ssm_commands", "get_ssm_command", "search_ssm_log", "get_ssm_log_entry", "edit_ssm_log_entry"}, names)
-                self.assertEqual(await tool("list_detections"), {"run": None, "rules": []})
+                self.assertEqual(await tool("list_detections"), {"run": None, "guardduty": None, "rules": []})
                 schema = await tool("describe_schema")
                 self.assertIn("not_missing", schema["operators"])
                 self.assertEqual(schema["timezone"], "UTC")
@@ -651,7 +651,7 @@ class BrowserContract(unittest.TestCase):
             store.reviews.close()
         # Without detections the same filter is valid and simply matches nothing.
         self.assertEqual(self.call("/api/events", {"rules": ["rule-low"]})[1]["last_row"], 0)
-        self.assertEqual(self.call("/api/detections")[1], {"run": None, "rules": []})
+        self.assertEqual(self.call("/api/detections")[1], {"run": None, "guardduty": None, "rules": []})
 
     def test_large_detection_sidecar_preserves_all_rules_and_lists(self):
         sidecar = Path(self.temp.name) / "bulk.detections.duckdb"
@@ -1460,6 +1460,432 @@ class BrowserContract(unittest.TestCase):
         for width in (0, "1;DROP TABLE events", 1.5):
             self.assertEqual(self.call("/api/histogram", {**body, "bucket_minutes": width})[0], 400)
         self.assertEqual(self.call("/api/histogram", {**body, "bucket_minutes": 1})[0], 400)
+
+
+class GuardDutyContract(unittest.TestCase):
+    def test_guardduty_context_http_mcp_and_evidence_safety(self):
+        from kamotrace.cli import main
+        from kamotrace.guardduty import build as import_findings
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as cleanup:
+            root = Path(temporary)
+            source, database, findings = root / "events.json", root / "case.duckdb", root / "guardduty.json"
+            base = {"eventSource": "sts.amazonaws.com", "eventName": "GetCallerIdentity", "awsRegion": "us-east-1",
+                    "userIdentity": {"accountId": "123456789012", "accessKeyId": "AKIASYNTHETIC", "type": "IAMUser"}}
+            records = [{**base, "eventID": str(i), "eventTime": stamp} for i, stamp in enumerate([
+                "2026-10-01T00:59:59Z", "2026-10-01T01:00:00Z", "2026-10-01T01:03:00Z", "2026-10-01T02:00:00Z"])]
+            for changes in ({"awsRegion": "eu-west-1"}, {"userIdentity": {"accountId": "other", "accessKeyId": "AKIASYNTHETIC"}},
+                            {"userIdentity": {"accountId": "123456789012", "accessKeyId": "other"}}):
+                records.append({**records[2], **changes, "eventID": str(len(records))})
+            source.write_text(json.dumps({"Records": records}))
+            build(source, database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            finding = {"Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/synthetic/finding/one",
+                "Id": "one", "AccountId": "123456789012", "Region": "us-east-1", "Type": "UnauthorizedAccess:IAMUser/Test",
+                "Title": "Synthetic API activity <script>neverRun()</script>", "Severity": 8.9,
+                "Resource": {"AccessKeyDetails": {"AccessKeyId": "AKIASYNTHETIC"}},
+                "Service": {"EventFirstSeen": "2026-10-01T01:00:00Z", "EventLastSeen": "2026-10-01T02:00:00Z", "Archived": True},
+                "large_number": 9007199254740993}
+            unsupported = {**finding, "Arn": finding["Arn"] + "-unsupported", "Id": "unsupported", "Resource": {}}
+            findings.write_text(json.dumps({"Findings": [finding, unsupported]}))
+            self.assertEqual(main(["guardduty", "--database", str(database), "--findings", str(findings)]), 0)
+            sidecar = database.with_suffix(".guardduty.duckdb")
+            with duckdb.connect(str(sidecar), read_only=True) as connection:
+                self.assertEqual(connection.execute("SELECT raw_finding->>'$.large_number' FROM findings LIMIT 1").fetchone()[0], "9007199254740993")
+            with self.assertRaises(FileExistsError):
+                import_findings(database, findings, sidecar)
+            with self.assertRaises(ValueError):
+                import_findings(database, findings, database, replace=True)
+            sidecar_hash = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+            bad = root / "bad.json"
+            for invalid in ({"Findings": [finding], "coverage": {"complete": False}},
+                            {"Findings": [{**finding, "Severity": True}]},
+                            {"Findings": [{**finding, "Service": {"EventFirstSeen": "2026-10-01T01:00:00"}}]}):
+                bad.write_text(json.dumps(invalid))
+                with self.assertRaises(ValueError):
+                    import_findings(database, bad, sidecar, replace=True)
+                self.assertEqual(hashlib.sha256(sidecar.read_bytes()).hexdigest(), sidecar_hash)
+            other = root / "other.duckdb"
+            bad.write_text(json.dumps({"Records": records[:1]}))
+            build(bad, other)
+            with self.assertRaisesRegex(ValueError, "different evidence"):
+                Store(other, guardduty=sidecar)
+            store = Store(database)
+            cleanup.callback(store.reviews.close)
+            cleanup.callback(store.connection.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            cleanup.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            cleanup.callback(thread.join)
+            cleanup.callback(server.shutdown)
+            url = f"http://127.0.0.1:{server.server_port}"
+
+            def request(path, body=None):
+                with urlopen(Request(url + path, data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})) as response:
+                    return json.load(response)
+
+            result = request("/api/detections")
+            self.assertIsNone(result["run"])
+            self.assertEqual((result["guardduty"]["linked_findings"], result["guardduty"]["unlinked_findings"]), (1, 1))
+            rule = result["rules"][0]
+            self.assertEqual((rule["events"], rule["level"]), (2, "high"))
+            query = {"rules": [rule["rule_id"]]}
+            events = request("/api/events", query)
+            self.assertEqual({r["event_id"] for r in events["data"]}, {"1", "2"})
+            self.assertIn("context (not exact)", events["data"][0]["detections"][0]["title"])
+            self.assertEqual(request("/api/events", {"min_level": "critical"})["last_row"], 0)
+
+            async def mcp_contract():
+                async with Client(StdioServerParameters(command=sys.executable,
+                    args=["-m", "kamotrace", "mcp", "--url", url])) as client:
+                    detections = await client.call_tool("list_detections", {})
+                    self.assertEqual(detections.structured_content["guardduty"]["findings"], 2)
+                    response = await client.call_tool("search_events", {"query": query})
+                    self.assertEqual(response.structured_content["total"], 2)
+                    event = await client.call_tool("get_event", {"id": events["data"][0]["id"]})
+                    self.assertEqual(json.loads(event.structured_content["guardduty_findings"][0]["raw_finding"]), finding)
+            anyio.run(mcp_contract)
+            self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+
+
+class NativeDetectionContract(unittest.TestCase):
+    def test_anomaly_thresholds_without_geolocation_and_identity_boundaries(self):
+        from datetime import timedelta
+        from kamotrace.detect import build as detect
+        from kamotrace.rules import rarity, volume, breadth
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as cleanup:
+            root = Path(temporary)
+            database, source = root / "case.duckdb", root / "events.json"
+            start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+            records = []
+
+            def event(actor, window, index, account="123456789012", kind="IAMUser", **changes):
+                records.append({"eventID": f"{account}-{kind}-{actor}-{window}-{index}",
+                    "eventTime": (start + timedelta(minutes=window, seconds=index)).isoformat(),
+                    "userIdentity": {"accountId": account, "type": kind, "principalId": actor},
+                    "eventSource": "sts.amazonaws.com", "eventName": "GetCallerIdentity",
+                    "awsRegion": "us-west-2", "sourceIPAddress": "10.1.2.3", **changes})
+
+            for account in ("123456789012", "999999999999"):
+                event("edge", 0, 0, account)
+                event("edge", 10, 0, account)
+            for actor, total, rare_count in (("support99", 99, 1), ("support100", 100, 1), ("not-rare", 100, 2)):
+                for index in range(total):
+                    event(actor, index % 9 + 1, index // 9,
+                          eventName="Uncommon" if index < rare_count else "GetCallerIdentity")
+            # A nonzero MAD rejects 22 but accepts 24, with reference counts 2..9.
+            for actor, target in (("robust-below", 22), ("robust-above", 24)):
+                for window, count in enumerate([*range(2, 10), target], 1):
+                    for index in range(count):
+                        event(actor, window, index)
+            # Constant call volume; six failures hit the robust-score boundary, five do not.
+            for actor, failures in (("failure-below", 5), ("failure-at", 6)):
+                for window in range(1, 10):
+                    for index in range(10):
+                        event(actor, window, index, **({"errorCode": "AccessDenied"}
+                              if window == 9 and index < failures else {}))
+            for actor in ("account-split", "type-split"):
+                for window in range(1, 9):
+                    for index in range(2):
+                        event(actor, window, index)
+                for index in range(24):
+                    event(actor, 9, index, account="999999999999" if actor == "account-split" else "123456789012",
+                          kind="AssumedRole" if actor == "type-split" else "IAMUser")
+            event("unattributed", 5, 0, userIdentity={})
+            source.write_text(json.dumps({"Records": records}))
+            build(source, database)
+            run = detect(database, database.with_suffix(".native.duckdb"), anomalies=True, bucket_minutes=1)
+            self.assertIsNone(run["analysis"]["enrichment"])
+            self.assertEqual(run["analysis"]["unknown_identity_records"], 1)
+            store = Store(database)
+            cleanup.callback(store.reviews.close)
+            cleanup.callback(store.connection.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            cleanup.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            cleanup.callback(thread.join)
+            cleanup.callback(server.shutdown)
+
+            def events(rule):
+                with urlopen(Request(f"http://127.0.0.1:{server.server_port}/api/events",
+                        data=json.dumps({"rules": [rule]}).encode(), headers={"Content-Type": "application/json"})) as response:
+                    return json.load(response)["data"]
+
+            self.assertEqual([r["event_id"] for r in events(rarity.ID)], ["123456789012-IAMUser-support100-1-0"])
+            expected = {f"123456789012-IAMUser-robust-above-9-{i}" for i in range(24)}
+            expected.update(f"123456789012-IAMUser-failure-at-9-{i}" for i in range(6))
+            self.assertEqual({r["event_id"] for r in events(volume.ID)}, expected)
+            self.assertEqual(events(breadth.ID), [])
+
+    def test_anomalies_use_observed_deduplicated_identity_history_http_and_mcp(self):
+        from copy import deepcopy
+        from datetime import timedelta
+        from kamotrace.cli import main
+        from kamotrace.detect import build as detect
+        from kamotrace.rules import rarity, volume, breadth
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as cleanup:
+            root = Path(temporary)
+            source, database = root / "events.json", root / "case.duckdb"
+            start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+            records = []
+            # Deliberate gaps: these are ten observed windows, not 999 mostly-zero windows.
+            buckets = [0, 1, 2, 3, 4, 5, 6, 7, 8, 400, 900, 1000]
+            for window, bucket in enumerate(buckets):
+                for index in range(40 if window in (0, 10, 11) else 10):
+                    burst = window == 10
+                    records.append({"eventID": f"w{window}-{index}",
+                        "eventTime": (start + timedelta(minutes=bucket * 5, seconds=index)).isoformat(),
+                        "eventSource": f"service{index % 10}.amazonaws.com" if burst else "sts.amazonaws.com",
+                        "eventName": "GetCallerIdentity", "awsRegion": f"region-{index % 8}" if burst else "us-west-2",
+                        "sourceIPAddress": "1.1.1.1",
+                        "userIdentity": {"type": "AssumedRole", "accountId": "123456789012",
+                            "arn": f"arn:aws:sts::123456789012:assumed-role/application/session-{window}-{index}",
+                            "accessKeyId": f"ASIASYNTHETIC{window}-{index}",
+                            "sessionContext": {"sessionIssuer": {"arn": "arn:aws:iam::123456789012:role/application"}}},
+                        "resources": [{"ARN": "arn:synthetic:shared"},
+                                      {"ARN": f"arn:synthetic:resource-{index % 10 if burst else 0}"}],
+                        **({"errorCode": "AccessDenied"} if index < (20 if burst else 1) else {})})
+            rare = next(r for r in records if r["eventID"] == "w9-0")
+            rare.update(sourceIPAddress="8.8.8.8", eventSource="s3.amazonaws.com")
+            next(r for r in records if r["eventID"] == "w9-1")["sourceIPAddress"] = "AWS Internal"
+            # Copies must inflate neither rarity support nor volume. Only the first canonical
+            # representative gets a statistical lead; original evidence copies remain intact.
+            records.extend(deepcopy(rare) for _ in range(20))
+            baseline = next(r for r in records if r["eventID"] == "w1-1")
+            records.extend(deepcopy(baseline) for _ in range(100))
+            # Seven reference windows are insufficient, even though the timeline spans days.
+            for window in (*range(1, 8), 10):
+                for index in range(40 if window == 10 else 1):
+                    row = deepcopy(baseline)
+                    row.update(eventID=f"sparse-{window}-{index}",
+                        eventTime=(start + timedelta(minutes=buckets[window] * 5, seconds=index)).isoformat())
+                    row["userIdentity"]["sessionContext"]["sessionIssuer"]["arn"] = "arn:aws:iam::123456789012:role/sparse"
+                    records.append(row)
+            source.write_text(json.dumps({"Records": records}))
+            build(source, database)
+            evidence_hash = hashlib.sha256(database.read_bytes()).hexdigest()
+            provider = root / "synthetic.jsonl"
+            provider.write_text('\n'.join(json.dumps(r) for r in [
+                {"ip": "1.1.1.1", "country": "Japan", "asn": 64500},
+                {"ip": "8.8.8.8", "country": "Norway", "asn": 64501}]))
+            enrichment = database.with_suffix(".enrichment.duckdb")
+            enrich(database, enrichment, [("jsonl", provider)])
+            enrichment_hash = hashlib.sha256(enrichment.read_bytes()).hexdigest()
+            sidecar = database.with_suffix(".native.duckdb")
+            self.assertEqual(main(["detect", "--database", str(database), "--anomalies"]), 0)
+            run_hash = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError, "also an input"):
+                detect(database, enrichment, anomalies=True, replace=True)
+            with self.assertRaisesRegex(ValueError, "between 1 and 1440"):
+                detect(database, sidecar, anomalies=True, bucket_minutes=0, replace=True)
+            other_source, other_database = root / "other.json", root / "other.duckdb"
+            other_source.write_text(json.dumps({"Records": records[:1]}))
+            build(other_source, other_database)
+            with self.assertRaisesRegex(ValueError, "different evidence"):
+                detect(other_database, sidecar, anomalies=True, enrichment=enrichment, replace=True)
+            self.assertEqual(hashlib.sha256(sidecar.read_bytes()).hexdigest(), run_hash)
+            store = Store(database)
+            cleanup.callback(store.reviews.close)
+            cleanup.callback(store.connection.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            cleanup.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            cleanup.callback(thread.join)
+            cleanup.callback(server.shutdown)
+            url = f"http://127.0.0.1:{server.server_port}"
+
+            def request(path, body=None):
+                with urlopen(Request(url + path, data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})) as response:
+                    return json.load(response)
+
+            result = request("/api/detections")
+            self.assertEqual({r["rule_id"]: (r["events"], r["level"]) for r in result["rules"]},
+                             {rarity.ID: (1, "low"), volume.ID: (40, "low"), breadth.ID: (40, "low")})
+            analysis = result["native"]["analysis"]
+            self.assertEqual(analysis["enrichment_sha256"], enrichment_hash)
+            self.assertEqual(analysis["excluded_edge_records"], 80)
+            self.assertEqual(analysis["deduplicated_records"], len(records) - 120)
+            self.assertIn("retrospective", analysis["baseline_mode"])
+            rare_events = request("/api/events", {"rules": [rarity.ID]})
+            self.assertEqual([r["event_id"] for r in rare_events["data"]], ["w9-0"])
+            rare_id = rare_events["data"][0]["id"]
+            rare_detail = json.loads(request(f"/api/events/{rare_id}")["native_detections"][0]["details_json"])
+            signals = {s["dimension"]: s for s in rare_detail["signals"]}
+            self.assertEqual(set(signals), {"operation", "asn", "country"})
+            self.assertEqual(signals["operation"]["value"], "s3.amazonaws.com:GetCallerIdentity")
+            self.assertEqual((signals["operation"]["observed"], signals["operation"]["known_dimension_events"]), (1, 130))
+            self.assertEqual(signals["asn"]["known_dimension_events"], 129)
+            self.assertEqual(signals["country"]["value"], "Norway")
+            burst = request("/api/events", {"rules": [volume.ID, breadth.ID]})
+            self.assertEqual({r["event_id"] for r in burst["data"]}, {f"w10-{i}" for i in range(40)})
+            denied = next(r for r in burst["data"] if r["event_id"] == "w10-0")
+            detail = request(f"/api/events/{denied['id']}")
+            leads = {d["rule_id"]: json.loads(d["details_json"]) for d in detail["native_detections"]}
+            overall = {s["metric"]: s for s in leads[volume.ID]["signals"] if s["dimension"] == "all"}
+            self.assertEqual((overall["events"]["observed"], overall["events"]["reference_windows"],
+                              overall["events"]["reference_median"], overall["events"]["robust_score"]), (40, 9, 10, 30))
+            self.assertEqual((overall["failures"]["observed"], overall["failures"]["reference_median"]), (20, 1))
+            self.assertEqual(overall["events"]["window_start_epoch"], int(start.timestamp()) + 900 * 300)
+            self.assertEqual(overall["events"]["identity"][2], "arn:aws:iam::123456789012:role/application")
+            breadth_signals = {s["metric"]: s for s in leads[breadth.ID]["signals"]}
+            self.assertEqual({k: s["observed"] for k, s in breadth_signals.items()},
+                             {"operations": 10, "services": 10, "regions": 8, "resources": 11})
+            self.assertEqual(breadth_signals["resources"]["reference_median"], 2)
+            success = next(r for r in burst["data"] if r["event_id"] == "w10-39")
+            success_leads = request(f"/api/events/{success['id']}")["native_detections"]
+            self.assertFalse(any(s["metric"] == "failures" for d in success_leads if d["rule_id"] == volume.ID
+                                 for s in json.loads(d["details_json"])["signals"]))
+
+            async def mcp_contract():
+                async with Client(StdioServerParameters(command=sys.executable,
+                    args=["-m", "kamotrace", "mcp", "--url", url])) as client:
+                    listed = await client.call_tool("list_detections", {})
+                    self.assertEqual(listed.structured_content["native"]["analysis"], analysis)
+                    events = await client.call_tool("search_events", {"query": {"rules": [volume.ID, breadth.ID]}})
+                    self.assertEqual(events.structured_content["total"], 40)
+                    event = await client.call_tool("get_event", {"id": denied["id"]})
+                    self.assertTrue(event.structured_content["raw_json_matches_hash"])
+                    self.assertEqual(event.structured_content["native_detections"], detail["native_detections"])
+            anyio.run(mcp_contract)
+            self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), evidence_hash)
+            self.assertEqual(hashlib.sha256(enrichment.read_bytes()).hexdigest(), enrichment_hash)
+
+    def test_instance_credential_rule_http_mcp_and_safety(self):
+        from copy import deepcopy
+        from kamotrace.cli import main
+        from kamotrace.detect import build as detect
+        from kamotrace.rules.instance_credentials import ID
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as cleanup:
+            root = Path(temporary)
+            source, database, context_path = root / "events.json", root / "case.duckdb", root / "network.json"
+            base = {"eventSource": "sts.amazonaws.com", "eventName": "GetCallerIdentity", "awsRegion": "us-west-2",
+                "eventTime": "2026-10-01T00:00:00Z", "sourceIPAddress": "1.1.1.1",
+                "userIdentity": {"type": "AssumedRole", "accountId": "123456789012", "accessKeyId": "ASIASYNTHETIC",
+                    "arn": "arn:aws:sts::123456789012:assumed-role/application/i-0123456789abcdef0",
+                    "sessionContext": {"ec2RoleDelivery": "2.0"}}}
+            records = []
+
+            def event(name, **changes):
+                row = deepcopy(base)
+                row.update(eventID=name, **changes)
+                records.append(row)
+                return row
+
+            event("external-denied", errorCode="AccessDenied")
+            event("allowed-on-prem", sourceIPAddress="8.8.8.8")
+            event("aws-but-wrong-egress", sourceIPAddress="3.2.3.4")
+            event("ipv6-external", sourceIPAddress="2606:4700:4700::1111")
+            event("ipv6-aws-unknown-instance", sourceIPAddress="2600:1f00::1")["userIdentity"]["arn"] = (
+                "arn:aws:sts::123456789012:assumed-role/application/i-11111111111111111")
+            event("before", eventTime="2026-09-30T23:59:59Z")
+            event("end", eventTime="2026-10-02T00:00:00Z")
+            event("last-inside", eventTime="2026-10-01T23:59:59Z")["userIdentity"]["sessionContext"]["ec2RoleDelivery"] = "1.0"
+            event("internal", sourceIPAddress="AWS Internal")
+            event("private", sourceIPAddress="10.1.2.3")
+            event("service")["userIdentity"]["invokedBy"] = "lambda.amazonaws.com"
+            event("unmarked")["userIdentity"]["sessionContext"] = {}
+            event("not-an-assumed-role")["userIdentity"]["type"] = "IAMUser"
+            other = event("other-account")
+            other["userIdentity"].update(accountId="999999999999",
+                arn="arn:aws:sts::999999999999:assumed-role/application/i-0123456789abcdef0")
+            source.write_text(json.dumps({"Records": records}))
+            build(source, database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            context = {"source": "Synthetic incident-time network snapshot", "valid_from": "2026-10-01T00:00:00Z",
+                "valid_until": "2026-10-02T00:00:00Z", "aws_prefixes": ["3.0.0.0/8", "2600:1f00::/24"],
+                "instances": [{"account": "123456789012", "instance_id": "i-0123456789abcdef0",
+                               "expected_egress": ["8.8.8.0/24"]}]}
+            context_path.write_text(json.dumps(context))
+            self.assertEqual(main(["detect", "--database", str(database), "--network-context", str(context_path)]), 0)
+            sidecar = database.with_suffix(".native.duckdb")
+            sidecar_hash = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+            with self.assertRaises(FileExistsError):
+                detect(database, sidecar, context_path)
+            with self.assertRaises(ValueError):
+                detect(database, database, context_path, replace=True)
+            with self.assertRaises(ValueError):
+                detect(database, context_path, context_path, replace=True)
+            for invalid in ({**context, "valid_until": context["valid_from"]},
+                            {**context, "aws_prefixes": ["3.0.0.1/8"]},
+                            {**context, "instances": context["instances"] * 2}):
+                context_path.write_text(json.dumps(invalid))
+                self.assertEqual(main(["detect", "--database", str(database), "--network-context", str(context_path), "--replace"]), 1)
+                self.assertEqual(hashlib.sha256(sidecar.read_bytes()).hexdigest(), sidecar_hash)
+            context_path.write_text(json.dumps(context))
+            # Expected-egress-only mode cannot assess another account or instance.
+            expected_only = root / "expected.duckdb"
+            context_path.write_text(json.dumps({k: v for k, v in context.items() if k != "aws_prefixes"}))
+            assessment = detect(database, expected_only, context_path)["assessment"]
+            self.assertEqual(assessment["missing_network_context"], 2)
+            # AWS-prefix-only mode assesses both IP families without a session-name guess.
+            context_path.write_text(json.dumps({k: v for k, v in context.items() if k != "instances"}))
+            aws_run = detect(database, root / "aws.duckdb", context_path)
+            self.assertEqual(aws_run["assessment"]["matches"], 5)
+            context_path.write_text(json.dumps({**context, "instances": [], "aws_prefixes": ["3.0.0.0/8"]}))
+            self.assertEqual(detect(database, root / "ipv4.duckdb", context_path)["assessment"]["missing_network_context"], 2)
+            context_path.write_text(json.dumps({**context, "aws_prefixes": ["0.0.0.0/0", "::/0"], "instances": []}))
+            clean = detect(database, root / "clean.duckdb", context_path)["assessment"]
+            self.assertEqual((clean["status"], clean["matches"]), ("completed", 0))
+            self.assertEqual(detect(database, root / "skipped.duckdb")["assessment"]["status"], "skipped")
+            context_path.write_text(json.dumps(context))
+            self.assertEqual(detect(database, sidecar, context_path, replace=True)["assessment"]["matches"], 5)
+            other_db = root / "other.duckdb"
+            source.write_text(json.dumps({"Records": records[:1]}))
+            build(source, other_db)
+            other_db.with_suffix(".native.duckdb").write_bytes(sidecar.read_bytes())
+            with self.assertRaisesRegex(ValueError, "different evidence"):
+                Store(other_db)
+            store = Store(database)
+            cleanup.callback(store.reviews.close)
+            cleanup.callback(store.connection.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            cleanup.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            cleanup.callback(thread.join)
+            cleanup.callback(server.shutdown)
+            url = f"http://127.0.0.1:{server.server_port}"
+
+            def request(path, body=None):
+                with urlopen(Request(url + path, data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})) as response:
+                    return json.load(response)
+
+            result = request("/api/detections")
+            self.assertEqual(result["rules"][0]["rule_id"], ID)
+            self.assertEqual(result["rules"][0]["events"], 5)
+            self.assertEqual(result["native"]["context_sha256"], hashlib.sha256(json.dumps(context).encode()).hexdigest())
+            counts = result["native"]["assessment"]
+            self.assertEqual((counts["candidates"], counts["assessed"], counts["matches"]), (12, 7, 5))
+            self.assertEqual(counts["assumed_role_events_without_ec2_marker"], 1)
+            self.assertEqual(counts["outside_context_interval"], 2)
+            self.assertEqual(counts["non_public_or_non_ip_source"], 2)
+            self.assertEqual(counts["service_mediated"], 1)
+            events = request("/api/events", {"rules": [ID]})
+            self.assertEqual({e["event_id"] for e in events["data"]},
+                {"external-denied", "aws-but-wrong-egress", "ipv6-external", "last-inside", "other-account"})
+            denied = next(e for e in events["data"] if e["event_id"] == "external-denied")
+            details = json.loads(request(f"/api/events/{denied['id']}")["native_detections"][0]["details_json"])
+            self.assertEqual(details["error_code"], "AccessDenied")
+            self.assertEqual(len(details["reasons"]), 2)
+            self.assertEqual(request("/api/events", {"min_level": "high"})["last_row"], 0)
+
+            async def mcp_contract():
+                async with Client(StdioServerParameters(command=sys.executable,
+                    args=["-m", "kamotrace", "mcp", "--url", url])) as client:
+                    detections = await client.call_tool("list_detections", {})
+                    self.assertEqual(detections.structured_content["native"]["assessment"]["matches"], 5)
+                    response = await client.call_tool("search_events", {"query": {"rules": [ID]}})
+                    self.assertEqual(response.structured_content["total"], 5)
+                    event = await client.call_tool("get_event", {"id": denied["id"]})
+                    self.assertTrue(event.structured_content["raw_json_matches_hash"])
+                    self.assertEqual(json.loads(event.structured_content["native_detections"][0]["details_json"]), details)
+            anyio.run(mcp_contract)
+            self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
 
 
 if __name__ == "__main__":

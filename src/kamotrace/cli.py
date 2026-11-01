@@ -6,6 +6,7 @@
   kamotrace trailcheck [--profile NAME] [--regions all] [--json report.json|-] [--probe-buckets]
   kamotrace get-suzaku [--version 3.0.0]
   kamotrace suzaku   --database case.duckdb (--source event_history.json [--suzaku suzaku.exe] | --timeline suzaku.duckdb)
+  kamotrace detect   --database case.duckdb --network-context historical-network.json
   kamotrace get-dbip [--dest FOLDER]
   kamotrace enrich   --database case.duckdb (--geolite2 FOLDER | --jsonl FILE)...
   kamotrace ssmcheck [--profile NAME] [--regions all] [--json report.json] [--max-items 200]
@@ -22,6 +23,8 @@ COMMANDS = {
     "trailcheck": ("kamotrace.trailcheck", "Read-only audit of trails, logging/delivery state, S3 destinations and log dates"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
+    "guardduty": ("kamotrace.guardduty", "Enrich events with contextual GuardDuty findings from downloaded JSON"),
+    "detect": ("kamotrace.detect", "Run offline KamoTrace rules: machine-role context and optional anomaly passes"),
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),
     "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2-format .mmdb and/or provider-neutral JSONL"),
     "ssmcheck": ("kamotrace.ssmcheck", "Read-only report of what SSM sessions and commands log, and where"),

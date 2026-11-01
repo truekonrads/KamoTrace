@@ -1221,6 +1221,12 @@ dialog::backdrop {
   gap: 4px;
   margin: 4px 0;
 }
+#detail-findings pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow: auto;
+}
 .command-links {
   display: flex;
   flex-wrap: wrap;

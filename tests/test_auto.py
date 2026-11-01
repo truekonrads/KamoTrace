@@ -273,6 +273,36 @@ class AutoContract(unittest.TestCase):
         (target / "download" / "ssm.json").unlink()
         self.run_auto(target, "--skip-download", "--ssm-export", replacement, "--no-serve")
 
+    def test_offline_guardduty_is_built_reused_and_refreshed(self):
+        source, findings, target = self.root / "events.json", self.root / "gd.json", self.root / "case-gd"
+        event = record("gd-event", "2026-10-01T01:01:00Z")
+        event["userIdentity"].update(accountId="123456789012", accessKeyId="AKIASYNTHETIC")
+        source.write_text(json.dumps({"Records": [event]}))
+        finding = {"Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/test/finding/test",
+            "Id": "test", "AccountId": "123456789012", "Region": "us-east-1", "Type": "Synthetic", "Severity": 9,
+            "Resource": {"AccessKeyDetails": {"AccessKeyId": "AKIASYNTHETIC"}},
+            "Service": {"EventFirstSeen": "2026-10-01T01:00:00Z", "EventLastSeen": "2026-10-01T02:00:00Z"}}
+        findings.write_text(json.dumps({"Findings": [finding]}))
+        options = (target, "--source", source, "--guardduty-findings", findings,
+                   "--skip-suzaku", "--skip-enrich", "--no-serve")
+        self.run_auto(*options)
+        output = target / "case.guardduty.duckdb"
+        before = digest(output)
+        _, log = self.run_auto(*options)
+        self.assertIn("guardduty] verified", log)
+        self.assertEqual(digest(output), before)
+        finding["Severity"] = 3.9
+        findings.write_text(json.dumps({"Findings": [finding]}))
+        self.run_auto(*options)
+        self.assertNotEqual(digest(output), before)
+        from kamotrace.server import Store
+        store = Store(target / "case.duckdb")
+        try:
+            self.assertEqual(store.detections_list()["rules"][0]["level"], "low")
+        finally:
+            store.connection.close()
+            store.reviews.close()
+
     def test_existing_inputs_stage_failure_resume_refresh_and_refusals(self):
         archive = self.root / "suzaku.zip"
         archive.write_bytes(self.suzaku_archive())

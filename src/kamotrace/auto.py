@@ -14,13 +14,13 @@ import duckdb
 import ijson
 from botocore.exceptions import BotoCoreError, ClientError
 
-from . import download, get_dbip, get_suzaku, inventory, server
+from . import download, get_dbip, get_suzaku, guardduty, inventory, server
 from .enrich import SCHEMA as ENRICH_SCHEMA, Source, build as enrich, read_geolite2
 from .importer import build as import_evidence, expand, in_staging, lock_path, sha256, write_lock
 from .suzaku import (LEVELS, SCHEMA as SUZAKU_SCHEMA, evidence_identity, identify_sidecar, import_timeline,
                      run_options, run_suzaku)
 
-STAGES = ("get-suzaku", "get-dbip", "download", "import", "enrich", "suzaku", "inventory", "serve")
+STAGES = ("get-suzaku", "get-dbip", "download", "import", "enrich", "suzaku", "guardduty", "inventory", "serve")
 
 
 class StageError(Exception):
@@ -89,6 +89,8 @@ def missing_exports(folder, manifest, ssm=True):
     suffix = ".json.gz" if manifest.get("compress") else ".json"
     missing = [name + suffix for name in ("cloudtrail", "ssm") if (ssm or name != "ssm")
                and name in manifest.get("services", []) and not (folder / (name + suffix)).is_file()]
+    if "guardduty" in manifest.get("services", []) and not (folder / "guardduty.json").is_file():
+        missing.append("guardduty.json")
     for log in manifest.get("logs", []):
         path = folder / log["file"]
         if not path.is_file() or ("sha256" in log and sha256(path) != log["sha256"]):
@@ -131,7 +133,7 @@ def parser():
     aws.add_argument("--regions", nargs="+", default=["all"], help="Region names, or all enabled regions (default: all)")
     aws.add_argument("--start", help="Inclusive ISO timestamp with offset, or UTC date (default: all available history)")
     aws.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date (default: first run's start time, kept on resume)")
-    aws.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm"), default=["cloudtrail", "ssm"])
+    aws.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm", "guardduty"), default=["cloudtrail", "ssm"])
     aws.add_argument("--cloudtrail-source", choices=("auto", "history"), default="auto",
                      help="With explicit --start/--end, prefer S3 only when trailcheck verifies every Region/day; history disables S3")
     aws.add_argument("--compress", action="store_true", help="Gzip generated CloudTrail/SSM/CloudWatch JSON")
@@ -159,6 +161,7 @@ def parser():
     detections.add_argument("--timeline", type=Path, help="Existing `suzaku aws-ct-timeline -t duckdb` output to import")
     detections.add_argument("--rules", type=Path, help="Suzaku rules folder")
     detections.add_argument("--min-level", choices=LEVELS)
+    detections.add_argument("--guardduty-findings", type=Path, help="Existing GuardDuty GetFindings JSON to enrich offline")
     parser.add_argument("--rebuild-sidecars", action="store_true",
                         help="Rebuild enrichment and detections even if their recorded inputs and options are unchanged")
     ui = parser.add_argument_group("browser UI (kamotrace serve)")
@@ -188,7 +191,7 @@ def main(argv=None):
         options.error("--ssm-export replaces the downloaded SSM export; use it with --source or --skip-download")
     if args.skip_inventory and args.inventory_export:
         options.error("--skip-inventory cannot be combined with --inventory-export")
-    for path in (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules,
+    for path in (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules, args.guardduty_findings,
                  *(p for _, p in args.sources or [])):
         if path is not None and not path.exists():
             options.error(f"not found: {path}")
@@ -206,9 +209,11 @@ def main(argv=None):
     # Outputs must never be any original input: derived files are replaced, evidence is never written twice.
     # Staging happens in fresh private folders, and leftover ones are removed only when positively ours
     # and holding no input (importer.discard_abandoned), so these are the only predictable write paths.
-    published = (database, database.with_suffix(".enrichment.duckdb"), database.with_suffix(".detections.duckdb"))
+    published = (database, database.with_suffix(".enrichment.duckdb"), database.with_suffix(".detections.duckdb"),
+                 database.with_suffix(".guardduty.duckdb"))
     outputs = {*published, *map(lock_path, published)}
-    inputs = (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules, *(p for _, p in args.sources or []))
+    inputs = (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules,
+              args.guardduty_findings, *(p for _, p in args.sources or []))
     for path in inputs:
         if path is not None and path.resolve() in outputs:
             options.error(f"{path} is an input but also a path this run writes; choose another --database or TARGET")
@@ -273,6 +278,7 @@ def main(argv=None):
         # 3. Collection: the downloader's own checkpoint makes this resumable and keeps its range frozen.
         stage = STAGES[2]
         ssm_export = args.ssm_export
+        guardduty_source = args.guardduty_findings
         if args.source:
             say(stage, "skipped: importing --source")
             inputs = list(args.source)
@@ -314,6 +320,8 @@ def main(argv=None):
             inputs = [folder / ("cloudtrail" + suffix)]
             if ssm_export is None and "ssm" in manifest["services"]:
                 ssm_export = folder / ("ssm" + suffix)
+            if guardduty_source is None and "guardduty" in manifest["services"]:
+                guardduty_source = folder / "guardduty.json"
 
         # 4. Evidence: imported once, never overwritten; an existing database must match these inputs.
         stage = STAGES[3]
@@ -391,8 +399,21 @@ def main(argv=None):
                 finally:
                     work.cleanup()
 
-        # 7. Current network configuration, independent of the historical CloudTrail range.
+        # GuardDuty context is independent of Suzaku's exact rule/event linkage.
         stage = STAGES[6]
+        if guardduty_source is None:
+            say(stage, "skipped; select --services cloudtrail ssm guardduty or pass --guardduty-findings")
+        else:
+            output = database.with_suffix(".guardduty.duckdb")
+            run = sidecar_run(output, "guardduty_run", guardduty.TABLES, guardduty.SCHEMA, identity)
+            if run and run.get("source_sha256") == sha256(guardduty_source) and not args.rebuild_sidecars:
+                say(stage, f"verified {output}; reused")
+            else:
+                say(stage, f"enriching contextual leads from {guardduty_source}")
+                guardduty.build(database, guardduty_source, output, replace=output.exists(), lock=False)
+
+        # Current network configuration, independent of the historical CloudTrail range.
+        stage = STAGES[7]
         inventory_export = args.inventory_export
         if args.skip_inventory:
             say(stage, "skipped")
@@ -415,7 +436,7 @@ def main(argv=None):
                     inventory.build(inventory_export, profile=args.profile, regions=args.regions, lock=False)
 
         # 8. UI: serve's defaults pick up the sidecars beside the database.
-        stage = STAGES[7]
+        stage = STAGES[8]
         if args.no_serve:
             say(stage, f"skipped; start later with: kamotrace serve --database {database}"
                 + (f" --ssm-export {ssm_export}" if ssm_export else "")
