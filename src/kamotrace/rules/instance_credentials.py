@@ -2,6 +2,7 @@
 from bisect import bisect_right
 from datetime import datetime
 import ipaddress
+import json
 import re
 
 ID = "kamotrace:ec2-credentials-unexpected-source"
@@ -54,10 +55,10 @@ def prepare(context):
     return start, end, aws, instances
 
 
-def run(connection, context):
-    """Return exact evidence matches plus explicit assessment/coverage counters."""
+def run(connection, context, *, bucket_minutes=5):
+    """Publish exact evidence matches and return explicit assessment/coverage counters."""
     if context is None:
-        return [], {"status": "skipped", "reason": "No network context supplied"}
+        return {"status": "skipped", "reason": "No network context supplied"}
     start, end, aws, instances = prepare(context)
     # Collapse overlaps once, then use logarithmic lookup rather than scanning
     # thousands of AWS prefixes for every CloudTrail record.
@@ -72,14 +73,16 @@ def run(connection, context):
     counts["assumed_role_events_without_ec2_marker"] = connection.execute("""SELECT count(*) FROM ev.events
         WHERE identity_type = 'AssumedRole' AND coalesce(
         user_identity->>'$.sessionContext.ec2RoleDelivery', '') NOT IN ('1.0', '2.0')""").fetchone()[0]
-    matches = []
-    connection.execute("""SELECT source_record, record_sha256, epoch(event_time), source_ip,
+    # Keep the scan independent of writes on the publishing connection.
+    reader = connection.cursor()
+    reader.execute("""SELECT source_record, record_sha256, epoch(event_time), source_ip,
         user_identity->>'$.accountId', user_identity->>'$.arn',
         user_identity->>'$.accessKeyId', user_identity->>'$.invokedBy', error_code,
         user_identity->>'$.sessionContext.ec2RoleDelivery'
         FROM ev.events WHERE identity_type = 'AssumedRole'
         AND user_identity->>'$.sessionContext.ec2RoleDelivery' IN ('1.0', '2.0')""")
-    while rows := connection.fetchmany(8192):
+    while rows := reader.fetchmany(8192):
+        matches = []
         for record, digest, time, source, account, arn, key, invoked_by, error, delivery in rows:
             counts["candidates"] += 1
             if time is None or not start.timestamp() <= time < end.timestamp():
@@ -116,9 +119,14 @@ def run(connection, context):
             if starts and not inside_aws and not inside_expected:
                 reasons.append("outside supplied AWS address ranges (not proof of non-AWS ownership)")
             if reasons:
-                matches.append((record, digest, {"reasons": reasons, "source_ip": source,
+                matches.append((record, digest, json.dumps({"reasons": reasons, "source_ip": source,
                     "account": account, "instance_id": instance, "session_arn": arn,
                     "access_key_id": key, "ec2_role_delivery": delivery, "error_code": error,
-                    "context_source": context["source"], "expected_egress": [str(n) for n in expected]}))
-    counts["matches"] = len(matches)
-    return matches, counts
+                    "context_source": context["source"], "expected_egress": [str(n) for n in expected]})))
+        if matches:
+            records, hashes, details = map(list, zip(*matches))
+            connection.execute("""INSERT INTO matches SELECT unnest(?::BIGINT[]),
+                unnest(?::VARCHAR[]), ?, unnest(?::VARCHAR[])::JSON""", [records, hashes, ID, details])
+            counts["matches"] += len(matches)
+    reader.close()
+    return counts

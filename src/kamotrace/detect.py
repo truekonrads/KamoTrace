@@ -24,11 +24,13 @@ def prepare_analysis(connection, bucket_minutes, enrichment):
     enrichment_hash = sha256(enrichment) if enrichment else None
     enrichment_run = load_enrichment(connection, enrichment)
     seconds = bucket_minutes * 60
+    # Deduplicate identifiers before extracting only the fields used by native statistics.
     connection.execute("""CREATE TEMP TABLE analysis_candidates AS WITH unique_events AS (
-        SELECT * FROM ev.events QUALIFY row_number() OVER
+        SELECT source_record FROM ev.events QUALIFY row_number() OVER
             (PARTITION BY record_sha256 ORDER BY source_record)=1
     ), normalized AS (
-        SELECT e.*, nullif(user_identity->>'$.accountId', '') AS account,
+        SELECT e.source_record, e.record_sha256, e.identity_type, e.event_source, e.aws_region,
+            nullif(user_identity->>'$.accountId', '') AS account,
             coalesce(CASE WHEN identity_type='AssumedRole' THEN
                 nullif(user_identity->>'$.sessionContext.sessionIssuer.arn', '') END,
                 nullif(identity_arn, ''), nullif(user_identity->>'$.principalId', ''),
@@ -39,23 +41,27 @@ def prepare_analysis(connection, bucket_minutes, enrichment):
             g.asn, CASE WHEN g.country NOT LIKE '(%' THEN nullif(g.country, '') END AS country,
             coalesce(error_code NOT IN ('', 'Success'), false) AS failed,
             raw_event->'$.resources' AS resources
-        FROM unique_events e LEFT JOIN ip_enrichment g ON e.source_ip=g.ip
+        FROM unique_events u JOIN ev.events e ON e.source_record=u.source_record
+        LEFT JOIN ip_enrichment g ON e.source_ip=g.ip
     ) SELECT *, json_array(account, identity_type, principal)::VARCHAR AS actor,
         min(bucket) OVER (PARTITION BY account) AS first_bucket,
         max(bucket) OVER (PARTITION BY account) AS last_bucket FROM normalized""", [seconds, seconds])
-    connection.execute("""CREATE TEMP TABLE analysis_events AS SELECT * FROM analysis_candidates
+    connection.execute("""CREATE TEMP TABLE analysis_events AS
+        SELECT source_record, record_sha256, actor, bucket, operation, event_source, aws_region,
+            asn, country, failed, resources FROM analysis_candidates
         WHERE account IS NOT NULL AND principal IS NOT NULL AND identity_type IS NOT NULL
         AND bucket > first_bucket AND bucket < last_bucket""")
-    connection.execute("""CREATE TEMP TABLE analysis_dimensions AS
-        SELECT e.actor, e.bucket, e.failed, v.dimension, v.value FROM analysis_events e,
-        LATERAL (VALUES ('all', 'all'), ('operation', e.operation), ('asn', e.asn),
-            ('country', e.country)) v(dimension, value) WHERE v.value IS NOT NULL""")
     unique, usable, unknown_identity, missing_time, edges = connection.execute("""SELECT count(*),
         count(*) FILTER (WHERE account IS NOT NULL AND principal IS NOT NULL AND identity_type IS NOT NULL
             AND bucket > first_bucket AND bucket < last_bucket),
         count(*) FILTER (WHERE account IS NULL OR principal IS NULL OR identity_type IS NULL),
         count(*) FILTER (WHERE bucket IS NULL),
         count(*) FILTER (WHERE bucket=first_bucket OR bucket=last_bucket) FROM analysis_candidates""").fetchone()
+    connection.execute("DROP TABLE analysis_candidates")
+    connection.execute("""CREATE TEMP TABLE analysis_dimensions AS
+        SELECT e.actor, e.bucket, e.failed, v.dimension, v.value FROM analysis_events e,
+        LATERAL (VALUES ('all', 'all'), ('operation', e.operation), ('asn', e.asn),
+            ('country', e.country)) v(dimension, value) WHERE v.value IS NOT NULL""")
     return {"baseline_mode": "retrospective, not a trained model or chronological alert",
         "bucket_minutes": bucket_minutes, "bucket_timezone": "UTC", "bucket_interval": "[start, end)",
         "deduplicated_records": unique, "scored_records": usable,
@@ -96,17 +102,7 @@ def build(database, output, context_path=None, replace=False, *, anomalies=False
                 connection.execute("CREATE TABLE matches(source_record BIGINT, record_sha256 VARCHAR, rule_id VARCHAR, details JSON)")
                 rules = []
                 for rule in [instance_credentials] + ([rarity, volume, breadth] if anomalies else []):
-                    matches, assessment = rule.run(connection, context)
-                    if analysis and rule is not instance_credentials:
-                        for _, _, details in matches:
-                            details["bucket_minutes"] = bucket_minutes
-                            details["bucket_timezone"] = "UTC"
-                            for signal in details["signals"]:
-                                if "window_start_epoch" in signal:
-                                    signal["window_end_epoch"] = signal["window_start_epoch"] + bucket_minutes * 60
-                    if matches:
-                        connection.executemany("INSERT INTO matches VALUES (?, ?, ?, ?)",
-                            [(record, digest, rule.ID, json.dumps(details)) for record, digest, details in matches])
+                    assessment = rule.run(connection, context, bucket_minutes=bucket_minutes)
                     rules.append({"rule_id": rule.ID, "rule_version": rule.VERSION, "rule_title": rule.TITLE,
                         "level": rule.LEVEL, "tactics": rule.TACTICS, "techniques": rule.TECHNIQUES,
                         "assessment": assessment})
