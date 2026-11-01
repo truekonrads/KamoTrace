@@ -879,6 +879,8 @@ def main(argv=None):
             logger.info("Startup complete in %.1fs", time.monotonic() - started)
             print(f"KamoTrace: {base} | {store.meta['total']:,} events{detections} | read-only", flush=True)
             print(setup, flush=True)
+            from .memory import MemoryMonitor
+            transports.enter_context(MemoryMonitor(store))
             server.serve_forever()
     except KeyboardInterrupt:
         pass

@@ -1364,8 +1364,9 @@ HTTP/MCP libraries.
 
 At info level, each Store operation logs when it is queued, starts, and finishes.
 `lock_wait_ms` is time waiting behind another Store operation; `execution_ms`
-is time holding the lock; `total_ms` includes both. For example, a slow IP card
-may be waiting behind an event count rather than running a slow lookup itself.
+is time holding the lock; `total_ms` includes both. For example, an explicitly
+requested history lookup may be waiting behind an event count rather than
+running a slow lookup itself.
 Request summaries include status and elapsed time through writing the response.
 The response's `X-Request-ID` header correlates these records with the browser
 Network panel. Debug records add query/count/page and JSON serialization timings;
@@ -1377,6 +1378,26 @@ Snapshots are totals at that stage, not additive allocations. Large `BASE_TABLE`
 values can be cached evidence pages rather than enrichment rows. The server
 retains its existing 2 GB DuckDB memory budget; reducing a cache budget can make
 queries slower and is not a substitute for measuring the workload.
+
+After startup, a background monitor samples memory every **30 seconds**. Debug
+records include process RSS, system total/available bytes and, where readable,
+Linux unified cgroup (v2) usage, limits and estimated available bytes. Ancestor
+limits are considered, and inactive file cache is treated as reclaimable.
+`pressure_scope` identifies the system or cgroup with the least proportional
+headroom. Unavailable cgroup metrics are labelled `unknown`; non-Linux and
+legacy cgroup v1 environments still get system and process readings via psutil.
+
+Two consecutive samples with **10% or less headroom** produce a warning, with
+at most one reminder every **five minutes** while pressure remains low. Two
+consecutive samples at **15% or more** produce an info-level recovery message.
+The gap avoids flapping around one threshold. Unknown samples do not count as
+pressure or recovery. High RSS alone does not trigger a warning; this is a
+headroom heuristic, not proof that KamoTrace caused pressure or an OOM forecast.
+
+At debug level the monitor also samples DuckDB memory categories if the Store
+lock is immediately available; otherwise it logs `duckdb=skipped_busy`. It never
+waits behind an active query. Sampling stops before database connections close.
+No per-request memory deltas or automatic cache/budget changes are made.
 
 New timing records use fixed operation/route names and omit query text,
 parameters, record IDs, IPs, identities and request/response payloads. Existing
