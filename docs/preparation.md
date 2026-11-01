@@ -72,10 +72,21 @@ to collect a different source.
 kamotrace inventory --profile investigation --regions all --output C:\cases\example\inventory
 # Reanalyze an existing standalone or KamoTrace export, without any AWS calls:
 kamotrace inventory --from-export C:\cases\example\inventory --output C:\cases\example\inventory-analysis
+# Static inventory identity policy only: no AWS calls or snapshot required:
+kamotrace inventory --emit-policy C:\cases\example\inventory-policy.json
+# Or collect normally and also emit a policy outside the snapshot folder:
+kamotrace inventory --profile investigation --output C:\cases\example\inventory-new --emit-policy C:\cases\example\inventory-new-policy.json
 ```
 
 The collector uses read-only EC2, RDS, ELB/ELBv2 and assigned IAM instance-profile
 lookups in one authenticated account. `--regions` defaults to all enabled regions.
+`--emit-policy PATH|-` emits the static inventory action set: without `--output`
+it makes no AWS calls; with `--output` it also performs the normal snapshot.
+Use `--emit-policy -` for standalone policy JSON on stdout (summary/warnings go
+to stderr). A policy file must be new and outside both the snapshot output and
+any input export, preserving their manifests and evidence. The inventory policy
+needs no S3 or KMS actions and does not test effective access. See the
+[combined example identity policy](#aws-collection-iam-policy) for exact actions.
 It preserves API response pages under `raw/`, regional inputs under `regions/`,
 collection identity/timestamps in `collection.json`, IAM lookup timestamps in
 `iam.json`, and SHA-256/size provenance in `manifest.json`. Reports retain the
@@ -256,13 +267,260 @@ transcripts. Empty results do not prove no activity occurred.
 To find the configured transcript and command output locations first, run the
 read-only [`kamotrace ssmcheck`](user-guide.md#ssm-logging-check).
 
-Permissions depend on collection: `sts:GetCallerIdentity`, `cloudtrail:LookupEvents`,
-`ssm:ListCommands`, `ssm:ListCommandInvocations`, `ssm:GetCommandInvocation`,
-`ssm:DescribeSessions`, plus `s3:ListBucket`/`s3:GetObject`,
-`logs:FilterLogEvents` and `kms:Decrypt` where the log destinations require them.
+See the [collection IAM policy](#aws-collection-iam-policy) below for audit and
+download permissions, including S3 destinations and KMS-encrypted objects.
 Permission failures stop with a nonzero status and leave resumable checkpoints;
 `manifest.json` is marked complete only after all selected collection succeeds.
 Missing, expired or not-yet-delivered logs cannot be recovered by this command.
+
+#### AWS collection IAM policy
+
+Generate one policy for **CloudTrail, SSM and inventory** before granting access:
+
+```powershell
+# Offline template with explicit bucket/key placeholders; no AWS login needed:
+kamotrace policy --output C:\cases\example\combined-policy.json
+# Supply every CloudTrail/SSM bucket and current/historical S3 encryption key:
+kamotrace policy --bucket example-trail-logs --bucket example-ssm-output --kms-key arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000001 --output C:\cases\example\scoped-policy.json
+# Validate the reviewed file with AWS IAM Access Analyzer (does not change it):
+kamotrace policy --validate-file C:\cases\example\scoped-policy.json --profile investigation --region us-east-1
+```
+
+`policy` reuses the collectors' permission lists and deduplicates actions,
+bucket names and key ARNs. Repeat `--bucket` and `--kms-key` as needed. It does
+not discover destinations: get them from `trailcheck`/`ssmcheck` reports or the
+resource owner, including historical destinations and keys. Missing resources
+become `REPLACE_WITH_...` placeholders. Use `--no-kms` instead of `--kms-key`
+only when **none** of the required S3 objects use SSE-KMS. `--partition` accepts
+`aws` (default), `aws-us-gov` or `aws-cn`. Bucket inputs must be names, not URLs,
+prefixes or wildcards; key inputs must be full key ARNs in that partition.
+The policy grants bucket-wide object reads, and uses `Resource: "*"` for
+metadata/CloudWatch reads; review and narrow those scopes where appropriate.
+
+`--output` defaults to `-` (policy JSON on stdout, diagnostics on stderr).
+Existing files are never overwritten. This command **does not attach a policy**
+or change AWS resources: an administrator must review and grant it to the
+investigation role/user through their normal IAM process.
+
+For validation, either add `--validate` during generation or use
+`--validate-file PATH` after editing the saved policy. File validation cannot
+be combined with generation options and never rewrites the file. Unresolved
+`REPLACE_WITH_` placeholders prevent AWS validation. Validation sends the policy
+document to AWS IAM Access Analyzer using `--profile`/`--region` or the SDK's
+normal configuration; the validating principal separately needs
+`access-analyzer:ValidatePolicy` on `Resource: "*"`. This permission is not
+included in the collection policy because collection does not use it.
+All paginated findings (errors, security warnings, warnings and suggestions)
+are printed to stderr. Exit status is **0** for successful generation, or
+requested validation with no findings; **1** for validation findings or unresolved
+placeholders; **2** for usage, file or AWS failures. A generated file remains
+available even if validation subsequently fails. Broad portable permissions may
+produce findings that need administrator review; they are not silently ignored.
+
+Access Analyzer checks **policy syntax and security recommendations, not effective
+access**. After the administrator grants the reviewed policy, use the same role
+to rerun `trailcheck`, `ssmcheck` and `inventory`, then collect the selected logs
+with `download` or `auto`. Check reports for denied/unknown results: audit success
+alone does not test S3 object reads or KMS decryption. A successful download tests
+only the selected, available objects, not missing/expired logs or all possible
+destinations. Cross-account policies, SCPs and other explicit denies still apply.
+
+The following is an example **identity policy for the investigator's AWS role or
+user**, covering `trailcheck`, `ssmcheck` and `download` (CloudTrail Event History,
+S3 trail logs, SSM history/output and configured S3/CloudWatch transcripts), plus
+the current network `inventory` snapshot that online `auto` collects by default.
+It grants no AWS writes and is **not a service delivery policy**: it does not
+enable logging or grant CloudTrail or the SSM Agent permission to deliver logs.
+Omit the `ReadNetworkInventory` statement if not collecting inventory (for
+example, with `auto --skip-inventory`); the other statements cover log collection.
+
+Replace every uppercase placeholder before attaching the policy. Use `aws`,
+`aws-us-gov` or `aws-cn` for `PARTITION` as appropriate. The arrays illustrate
+multiple CloudTrail and SSM buckets and KMS keys: for a single bucket/key, keep
+only its entry; for more, add entries. Repeat each bucket in both the bucket
+and object resource arrays, and deduplicate shared destinations. These are
+bucket names, not S3 URLs or prefixes. Use full KMS **key ARNs**, including the
+key owner's account and Region, not aliases or bare key IDs.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AuditAndCollectServiceMetadata",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ec2:DescribeRegions",
+        "cloudtrail:DescribeTrails",
+        "cloudtrail:GetTrailStatus",
+        "cloudtrail:GetEventSelectors",
+        "cloudtrail:GetInsightSelectors",
+        "cloudtrail:LookupEvents",
+        "ssm:GetDocument",
+        "ssm:ListDocuments",
+        "ssm:DescribeSessions",
+        "ssm:ListCommands",
+        "ssm:ListCommandInvocations",
+        "ssm:GetCommandInvocation",
+        "ssm:ListAssociations",
+        "ssm:DescribeAssociation",
+        "ssm:DescribeMaintenanceWindows",
+        "ssm:DescribeMaintenanceWindowTasks",
+        "ssm:GetMaintenanceWindowTask",
+        "s3:ListAllMyBuckets",
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadNetworkInventory",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ec2:DescribeRegions",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeInternetGateways",
+        "ec2:DescribeNetworkAcls",
+        "ec2:GetManagedPrefixListEntries",
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBClusters",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeRules",
+        "elasticloadbalancing:DescribeLoadBalancerAttributes",
+        "elasticloadbalancing:DescribeTags",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "elasticloadbalancing:DescribeTargetGroupAttributes",
+        "iam:GetInstanceProfile"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AuditAndListLogBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketPolicyStatus",
+        "s3:GetBucketPolicy",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketVersioning",
+        "s3:GetBucketObjectLockConfiguration",
+        "s3:GetLifecycleConfiguration"
+      ],
+      "Resource": [
+        "arn:PARTITION:s3:::CLOUDTRAIL_BUCKET_1",
+        "arn:PARTITION:s3:::CLOUDTRAIL_BUCKET_2",
+        "arn:PARTITION:s3:::SSM_OUTPUT_BUCKET_1",
+        "arn:PARTITION:s3:::SSM_OUTPUT_BUCKET_2"
+      ]
+    },
+    {
+      "Sid": "ReadHistoricalLogObjects",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:PARTITION:s3:::CLOUDTRAIL_BUCKET_1/*",
+        "arn:PARTITION:s3:::CLOUDTRAIL_BUCKET_2/*",
+        "arn:PARTITION:s3:::SSM_OUTPUT_BUCKET_1/*",
+        "arn:PARTITION:s3:::SSM_OUTPUT_BUCKET_2/*"
+      ]
+    },
+    {
+      "Sid": "DecryptCollectedS3Objects",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": [
+        "arn:PARTITION:kms:REGION:KEY_OWNER_ACCOUNT_ID:key/CLOUDTRAIL_KEY_ID",
+        "arn:PARTITION:kms:REGION:KEY_OWNER_ACCOUNT_ID:key/SSM_OUTPUT_KEY_ID",
+        "arn:PARTITION:kms:REGION:KEY_OWNER_ACCOUNT_ID:key/HISTORICAL_KEY_ID"
+      ]
+    }
+  ]
+}
+```
+
+The service metadata statement uses `Resource: "*"` for this portable example;
+where supported, an administrator can scope actions such as SSM document reads
+and CloudWatch `logs:FilterLogEvents` to the relevant resource ARNs. Region
+discovery in `download` and the checks needs `ec2:DescribeRegions` with
+`--regions all`; online inventory also uses it to validate explicit Regions.
+S3 SDK operations
+do not always match IAM action names: `ListObjectsV2` needs `s3:ListBucket`,
+`ListBuckets` needs `s3:ListAllMyBuckets`, and `GetBucketEncryption` needs
+`s3:GetEncryptionConfiguration`.
+
+Bucket-wide listing and object reads are intentional: historical logs may use
+older prefixes, account paths or output layouts. In shared or organization
+buckets, this can authorize reads beyond the investigated account. Review that
+scope with the owner; narrow it only if you know all required historical paths.
+`--probe-buckets` additionally needs listing access to other buckets it probes;
+add those bucket ARNs if they are outside the example's destinations.
+
+For **SSE-KMS S3 objects**, `s3:GetObject` alone is insufficient: the collector
+also needs `kms:Decrypt` on every key used by the selected objects, and the key
+policy or grant must permit that use. Today's trail key or bucket default is
+not an inventory of historical object keys. Changed destinations, old keys and
+unreadable encryption settings may leave required keys unknown; obtain their
+full ARNs from the bucket/key owner and retain access to old keys. A Session
+Manager `kmsKeyId` can describe session encryption, not the S3 object's SSE-KMS
+key; do not treat it as proof of which object key to authorize. CloudWatch Logs
+retrieval uses `logs:FilterLogEvents`; its at-rest KMS delivery configuration is
+separate from the collector's S3 decrypt permission.
+
+For cross-account buckets, the bucket owner must also authorize the collecting
+principal through an appropriate bucket policy; attaching this identity policy
+does not change the bucket policy or make owner-only settings readable. For
+cross-account KMS use, the key owner's key policy/grant and the collecting
+principal's identity policy must both allow decryption. Explicit denies in
+identity/resource policies, AWS Organizations SCPs, permissions boundaries and
+session policies can still block access. These example allows do not override
+those controls or establish effective access.
+
+##### Generate a policy from an audit
+
+Both checks accept `--emit-policy PATH|-`. They run their **normal audit first**,
+then emit a standalone IAM identity policy, separate from the JSON report:
+
+```powershell
+kamotrace trailcheck --profile investigation --json C:\cases\example\trailcheck.json --emit-policy C:\cases\example\trail-policy.json
+kamotrace ssmcheck --profile investigation --json C:\cases\example\ssmcheck.json --emit-policy C:\cases\example\ssm-policy.json
+# Send only the policy JSON to stdout; summary and warnings go to stderr:
+kamotrace trailcheck --profile investigation --json C:\cases\example\trailcheck-stdout.json --emit-policy -
+kamotrace ssmcheck --profile investigation --emit-policy -
+```
+
+File outputs are never overwritten: choose new report and policy paths, and
+the two paths must differ. `--emit-policy -` moves the readable summary to
+stderr and cannot be combined with `--json -` (both would need stdout).
+Warnings go to stderr, not inside the standalone IAM policy.
+
+Each check's policy covers audit/collection actions and scopes S3 access to its
+discovered log buckets, with bucket-wide `/*` object reads to include history,
+not just currently configured prefixes. For `trailcheck`, object reads cover
+configured trail buckets and probed former buckets **confirmed to have CloudTrail
+prefixes**; buckets with only other services' `AWSLogs/` paths are excluded.
+Trail and SSM checks discover different destinations; neither alone inventories
+both services. Review both reports and pass all required buckets/keys to
+`kamotrace policy` for a combined policy, or use the example above. Unknown,
+denied or truncated discovery keeps explicit placeholders and emits warnings;
+replace unresolved bucket and KMS key placeholders, including historical keys,
+before use. Even a complete audit cannot identify every historical destination
+or encryption key; a default warning reminds you of these historical omissions.
+
+Policy generation adds **no GetObject calls or permission simulation checks**.
+An audit can return a partial report and still emit a useful policy draft, but
+generation neither tests object reads/decryption nor assures effective access,
+complete discovery, delivered logs or complete evidence. Review the report's
+unknowns and limits as well as the policy. Neither command changes AWS IAM.
 
 #### Check trail configuration and S3 log coverage
 

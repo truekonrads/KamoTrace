@@ -262,7 +262,20 @@ class TrailcheckContract(unittest.TestCase):
 
     def test_reports_configuration_observed_prefixes_verified_days_and_unknowns(self):
         aws = self.scenario()
-        stdout, stderr = self.run_cli(aws, "--json", "-", status=1)
+        policy_path = self.folder / "policy.json"
+        stdout, stderr = self.run_cli(aws, "--json", "-", "--emit-policy", str(policy_path), status=1)
+        policy = json.loads(policy_path.read_text())
+        statements = {s["Sid"]: s for s in policy["Statement"]}
+        self.assertEqual(policy["Version"], "2012-10-17")
+        self.assertEqual(statements["DownloadLogObjects"]["Resource"], [
+            "arn:aws:s3:::REPLACE_WITH_ADDITIONAL_CLOUDTRAIL_BUCKET/*",
+            "arn:aws:s3:::synthetic-denied-bucket/*", "arn:aws:s3:::synthetic-trail-logs/*"])
+        self.assertEqual(statements["DownloadLogObjects"]["Action"], ["s3:GetObject"])
+        self.assertIn("s3:ListBucket", statements["LogBuckets"]["Action"])
+        self.assertIn("cloudtrail:GetTrailStatus", statements["DiscoveryAndHistory"]["Action"])
+        self.assertIn(f"arn:aws:kms:us-east-1:{ACCOUNT}:key/synthetic", statements["DecryptS3Logs"]["Resource"])
+        self.assertTrue(all(s["Effect"] == "Allow" and "Principal" not in s for s in policy["Statement"]))
+        self.assertIn("not an effective-permissions test", stderr)
         report = json.loads(stdout)
         self.assertEqual((report["tool"], report["version"], report["account_id"], report["partition"]),
                          ("trailcheck", 1, ACCOUNT, "aws"))
@@ -391,7 +404,11 @@ class TrailcheckContract(unittest.TestCase):
         aws = FakeAWS(routes, objects)
         target = self.folder / "trailcheck.json"
         stdout, stderr = self.run_cli(aws, "--regions", "us-east-1", "eu-west-1", "--probe-buckets",
-                                      "--json", str(target), status=0)
+                                      "--json", str(target), "--emit-policy", "-", status=0)
+        emitted = json.loads(stdout)
+        resources = next(s["Resource"] for s in emitted["Statement"] if s["Sid"] == "DownloadLogObjects")
+        self.assertEqual(resources, ["arn:aws:s3:::synthetic-current/*", "arn:aws:s3:::synthetic-old-trail/*"])
+        stdout = stderr  # Policy owns stdout; the normal readable report goes to stderr.
         report = json.loads(target.read_text(encoding="utf-8"))
         self.assertTrue(report["complete"], report["errors"])
         self.assertEqual(report["errors"], [])
@@ -416,7 +433,7 @@ class TrailcheckContract(unittest.TestCase):
                       "AWSLogs/ found by --probe-buckets", stdout)
         self.assertIn("s3://synthetic-flow-logs  AWSLogs/ without CloudTrail/ (found: vpcflowlogs)", stdout)
         self.assertIn("eu-west-1        no trail applies", stdout)
-        self.assertNotIn("Result:", stderr)
+        self.assertIn("Policy template only", stderr)
         # Reports never replace an existing file.
         before = target.read_bytes()
         stdout = io.StringIO()
@@ -424,6 +441,16 @@ class TrailcheckContract(unittest.TestCase):
             main(["trailcheck", "--json", str(target)])
         self.assertEqual(raised.exception.code, 2)
         self.assertEqual(target.read_bytes(), before)
+
+    def test_policy_output_rejects_conflicts_and_preserves_existing_files(self):
+        target = self.folder / "policy.json"
+        target.write_text("keep")
+        for options in (["--emit-policy", str(target)], ["--emit-policy", "-", "--json", "-"],
+                        ["--emit-policy", str(self.folder / "new.json"), "--json", str(self.folder / "new.json")]):
+            with self.subTest(options=options), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                main(["trailcheck", *options])
+            self.assertEqual(error.exception.code, 2)
+        self.assertEqual(target.read_text(), "keep")
 
     def test_login_failure_stops_without_report(self):
         def identity(region):

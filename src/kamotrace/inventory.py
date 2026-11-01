@@ -1,7 +1,7 @@
 """Read-only AWS network export and offline, evidence-linked exposure report."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 import csv
 from datetime import datetime, timezone
 import ipaddress
@@ -14,6 +14,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from . import aws_policy
 from .importer import in_staging, lock_path, publish, sha256, staging, write_lock
 
 CONFIG = Config(retries={"mode": "standard", "max_attempts": 4},
@@ -828,14 +829,26 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace inventory", description=__doc__)
     parser.add_argument("--profile")
     parser.add_argument("--regions", nargs="+", default=["all"], help="Enabled regions (default: all)")
-    parser.add_argument("--output", type=Path, required=True, help="New output folder; never overwritten")
+    parser.add_argument("--output", type=Path, help="New output folder; required unless only emitting policy; never overwritten")
     parser.add_argument("--from-export", type=Path, help="Reanalyze saved JSON, without AWS calls")
     parser.add_argument("--enrich-iam", action="store_true", help="With --from-export, make read-only IAM calls to resolve assigned profiles")
     parser.add_argument("--collect-only", action="store_true")
+    aws_policy.arguments(parser)
     args = parser.parse_args(argv)
+    aws_policy.validate(parser, args)
+    if args.output is None and not args.emit_policy:
+        parser.error("--output is required unless --emit-policy is supplied")
+    if args.emit_policy and args.emit_policy != "-":
+        target = Path(args.emit_policy).resolve()
+        for folder in (args.output, args.from_export):
+            if folder and (target.is_relative_to(folder.resolve()) or target == lock_path(folder.resolve())):
+                parser.error("policy path must be outside inventory output and input export")
     try:
-        out = build(args.output, args.profile, args.regions, args.from_export, args.enrich_iam, args.collect_only)
-        print(f"Inventory snapshot: {out}", flush=True)
+        aws_policy.emit({"tool": "inventory"}, args.emit_policy)
+        if args.output is not None:
+            with redirect_stdout(sys.stderr) if args.emit_policy == "-" else nullcontext():
+                out = build(args.output, args.profile, args.regions, args.from_export, args.enrich_iam, args.collect_only)
+                print(f"Inventory snapshot: {out}", flush=True)
         return 0
     except (BotoCoreError, ClientError, OSError, ValueError, KeyError, RuntimeError) as error:
         print(f"kamotrace inventory: {error}", file=sys.stderr)

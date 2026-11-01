@@ -19,6 +19,8 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from . import aws_policy
+
 PREFERENCES = "SSM-SessionManagerRunShell"
 DENIED = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedAccess",
           "AuthorizationError", "AuthFailure"}
@@ -382,7 +384,9 @@ def main(argv=None):
                         "(the text summary then goes to stderr)")
     parser.add_argument("--max-items", type=int, default=200,
                         help="Maximum items per listing per region (default 200); hitting it marks coverage partial")
+    aws_policy.arguments(parser)
     args = parser.parse_args(argv)
+    aws_policy.validate(parser, args)
     if "all" in args.regions and args.regions != ["all"]:
         parser.error("use all alone, or explicit region names")
     if args.max_items < 1:
@@ -419,6 +423,11 @@ def main(argv=None):
               "limitations": LIMITATIONS, "results": results}
     document = json.dumps(report, indent=2, sort_keys=False, default=str) + "\n"
     summary = text_report(report)
+    try:
+        aws_policy.emit(report, args.emit_policy)
+    except OSError as error:
+        print(f"ssmcheck: cannot write policy: {error}", file=sys.stderr)
+        return 2
     if args.json == "-":
         sys.stdout.write(document)
         sys.stderr.write(summary)
@@ -426,7 +435,7 @@ def main(argv=None):
         if target is not None:
             with open(target, "x", encoding="utf-8") as output:  # Never overwrite an earlier report.
                 output.write(document)
-        sys.stdout.write(summary)
+        (sys.stderr if args.emit_policy == "-" else sys.stdout).write(summary)
     return 0 if report["complete"] else 1
 
 

@@ -298,7 +298,13 @@ class InventoryExportTest(unittest.TestCase):
         before = {p.relative_to(self.source): p.read_bytes() for p in self.source.rglob("*") if p.is_file()}
         out = self.root / "analysis"
         with patch.object(inventory.boto3, "Session", side_effect=AssertionError("offline must not call AWS")):
-            self.assertEqual(self.cli("--from-export", self.source, "--output", out), 0)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(main(["inventory", "--from-export", str(self.source), "--output", str(out),
+                                       "--emit-policy", "-"]), 0)
+            policy = json.loads(stdout.getvalue())
+            self.assertIn("Inventory snapshot:", stderr.getvalue())
+            self.assertIn("iam:GetInstanceProfile", policy["Statement"][0]["Action"])
         self.assertEqual(before, {p.relative_to(self.source): p.read_bytes() for p in self.source.rglob("*") if p.is_file()})
         for path, value in before.items():
             self.assertEqual((out / path).read_bytes(), value)
@@ -307,6 +313,30 @@ class InventoryExportTest(unittest.TestCase):
         self.assertEqual(report["resources"][0]["status"], "Restricted")
         self.assertIn("not historical", report["metadata"]["limitations"][0])
         self.assertTrue(inventory.completed_export(out))
+
+    def test_inventory_policy_can_be_emitted_without_credentials_or_snapshot(self):
+        target = self.root / "policy.json"
+        with patch.object(inventory.boto3, "Session", side_effect=AssertionError("policy must not call AWS")):
+            self.assertEqual(self.cli("--emit-policy", target), 0)
+        policy = json.loads(target.read_text())
+        actions = policy["Statement"][0]["Action"]
+        self.assertEqual(set(actions), {
+            "sts:GetCallerIdentity", "ec2:DescribeRegions", "ec2:DescribeVpcs", "ec2:DescribeSubnets",
+            "ec2:DescribeInstances", "ec2:DescribeNetworkInterfaces", "ec2:DescribeSecurityGroups",
+            "ec2:DescribeRouteTables", "ec2:DescribeInternetGateways", "ec2:DescribeNetworkAcls",
+            "ec2:GetManagedPrefixListEntries", "rds:DescribeDBInstances", "rds:DescribeDBClusters",
+            "elasticloadbalancing:DescribeLoadBalancers", "elasticloadbalancing:DescribeListeners",
+            "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeLoadBalancerAttributes",
+            "elasticloadbalancing:DescribeTags", "elasticloadbalancing:DescribeTargetGroups",
+            "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroupAttributes",
+            "iam:GetInstanceProfile"})
+        before = target.read_bytes()
+        for args in (["--emit-policy", target], ["--output", self.root / "new", "--emit-policy", self.root / "new/policy.json"],
+                     ["--from-export", self.source, "--emit-policy", self.source / "policy.json"]):
+            with self.subTest(args=args), self.assertRaises(SystemExit) as error:
+                self.cli(*args)
+            self.assertEqual(error.exception.code, 2)
+        self.assertEqual(target.read_bytes(), before)
 
     def test_unknown_existing_targets_inputs_and_locks_are_never_overwritten(self):
         out = self.root / "unknown"

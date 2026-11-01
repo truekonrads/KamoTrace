@@ -3,13 +3,14 @@
   kamotrace auto     CASE_FOLDER [--profile NAME] [--start ...] [--no-serve] ...
   kamotrace import   --source event_history.json --database case.duckdb
   kamotrace download --dest CASE --regions all --start 2026-10-01 --end 2026-10-02
-  kamotrace trailcheck [--profile NAME] [--regions all] [--json report.json|-] [--probe-buckets]
+  kamotrace trailcheck [--profile NAME] [--regions all] [--json report.json|-] [--probe-buckets] [--emit-policy policy.json|-]
   kamotrace get-suzaku [--version 3.0.0]
   kamotrace suzaku   --database case.duckdb (--source event_history.json [--suzaku suzaku.exe] | --timeline suzaku.duckdb)
   kamotrace get-dbip [--dest FOLDER]
   kamotrace enrich   --database case.duckdb (--geolite2 FOLDER | --jsonl FILE)...
-  kamotrace ssmcheck [--profile NAME] [--regions all] [--json report.json] [--max-items 200]
-  kamotrace inventory --output FOLDER [--profile NAME] [--regions all] [--from-export FOLDER]
+  kamotrace ssmcheck [--profile NAME] [--regions all] [--json report.json] [--max-items 200] [--emit-policy policy.json|-]
+  kamotrace inventory [--output FOLDER] [--profile NAME] [--regions all] [--from-export FOLDER] [--emit-policy policy.json|-]
+  kamotrace policy [--output policy.json|-] [--bucket NAME]... [--kms-key ARN]... [--validate]
   kamotrace serve    --database case.duckdb [--ssm-export ...]
   kamotrace mcp      --url http://127.0.0.1:8765
 """
@@ -26,6 +27,7 @@ COMMANDS = {
     "enrich": ("kamotrace.enrich", "Add offline IP enrichment from GeoLite2-format .mmdb and/or provider-neutral JSONL"),
     "ssmcheck": ("kamotrace.ssmcheck", "Read-only report of what SSM sessions and commands log, and where"),
     "inventory": ("kamotrace.inventory", "Export current AWS network configuration or analyze an existing export offline"),
+    "policy": ("kamotrace.aws_policy", "Generate a combined CloudTrail, SSM and inventory policy; optionally validate with AWS"),
     "serve": ("kamotrace.server", "Start the local browser UI and HTTP MCP at /mcp on 127.0.0.1"),
     "mcp": ("kamotrace.mcp_server", "Stdio MCP adapter for agents, backed by a running `kamotrace serve`"),
 }

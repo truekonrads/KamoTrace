@@ -16,6 +16,8 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from . import aws_policy
+
 VERSION = 1
 WORKERS = 8  # Concurrent read-only calls across Regions, trails and S3 Region prefixes.
 DENIED = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedAccess",
@@ -720,7 +722,9 @@ def main(argv=None):
                         help="Maximum S3 ListObjectsV2 calls for the whole run (default 2000); beyond it is partial")
     parser.add_argument("--probe-buckets", action="store_true",
                         help="Also list AWSLogs/ in every other bucket of the account, to find former trail logs")
+    aws_policy.arguments(parser)
     args = parser.parse_args(argv)
+    aws_policy.validate(parser, args)
     if bool(args.start) != bool(args.end):
         parser.error("--start and --end must be supplied together")
     if args.start:
@@ -738,7 +742,7 @@ def main(argv=None):
     target = Path(args.json) if args.json and args.json != "-" else None
     if target is not None and target.exists():
         parser.error(f"{target} exists; choose a new report path")
-    summary = sys.stderr if args.json == "-" else sys.stdout
+    summary = sys.stderr if args.json == "-" or args.emit_policy == "-" else sys.stdout
 
     def log(message):
         print(f"trailcheck: {message}", file=sys.stderr, flush=True)
@@ -763,6 +767,11 @@ def main(argv=None):
             return 2
     elif args.json == "-":
         sys.stdout.write(text)
+    try:
+        aws_policy.emit(report, args.emit_policy)
+    except OSError as error:
+        print(f"trailcheck: cannot write policy: {error}", file=sys.stderr)
+        return 2
     summary.write(render(report))
     if target is not None:
         print(f"JSON report: {target}", file=sys.stderr)

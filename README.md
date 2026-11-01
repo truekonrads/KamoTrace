@@ -55,6 +55,44 @@ kamotrace auto C:\cases\offline --source C:\exports\cloudtrail.json
 See [auto options and recovery](docs/user-guide.md#full-auto-preparation) or
 the [manual preparation and collection reference](docs/preparation.md) for more control.
 
+Your AWS login needs collection permissions, not just console access. Start with
+the [copyable audit/download IAM identity policy](docs/preparation.md#aws-collection-iam-policy)
+or generate a combined CloudTrail, SSM and inventory policy offline:
+
+```powershell
+kamotrace policy --output combined-policy.json
+```
+
+Replace the bucket/key placeholders, or supply repeatable `--bucket NAME` and
+`--kms-key ARN` arguments (`--no-kms` only for S3 objects without SSE-KMS).
+Validate a reviewed file with
+`kamotrace policy --validate-file combined-policy.json --profile investigation --region us-east-1`.
+This uses AWS IAM Access Analyzer and requires `access-analyzer:ValidatePolicy`;
+it checks the policy, not effective access. An administrator must grant the
+reviewed policy; then rerun the checks and collect logs to test actual access.
+No IAM policies are attached or changed by KamoTrace. For discovered
+destinations, run the normal audits and save separate policy drafts:
+
+```powershell
+kamotrace trailcheck --profile investigation --json trail-report.json --emit-policy trail-policy.json
+kamotrace ssmcheck --profile investigation --json ssm-report.json --emit-policy ssm-policy.json
+# Inventory's static policy needs no AWS calls when --output is omitted:
+kamotrace inventory --emit-policy inventory-policy.json
+```
+
+Use new, distinct report/policy paths; existing files are never overwritten.
+`--emit-policy -` prints policy JSON to stdout and the summary/warnings to stderr;
+it cannot be combined with `--json -`. Drafts include bucket-wide historical
+object reads and retain placeholders when discovery is unknown or partial.
+Review cross-account bucket/key policies, SSE-KMS decryption (including old keys),
+explicit denies, SCPs and permissions boundaries. These read-only audits do not
+test object reads or simulate permissions: a policy draft proves neither effective
+access nor complete logs. The example also covers auto's network inventory
+collector (`--skip-inventory` to omit it). Inventory's separate policy needs no
+S3/KMS permissions; add `--output FOLDER` to collect a snapshot as well, keeping
+the policy outside the snapshot output and any input export. None of these
+policies grants service delivery permissions or AWS writes.
+
 ### 2. Connect your AI assistant
 
 Auto serves MCP at **http://127.0.0.1:8765/mcp** alongside the browser. Keep it

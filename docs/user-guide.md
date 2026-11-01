@@ -34,7 +34,24 @@ opening a case:
 ```powershell
 kamotrace inventory --profile investigation --regions all --output C:\cases\acme\inventory
 kamotrace serve --database C:\cases\acme\case.duckdb --inventory-export C:\cases\acme\inventory
+# Emit the static inventory IAM policy without AWS calls:
+kamotrace inventory --emit-policy C:\cases\acme\inventory-policy.json
+# Or emit it alongside a normal collection, outside the snapshot directory:
+kamotrace inventory --profile investigation --output C:\cases\acme\inventory-new --emit-policy C:\cases\acme\inventory-new-policy.json
 ```
+
+`inventory --emit-policy PATH|-` emits the static read-only inventory identity
+policy. Without `--output`, no AWS calls are made; with `--output`, collection
+also runs normally. `-` sends policy JSON to stdout and summaries/warnings to
+stderr. A policy file must not already exist and must be outside the snapshot
+output and any input export, so manifests and source evidence remain intact.
+The exact actions are in the
+[combined collection IAM policy](preparation.md#aws-collection-iam-policy):
+STS identity, EC2 Region/network describes and managed prefix list entry reads,
+RDS describes, ELB/ELBv2 describes (including listeners, rules, targets,
+attributes and tags), and `iam:GetInstanceProfile`. The inventory-only policy
+grants no S3 or KMS access and does not establish effective access. Unlike the
+trail/SSM checks, this policy needs no discovery audit.
 
 The **AWS inventory** workspace shows collected systems and their network
 configuration. Search and region/status filters apply to the snapshot, not the
@@ -204,14 +221,16 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `kamotrace auto CASE_FOLDER [options]` | [Full-auto](#full-auto-preparation): tools, AWS download, import, enrichment, detections, then `serve`; rerun to resume |
 | `kamotrace import --source FILE_OR_FOLDER... --database NEW.duckdb` | Combine CloudTrail JSON/gzip exports; repeat `--source`, or use `-` for binary stdin |
 | `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume CloudTrail/SSM collection with an existing AWS login; optional gzip output |
-| `kamotrace trailcheck [--regions all] [--json PATH\|-] [--max-items N] [--max-s3-calls N] [--probe-buckets]` | [Read-only audit](#cloudtrail-trail-check) of trails, logging/delivery state, S3 destinations and observed log dates |
+| `kamotrace inventory [--output FOLDER] [--emit-policy PATH\|-]` | [Current network inventory](#aws-inventory-and-map); policy-only mode without `--output` makes no AWS calls |
+| `kamotrace policy [--output PATH\|-] [--bucket NAME]... [--kms-key ARN]... [--validate \| --validate-file PATH]` | [Combined collection policy](preparation.md#aws-collection-iam-policy) for CloudTrail, SSM and inventory; offline generation, optional AWS IAM Access Analyzer validation |
+| `kamotrace trailcheck [--regions all] [--json PATH\|-] [--emit-policy PATH\|-] [--max-items N] [--max-s3-calls N] [--probe-buckets]` | [Read-only audit](#cloudtrail-trail-check) of trails, logging/delivery state, S3 destinations and observed log dates |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
 | `kamotrace suzaku --database DB (--source FILE [--suzaku EXE] \| --timeline FILE)` | Run or import Suzaku detections into `<database>.detections.duckdb` |
 | `kamotrace get-dbip [--dest FOLDER]` | Download and verify the free DB-IP Lite City and ASN databases (CC BY 4.0, no account) |
 | `kamotrace enrich --database DB (--geolite2 FOLDER \| --jsonl FILE)...` | Add offline IP enrichment into `<database>.enrichment.duckdb` |
 | `kamotrace serve --database DB [options]` | Start the browser UI on `127.0.0.1` |
 | `kamotrace mcp --url http://127.0.0.1:8765` | Stdio MCP adapter for agents, backed by a running `serve` |
-| `kamotrace ssmcheck [--regions all] [--json FILE\|-] [--max-items 200]` | [Read-only report](#ssm-logging-check) of where SSM session and command output is logged |
+| `kamotrace ssmcheck [--regions all] [--json FILE\|-] [--emit-policy PATH\|-] [--max-items 200]` | [Read-only report](#ssm-logging-check) of where SSM session and command output is logged |
 
 `kamotrace <command> --help` lists every option. `python -m kamotrace` works too.
 
@@ -333,6 +352,9 @@ kamotrace trailcheck --profile investigation
 kamotrace trailcheck --regions us-east-1 ap-southeast-1 --json C:\cases\example\trailcheck.json
 kamotrace trailcheck --regions us-east-1 ap-southeast-1 --start 2026-10-01 --end 2026-10-03
 kamotrace trailcheck --json - --probe-buckets > C:\cases\example\trailcheck.json
+kamotrace trailcheck --profile investigation --json C:\cases\example\trail-report.json --emit-policy C:\cases\example\trail-policy.json
+# Policy JSON on stdout, summary and warnings on stderr:
+kamotrace trailcheck --profile investigation --emit-policy -
 ```
 
 It uses your existing AWS login, as `download` does, and only calls Describe,
@@ -340,6 +362,20 @@ Get and List APIs. It changes nothing in AWS, and it lists log objects without
 downloading them. The readable summary goes to stdout. `--json PATH` also
 writes the full report to a new file; it refuses to overwrite an existing one.
 `--json -` writes the JSON to stdout and moves the summary to stderr.
+
+`--emit-policy PATH|-` runs the normal audit, then emits a standalone IAM identity
+policy for audit and collection, scoped to configured trail buckets and probed
+former buckets confirmed to have CloudTrail prefixes, not buckets containing
+only other services' `AWSLogs/` paths. Object reads are intentionally bucket-wide
+(`/*`) to include historical paths. Report and
+policy files must have different paths and neither is overwritten.
+`--emit-policy -` sends only policy JSON to stdout and the summary to stderr;
+it cannot be combined with `--json -`. Unknown or partial discovery retains
+placeholders and warns on stderr, including unresolved KMS keys. This adds no
+GetObject or permission simulation checks and proves neither effective access
+nor complete discovery or evidence. Review the
+[copyable policy, placeholder instructions and cross-account/KMS cautions](preparation.md#aws-collection-iam-policy)
+before attaching it. SSM destinations require the separate SSM check.
 
 With `--start` and `--end` together, trailcheck additionally verifies each UTC
 day in that inclusive range for every selected Region, using only the current
@@ -435,6 +471,9 @@ all`), `cloudtrail:DescribeTrails`, `cloudtrail:GetTrailStatus`,
 `s3:GetBucketPublicAccessBlock`, `s3:GetBucketPolicyStatus`, `s3:GetBucketPolicy`,
 `s3:GetEncryptionConfiguration`, `s3:GetBucketVersioning`,
 `s3:GetBucketObjectLockConfiguration` and `s3:GetLifecycleConfiguration`.
+These are audit permissions, not object collection or service delivery grants;
+see the [audit and download identity policy](preparation.md#aws-collection-iam-policy)
+for `s3:GetObject`, CloudWatch reads and SSE-KMS `kms:Decrypt` requirements.
 CloudTrail Lake, Event History and CloudWatch Logs contents are not checked.
 Reports name accounts, buckets and trails: keep them private and out of Git.
 
@@ -1061,12 +1100,28 @@ your existing AWS login, the same way as `download`:
 
 ```powershell
 kamotrace ssmcheck --profile investigation --regions all --json C:\cases\example\ssmcheck.json
+kamotrace ssmcheck --profile investigation --json C:\cases\example\ssm-report.json --emit-policy C:\cases\example\ssm-policy.json
+# Policy JSON on stdout, summary and warnings on stderr:
+kamotrace ssmcheck --profile investigation --emit-policy -
 ```
 
 The text summary goes to stdout. `--json FILE` also writes the full report to a
 **new** file and refuses to overwrite one; `--json -` prints the JSON to stdout
 and sends the summary to stderr. Keep reports private: they name buckets, log
 groups, KMS keys and the account ID. Caller ARNs and credentials are never reported.
+
+`--emit-policy PATH|-` runs the normal audit, then emits a standalone IAM identity
+policy covering audit/collection actions and all discovered SSM output buckets,
+with intentionally bucket-wide object reads to include history. It does not
+discover CloudTrail destinations; use `trailcheck` for those. Policy and report
+files must differ and neither is overwritten. `--emit-policy -` sends policy
+JSON to stdout and the summary to stderr, and cannot be used with `--json -`.
+Unknown/partial discovery retains placeholders and warns on stderr; replace
+unresolved bucket and KMS key placeholders before use. Generation adds no
+GetObject or permission simulation calls and assures neither effective access
+nor complete discovery or evidence. See the
+[example identity policy and cross-account/KMS guidance](preparation.md#aws-collection-iam-policy),
+including keys used by historical objects, not just current settings.
 
 For each region it checks:
 
@@ -1111,6 +1166,9 @@ if denied, only the default region is checked and the report is partial),
 `ssm:GetDocument`, `ssm:ListDocuments`, `ssm:DescribeSessions`, `ssm:ListCommands`,
 `ssm:ListAssociations`, `ssm:DescribeAssociation`, `ssm:DescribeMaintenanceWindows`,
 `ssm:DescribeMaintenanceWindowTasks` and `ssm:GetMaintenanceWindowTask`.
+These checks do not need output-read permissions. The generated policy also
+includes collection permissions for a later download; it is not a service
+delivery policy and does not enable SSM logging or write anything in AWS.
 
 ## Agent access (MCP)
 

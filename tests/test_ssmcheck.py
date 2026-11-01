@@ -68,7 +68,7 @@ class SsmCheckContract(unittest.TestCase):
         ssm.add_response("list_documents", {"DocumentIdentifiers": [
             {"Name": "SSM-SessionManagerRunShell"}, {"Name": "Team-Shell"}, {"Name": "Team-Tunnel"}]},
             {"Filters": [{"Key": "DocumentType", "Values": ["Session"]}, {"Key": "Owner", "Values": ["Self"]}]})
-        ssm.add_response("get_document", session_doc("Standard_Stream", s3BucketName="", cloudWatchLogGroupName="/team"),
+        ssm.add_response("get_document", session_doc("Standard_Stream", s3BucketName="team-out", cloudWatchLogGroupName="/team"),
                          {"Name": "Team-Shell", "DocumentFormat": "JSON"})
         ssm.add_response("describe_sessions", {"Sessions": [
             {"SessionId": "a-1", "DocumentName": "SSM-SessionManagerRunShell", "StartDate": dt("2026-10-20T01:00:00Z")}]},
@@ -106,6 +106,7 @@ class SsmCheckContract(unittest.TestCase):
             "WindowId": "mw-0123456789abcdef0", "WindowTaskId": "22222222-2222-2222-2222-222222222222",
             "TaskArn": "AWS-RunPatchBaseline", "TaskType": "RUN_COMMAND",
             "TaskInvocationParameters": {"RunCommand": {"Parameters": {"Operation": [SECRET]},
+                                                        "OutputS3BucketName": "maintenance-out",
                                                         "CloudWatchOutputConfig": {"CloudWatchOutputEnabled": True}}}},
             {"WindowId": "mw-0123456789abcdef0", "WindowTaskId": "22222222-2222-2222-2222-222222222222"})
 
@@ -125,7 +126,21 @@ class SsmCheckContract(unittest.TestCase):
         ssm.add_response("describe_maintenance_windows", {"WindowIdentities": []})
         target = self.folder / "report.json"
 
-        code, out, err = self.run_cli("--regions", "us-east-1", "ap-southeast-1", "--json", str(target), "--max-items", "2")
+        policy_path = self.folder / "policy.json"
+        code, out, err = self.run_cli("--regions", "us-east-1", "ap-southeast-1", "--json", str(target),
+                                     "--max-items", "2", "--emit-policy", str(policy_path))
+        policy = json.loads(policy_path.read_text())
+        statements = {s["Sid"]: s for s in policy["Statement"]}
+        self.assertEqual(statements["DownloadLogObjects"]["Resource"], [
+            "arn:aws:s3:::REPLACE_WITH_ADDITIONAL_SSM_BUCKET/*", "arn:aws:s3:::assoc-out/*",
+            "arn:aws:s3:::cmd-out/*", "arn:aws:s3:::maintenance-out/*", "arn:aws:s3:::session-logs/*",
+            "arn:aws:s3:::team-out/*"])
+        self.assertIn("ssm:GetCommandInvocation", statements["DiscoveryAndHistory"]["Action"])
+        self.assertIn("arn:aws:logs:ap-southeast-1:123456789012:log-group:/team:*",
+                      statements["ReadSSMCloudWatchOutput"]["Resource"])
+        self.assertNotIn("alias/session", policy_path.read_text())  # Session transport key is not an S3 object key.
+        self.assertIn("REPLACE_WITH_S3_KMS_KEY_ID", policy_path.read_text())
+        self.assertIn("not an effective-permissions test", err)
 
         self.assertEqual(code, 1, err)
         raw = target.read_text(encoding="utf-8")
@@ -156,7 +171,7 @@ class SsmCheckContract(unittest.TestCase):
         self.assertEqual([(d["name"], d["session_type"], d["content_logging"]) for d in docs["documents"]],
                          [("Team-Shell", "Standard_Stream", "document_inputs")])
         self.assertEqual((docs["documents"][0]["s3"]["state"], docs["documents"][0]["cloudwatch"]["log_group"]),
-                         ("not_configured", "/team"))
+                         ("configured", "/team"))
 
         sessions = ap["observed_sessions"]
         self.assertEqual((sessions["state"], sessions["examined"], sessions["truncated"]), ("observed", 3, True))
@@ -177,7 +192,7 @@ class SsmCheckContract(unittest.TestCase):
         self.assertEqual((assoc["state"], assoc["s3_bucket"], assoc["s3_prefix"]), ("configured", "assoc-out", "inv/"))
         tasks = ap["maintenance_window_tasks"]
         self.assertEqual([(t["state"], t["cloudwatch_log_group"], t["s3_bucket"]) for t in tasks["run_command_tasks"]],
-                         [("configured", "/aws/ssm/AWS-RunPatchBaseline", None)])
+                         [("configured", "/aws/ssm/AWS-RunPatchBaseline", "maintenance-out")])
         self.assertEqual(tasks["other_task_types"], {"AUTOMATION": 1})
         self.assertEqual(us["maintenance_window_tasks"]["state"], "not_configured")
 
@@ -200,7 +215,12 @@ class SsmCheckContract(unittest.TestCase):
         ssm.add_response("list_associations", {"Associations": []})
         ssm.add_response("describe_maintenance_windows", {"WindowIdentities": []})
 
-        code, out, err = self.run_cli("--json", "-")
+        policy_path = self.folder / "stdout-report.json"
+        code, out, err = self.run_cli("--json", str(policy_path), "--emit-policy", "-")
+        policy = json.loads(out)
+        self.assertIn("arn:aws:s3:::REPLACE_WITH_ADDITIONAL_SSM_BUCKET/*",
+                      next(s["Resource"] for s in policy["Statement"] if s["Sid"] == "DownloadLogObjects"))
+        out = policy_path.read_text()
 
         self.assertEqual(code, 0, err)
         report = json.loads(out)
@@ -219,6 +239,16 @@ class SsmCheckContract(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit_:
             main(["ssmcheck", "--json", str(existing)])
         self.assertEqual((exit_.exception.code, existing.read_text(encoding="utf-8")), (2, "keep"))
+
+    def test_policy_output_rejects_conflicts_and_preserves_existing_files(self):
+        target = self.folder / "policy.json"
+        target.write_text("keep")
+        for options in (["--emit-policy", str(target)], ["--emit-policy", "-", "--json", "-"],
+                        ["--emit-policy", str(self.folder / "new.json"), "--json", str(self.folder / "new.json")]):
+            with self.subTest(options=options), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                main(["ssmcheck", *options])
+            self.assertEqual(error.exception.code, 2)
+        self.assertEqual(target.read_text(), "keep")
 
 
 if __name__ == "__main__":
