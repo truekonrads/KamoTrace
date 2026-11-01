@@ -256,7 +256,7 @@ other commands' code in dependency order, printing `[N/7 stage]` progress to std
 | --- | --- | --- |
 | 1. `get-suzaku` | Newest Suzaku installed in the tools folder; otherwise download and verify the latest 3.x | `--suzaku EXE`, `--suzaku-version X.Y.Z` (that exact version, installed or downloaded), `--timeline FILE`, `--skip-suzaku` |
 | 2. `get-dbip` | Newest complete DB-IP Lite folder in the tools folder; otherwise download and verify | `--geolite2 FOLDER` and/or `--jsonl FILE` (earlier wins), `--skip-enrich` |
-| 3. `download` | `CASE_FOLDER/download`, all enabled regions, CloudTrail and SSM, maximum available history; with explicit dates, S3 only after every Region/day is verified | `--download-dir`, `--profile`, `--regions`, `--start`, `--end`, `--cloudtrail-source auto\|history`, `--services`, `--compress`, `--progress`, `--session-s3`, `--session-log-group`; `--source FILE...` or `--skip-download` to use existing data |
+| 3. `download` | `CASE_FOLDER/download`, all enabled regions, CloudTrail and SSM, maximum available history; with `--start`, prefer readable S3 locations, allowing empty days and unused Regions; omitted `--end` means now, frozen on resume | `--download-dir`, `--profile`, `--regions`, `--start`, `--end`, `--cloudtrail-source auto\|history`, `--services`, `--compress`, `--progress`, `--session-s3`, `--session-log-group`; `--source FILE...` or `--skip-download` to use existing data |
 | 4. `import` | `CASE_FOLDER/case.duckdb` from `cloudtrail.json[.gz]` | `--database` |
 | 5. `enrich` | `<database stem>.enrichment.duckdb` from DB-IP Lite | as stage 2 |
 | 6. `suzaku` | `<database stem>.detections.duckdb`, running Suzaku on the imported CloudTrail file | `--rules`, `--min-level` |
@@ -349,11 +349,18 @@ nonempty log object. This is independent of unreadable bucket settings that may
 make the overall audit partial. Verification samples at most 20 objects per day,
 within the shared S3 call budget: an unverified day is not proof of absence.
 
-Dated `auto` (both dates explicitly supplied) and `download --cloudtrail-source auto`
-use this result to select S3; otherwise they retain Event History and warn about
-its 90-day management-event retention. The audit is saved as `trailcheck.json`
+`auto` and `download --cloudtrail-source auto`, when given `--start`,
+select S3 when every requested Region has at least one discovered current-account
+root with successful listings for all requested days. Empty days are allowed,
+including Regions with no existing prefix; matching log objects on every day are
+not required. Samples without matching objects and unknown samples are reported
+separately, and neither empty listings nor matching samples prove complete coverage.
+An omitted `--end` uses now (the first run's start time, frozen on resume).
+Missing locations, unknown Region scope, or unreadable/budget-limited day listings
+that leave a Region without a readable root retain Event History, with a warning
+about its 90-day management-event retention. The audit is saved as `trailcheck.json`
 in the collection directory, and the source choice is frozen for resume.
-After the presence gate passes, every requested date at every discovered
+After the readability gate passes, every requested date at every discovered
 current-account/Region root is fully listed, not just dates whose 20-object
 sample verified. Failed or denied collection listings stop the run; they do
 not silently remove a root from the collection. Existing history checkpoints

@@ -645,6 +645,13 @@ class Handler(SimpleHTTPRequestHandler):
         if transport is None:
             self.respond({"error": "HTTP MCP is disabled; use the stdio adapter"}, 404)
             return
+        if self.command == "GET":
+            # The buffered ASGI bridge cannot serve an open-ended SSE stream.
+            self.send_response(405)
+            self.send_header("Allow", "POST, DELETE")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > 1048576 or self.headers.get("Transfer-Encoding"):

@@ -29,7 +29,8 @@ HTTP_BASE = ContextVar("kamotrace_http_base", default=None)
 NEW_TAG_COLOR = "#c45436"  # Same default as the browser's quick-tag colour picker.
 OPENER = build_opener(ProxyHandler({}))  # Never route loopback evidence traffic through a system proxy.
 
-mcp = MCPServer("kamotrace", instructions="""\
+# Tool/resource lists are fixed; the buffered HTTP bridge cannot stream subscriptions.
+mcp = MCPServer("kamotrace", subscriptions=False, instructions="""\
 Search and annotate CloudTrail evidence held by a local, read-only KamoTrace browser.
 list_detections shows Suzaku rules, KamoTrace heuristic rules and labelled GuardDuty contextual leads; filter with query.rules / min_level.
 GuardDuty context is not an exact CloudTrail event match. Verify original evidence before drawing conclusions.

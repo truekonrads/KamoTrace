@@ -596,7 +596,7 @@ def main(argv=None):
     parser.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date YYYY-MM-DD; default: collection start time")
     parser.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm", "guardduty"), default=["cloudtrail", "ssm"])
     parser.add_argument("--cloudtrail-source", choices=("history", "auto"), default="history",
-                        help="auto: use S3 only after trailcheck verifies every requested Region/day; otherwise Event History")
+                        help="auto: with --start, prefer readable S3 locations, allowing empty days; omitted --end uses collection start time; otherwise Event History")
     parser.add_argument("--cloudtrail-s3", action="append", default=[], metavar="s3://BUCKET/ROOT/AWSLogs/ACCOUNT/CloudTrail/",
                         help="Download this account's CloudTrail root directly (repeatable); requires --start and --end")
     parser.add_argument("--compress", action="store_true", help="Gzip generated CloudTrail, SSM and CloudWatch JSON exports (not original S3 objects)")
@@ -688,19 +688,29 @@ def main(argv=None):
                     bucket_region = {None: "us-east-1", "EU": "eu-west-1"}.get(constraint, constraint)
                     plan["locations"].extend({**location, "bucket_region": bucket_region, "region": name} for name in regions)
                 plan["source"] = "s3"
-            elif args.cloudtrail_source == "auto" and args.start and args.end and "cloudtrail" in args.services:
-                progress.tick("Verifying S3 CloudTrail presence for every requested Region/day")
+            elif args.cloudtrail_source == "auto" and args.start and "cloudtrail" in args.services:
+                progress.tick("Checking S3 CloudTrail locations and requested Region/day listings")
                 report = trailcheck.audit(session, argparse.Namespace(regions=regions, max_items=1000,
                     max_s3_calls=2000, probe_buckets=False, start=collector.start, end=collector.end), progress.tick)
                 atomic_json(folder / "trailcheck.json", report)
                 requested = report["requested_range"]
-                if requested["verified"] and not report["unknown_regions"]:
+                readable = all(any(
+                    location["region"] == name and all(day["verification"] != "unknown" for day in location["days"])
+                    for location in requested["locations"]) for name in regions)
+                if readable and not report["unknown_regions"]:
                     # A negative sample is not absence: fully list every discovered root/day.
                     # Denied listings then fail collection rather than silently omitting evidence.
                     plan.update(source="s3", locations=[{key: value for key, value in item.items() if key != "days"}
                                                        for item in requested["locations"]])
+                    unverified = sum(day["verification"] == "not_verified"
+                                     for location in requested["locations"] for day in location["days"])
+                    unknown = sum(day["verification"] == "unknown"
+                                  for location in requested["locations"] for day in location["days"])
+                    print(f"CloudTrail source: S3; {unverified} location/day samples without matching log objects; "
+                          f"{unknown} unknown samples. Full listings will follow; empty days do not prove missing "
+                          "logs or complete coverage. See trailcheck.json.", file=sys.stderr, flush=True)
                 else:
-                    print("Warning: S3 range not verified; retaining CloudTrail Event History "
+                    print("Warning: S3 locations missing or not readable for every requested Region; retaining CloudTrail Event History "
                           "(last 90 days, management events only). See trailcheck.json.", file=sys.stderr, flush=True)
             with collector.db:
                 collector.db.execute("INSERT INTO cloudtrail_plan VALUES (?)", (encode(plan),))
