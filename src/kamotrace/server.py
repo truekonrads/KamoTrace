@@ -1,7 +1,8 @@
 """Local, read-only CloudTrail browser. Run with: kamotrace serve --database events.duckdb"""
 import argparse
 from collections import defaultdict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,7 @@ import duckdb
 
 
 logger = logging.getLogger(__name__)
+REQUEST_ID = ContextVar("request_id", default="startup")
 ROOT = Path(__file__).resolve().parent
 FIELDS = {
     "time_local": "Local time",
@@ -207,7 +209,12 @@ class Store:
             default = database.with_suffix(".enrichment.duckdb")
             enrichment = enrichment or (default if default.exists() else None)
             logger.info("Loading IP enrichment: %s", enrichment or "none (no sidecar found)")
+            stage_started = time.monotonic()
             self.enrichment_run = load_enrichment(self.connection, enrichment)
+            # Small, immutable lookup snapshot: reference-only cards never touch the shared connection.
+            self.reference_enrichment = {row[0]: dict(zip(("country", "city", "asn", "isp", "ip_info"), row[1:]))
+                for row in self.connection.execute("SELECT ip, country, city, asn, isp, ip_info FROM ip_enrichment").fetchall()}
+            self.startup_timing("enrichment", stage_started)
             logger.info("Preparing event browser view")
             self.connection.execute("""
                 CREATE TEMP VIEW browse_events AS
@@ -227,30 +234,70 @@ class Store:
             from .ssm import Commands
             from .suzaku import load_detections
             logger.info("Loading and linking SSM commands: %s", ssm_export or "none (no export supplied)")
+            stage_started = time.monotonic()
             self.commands = Commands(ssm_export, self.connection)
+            self.startup_timing("ssm", stage_started)
             from .inventory_store import Inventory
             logger.info("Loading current-configuration inventory: %s", inventory_export or "none (no export supplied)")
+            stage_started = time.monotonic()
             self.inventory = Inventory(inventory_export)
+            self.startup_timing("inventory", stage_started)
             # Suzaku detections come from a derived sidecar written by `kamotrace suzaku`; only rows the
             # CLI linked to exactly one evidence record are queryable. Missing sidecar = no detections.
             default = database.with_suffix(".detections.duckdb")
             detections = detections or (default if default.exists() else None)
             logger.info("Loading Suzaku detections: %s", detections or "none (no sidecar found)")
+            stage_started = time.monotonic()
             self.suzaku_run = load_detections(self.connection, detections)
+            self.startup_timing("detections", stage_started)
             # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
             self.connection.execute("SET enable_external_access=false")
             logger.info("Calculating event counts, time range and filter metadata")
+            stage_started = time.monotonic()
             self.meta = self.metadata()
+            self.startup_timing("metadata", stage_started)
             # The Store owns both connections after initialization succeeds.
             startup.pop_all()
 
+    def startup_timing(self, stage, started):
+        logger.info("startup stage=%s elapsed_ms=%.3f", stage, (time.monotonic() - started) * 1000)
+        if logger.isEnabledFor(logging.DEBUG):
+            # DuckDB-managed memory, not process RSS; snapshots are not additive stage costs.
+            for tag, used in self.connection.execute(
+                    "SELECT tag, sum(memory_usage_bytes) FROM duckdb_memory() GROUP BY tag").fetchall():
+                if used:
+                    logger.debug("startup_memory stage=%s tag=%s bytes=%d", stage, tag, used)
+
+    @contextmanager
+    def locked(self, operation):
+        """Separate serialized Store work from time spent waiting behind another request."""
+        queued = time.monotonic()
+        request_id = REQUEST_ID.get()
+        logger.info("operation queued request_id=%s operation=%s", request_id, operation)
+        self.lock.acquire()
+        acquired = time.monotonic()
+        outcome = "error"
+        try:
+            logger.info("operation started request_id=%s operation=%s lock_wait_ms=%.3f",
+                        request_id, operation, (acquired - queued) * 1000)
+            yield
+            outcome = "ok"
+        finally:
+            finished = time.monotonic()
+            self.lock.release()
+            logger.info("operation finished request_id=%s operation=%s outcome=%s lock_wait_ms=%.3f execution_ms=%.3f total_ms=%.3f",
+                        request_id, operation, outcome, (acquired - queued) * 1000,
+                        (finished - acquired) * 1000, (finished - queued) * 1000)
+
     def reference(self, body):
         from .inventory_store import reference
-        with self.lock:
-            return reference(body, self.inventory, self.connection, self.commands)
+        if body.get("include_history", True) is False:
+            return reference(body, self.inventory, None, self.commands, self.reference_enrichment)
+        with self.locked("reference"):
+            return reference(body, self.inventory, self.connection, self.commands, self.reference_enrichment)
 
     def ssm_log(self, body):
-        with self.lock:
+        with self.locked("ssm.log"):
             entry_id = body.get("entry_id")
             if entry_id is not None:
                 # Exact lookup (e.g. reading the latest saved review), independent of search, scope and time.
@@ -317,7 +364,7 @@ class Store:
             self.log_revision = f"{prefix}-{int(count) + 1}"
 
     def ssm_log_review(self, body):
-        with self.lock, self.reviews:
+        with self.locked("ssm.log_review"), self.reviews:
             entry_id = body.get("entry_id")
             if not isinstance(entry_id, str) or entry_id not in self.commands.log_entries:
                 raise ValueError("Unknown current log entry")
@@ -347,7 +394,7 @@ class Store:
                 self.connection.executemany(f"INSERT INTO {table} VALUES (?,?)", rows)
 
     def reviews_list(self):
-        with self.lock:
+        with self.locked("reviews.list"):
             # Counts are evidence events (rows), across the whole database, independent of the current query.
             tag_counts = dict(self.connection.execute("""SELECT r.slug, count(*) FROM review_tags r
                 JOIN events e ON e.record_sha256 = r.hash GROUP BY 1""").fetchall())
@@ -366,7 +413,7 @@ class Store:
 
     def review_write(self, body):
         action = body.get("action")
-        with self.lock:
+        with self.locked("reviews.write"):
             with self.reviews:
                 if action in ("annotate", "tag", "untag", "link", "unlink"):
                     hashes = body.get("hashes")
@@ -446,25 +493,30 @@ class Store:
         return {"ok": True, "log_revision": revision, **({"id": cursor.lastrowid} if action == "annotate" else {}),
                 **({"updated": stamp} if action in ("annotate", "edit", "link", "unlink") else {})}
 
-    def rows(self, sql, params=None):
+    def rows(self, sql, params=None, *, operation="rows"):
+        started = time.monotonic()
         result = self.connection.execute(sql, params or [])
         names = [column[0] for column in result.description]
-        return [dict(zip(names, row)) for row in result.fetchall()]
+        rows = [dict(zip(names, row)) for row in result.fetchall()]
+        logger.debug("query request_id=%s operation=%s elapsed_ms=%.3f rows=%d",
+                     REQUEST_ID.get(), operation, (time.monotonic() - started) * 1000, len(rows))
+        return rows
 
     def metadata(self, body=None):
         zone = query_timezone(body or {})
         bounds = self.rows("""SELECT count(*) AS total, min(epoch_ms(event_time)) AS start_ms,
-            max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""")[0]
+            max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""", operation="metadata.bounds")[0]
         histogram = self.rows("""SELECT strftime(event_time AT TIME ZONE ?, '%Y-%m-%d') AS day,
             count(*) AS total, count(*) FILTER (WHERE event_source='ssm.amazonaws.com'
             AND event_name IN ('SendCommand','StartSession')) AS ssm
-            FROM browse_events GROUP BY 1 ORDER BY 1""", [zone])
+            FROM browse_events GROUP BY 1 ORDER BY 1""", [zone], operation="metadata.histogram")
         for row in histogram:
             day = datetime.fromisoformat(row["day"]).replace(tzinfo=ZoneInfo(zone))
             row["start_ms"] = int(day.timestamp() * 1000)
             row["end_ms"] = int((day + timedelta(days=1)).timestamp() * 1000)
         facets = {field: [r["value"] for r in self.rows(
-            f"SELECT DISTINCT {field} AS value FROM browse_events WHERE {field} IS NOT NULL ORDER BY 1")]
+            f"SELECT DISTINCT {field} AS value FROM browse_events WHERE {field} IS NOT NULL ORDER BY 1",
+            operation=f"metadata.facet.{field}")]
             for field in ("event_name", "event_source", "country", "identity_type", "error_code", "document_name")}
         return {**bounds, "histogram": histogram, "facets": facets, "fields": FIELDS,
                 "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
@@ -473,15 +525,18 @@ class Store:
                 "timezone": zone, "timezones": TIMEZONES, "database": "cloudtrail.duckdb", "read_only": True}
 
     def timezone_metadata(self, body):
-        with self.lock:
+        with self.locked("metadata"):
             return self.metadata(body)
 
     def query(self, body):
         sql, params, count_sql, count_params, size = build_query(body)
         started = time.monotonic()
-        with self.lock:
+        with self.locked("events"):
+            counted = time.monotonic()
             total = self.connection.execute(count_sql, count_params).fetchone()[0]
-            rows = self.rows(sql, params)
+            logger.debug("query request_id=%s operation=events.count elapsed_ms=%.3f",
+                         REQUEST_ID.get(), (time.monotonic() - counted) * 1000)
+            rows = self.rows(sql, params, operation="events.page")
             found = self.row_detections([row["id"] for row in rows])
             for row in rows:
                 row["tags"] = [dict(r) for r in self.reviews.execute("SELECT t.* FROM tags t JOIN event_tags e USING(slug) WHERE e.hash=? ORDER BY slug", (row["record_sha256"],))]
@@ -532,8 +587,8 @@ class Store:
         FROM buckets b LEFT JOIN matching m ON m.event_ms >= b.start_ms AND m.event_ms < b.end_ms
         GROUP BY b.start_ms, b.end_ms ORDER BY b.start_ms"""
         bound = params + [[a for a, _ in ranges], [b for _, b in ranges], zone]
-        with self.lock:
-            rows = self.rows(sql, bound)
+        with self.locked("histogram"):
+            rows = self.rows(sql, bound, operation="histogram.buckets")
         return {"data": rows, "total": sum(r["events"] for r in rows),
                 "bucket_minutes": minutes, "sql": sql, "params": bound}
 
@@ -548,8 +603,8 @@ class Store:
                 raise ValueError("Cell values must be text or null")
             sql = count_sql.replace("SELECT count(*)", f"SELECT count(*) AS total, "
                 f"count(*) FILTER (WHERE {field} IS NOT DISTINCT FROM ?) AS events", 1)
-            with self.lock:
-                return self.rows(sql, [value, *params])[0]
+            with self.locked("column_values"):
+                return self.rows(sql, [value, *params], operation="column_values.cell")[0]
         sql = """WITH counts AS (
         """ + count_sql.replace("SELECT count(*)", f"SELECT {field} AS value, count(*) AS events", 1) + """
             GROUP BY 1
@@ -559,8 +614,8 @@ class Store:
                 sum(events) OVER () AS total, count(*) OVER () AS distinct_values
             FROM counts
         ) SELECT * FROM ranked WHERE top_rank <= 5 OR bottom_rank <= 5"""
-        with self.lock:
-            rows = self.rows(sql, params)
+        with self.locked("column_values"):
+            rows = self.rows(sql, params, operation="column_values.summary")
         return {"top": [{"value": r["value"], "events": r["events"]}
                         for r in sorted(rows, key=lambda r: r["top_rank"]) if r["top_rank"] <= 5],
                 "bottom": [{"value": r["value"], "events": r["events"]}
@@ -569,8 +624,9 @@ class Store:
                 "distinct_values": rows[0]["distinct_values"] if rows else 0}
 
     def detail(self, record):
-        with self.lock:
-            rows = self.rows("SELECT event_id, record_sha256, raw_event::VARCHAR AS raw_json FROM events WHERE source_record=?", [record])
+        with self.locked("event.detail"):
+            rows = self.rows("SELECT event_id, record_sha256, raw_event::VARCHAR AS raw_json FROM events WHERE source_record=?",
+                             [record], operation="event.detail")
             if rows:
                 rows[0]["ssm_commands"] = self.commands.for_record(record)
                 rows[0]["detections"] = self.row_detections([record]).get(record, [])
@@ -587,7 +643,7 @@ class Store:
         return found
 
     def detections_list(self):
-        with self.lock:
+        with self.locked("detections"):
             rules = self.rows("""SELECT rule_id, any_value(rule_title) AS title, any_value(level) AS level,
                     any_value(level_rank) AS level_rank, any_value(tactics) AS tactics,
                     any_value(technique_ids) AS techniques, count(DISTINCT source_record) AS events
@@ -602,9 +658,36 @@ class Handler(SimpleHTTPRequestHandler):
         self.store = store
         super().__init__(*args, directory=str(ROOT / "static"), **kwargs)
 
+    def handle_one_request(self):
+        token = REQUEST_ID.set(secrets.token_hex(8))
+        started = time.monotonic()
+        self._response_status = None
+        try:
+            super().handle_one_request()
+        finally:
+            if getattr(self, "command", None):
+                # Log route templates, never record IDs, query strings or request bodies.
+                route = self.path.split("?", 1)[0]
+                if route.startswith("/api/events/"):
+                    route = "/api/events/:record"
+                elif route not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values",
+                                   "/api/reviews", "/api/detections", "/api/inventory", "/api/reference",
+                                   "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event",
+                                   "/api/ssm-log", "/api/ssm-log-review", "/mcp"):
+                    route = "static-or-unknown"
+                logger.info("request request_id=%s method=%s route=%s status=%s elapsed_ms=%.3f",
+                            REQUEST_ID.get(), self.command if self.command in {"GET", "POST", "DELETE", "HEAD"} else "other",
+                            route, self._response_status, (time.monotonic() - started) * 1000)
+            REQUEST_ID.reset(token)
+
+    def log_request(self, code="-", size="-"):
+        # Replaced by the timed, redacted request summary above.
+        self._response_status = code
+
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Request-ID", REQUEST_ID.get())
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'")
         super().end_headers()
 
@@ -625,7 +708,10 @@ class Handler(SimpleHTTPRequestHandler):
         return True
 
     def respond(self, value, status=200):
+        started = time.monotonic()
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        logger.debug("response request_id=%s serialize_ms=%.3f bytes=%d",
+                     REQUEST_ID.get(), (time.monotonic() - started) * 1000, len(body))
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -726,7 +812,8 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, AttributeError) as error:
             self.respond({"error": str(error)}, 400)
         except (duckdb.Error, sqlite3.Error) as error:
-            self.log_error("Database operation failed: %s", error)
+            logger.error("Database operation failed request_id=%s error_type=%s",
+                         REQUEST_ID.get(), type(error).__name__)
             self.respond({"error": "Database operation failed; check the server log"}, 500)
 
 
@@ -748,9 +835,15 @@ def main(argv=None):
                         help="AWS inventory export folder containing report.json; current configuration, not historical evidence")
     parser.add_argument("--detections", type=Path,
                         help="Suzaku detections from `kamotrace suzaku` (default: <database>.detections.duckdb if present)")
+    parser.add_argument("--log-level", choices=("debug", "info", "warning", "error"),
+                        default=os.environ.get("KAMOTRACE_LOG_LEVEL", "info"),
+                        help="Application log verbosity (default: info, or $KAMOTRACE_LOG_LEVEL)")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+    if args.log_level not in ("debug", "info", "warning", "error"):
+        parser.error("KAMOTRACE_LOG_LEVEL must be debug, info, warning or error")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S%z")
+    logging.getLogger("kamotrace").setLevel(args.log_level.upper())
     started = time.monotonic()
     logger.info("Starting KamoTrace; loading local data before accepting requests")
     for name in ("database", "enrichment", "ssm_export", "detections"):

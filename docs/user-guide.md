@@ -1340,6 +1340,50 @@ and restart to reload them. It does not fetch output URLs or run shell commands.
 Known bugs and open limitations, with workarounds, are tracked in
 [known limitations](BUGS.md).
 
+### Investigating slow requests
+
+Reference cards open using loaded inventory and IP enrichment only, without
+scanning CloudTrail or waiting for the event-query lock. **Load event history**
+explicitly calculates scoped CloudTrail counts and first/last seen;
+**Load command history** adds the loaded SSM command associations for a machine.
+Until requested, history is labelled **not searched**, not absent. Existing REST
+callers retain historical results by default; `POST /api/reference` accepts
+`include_history: false` for the reference-only path and reports `history_included`.
+
+A small duck progress ring follows the pointer while a query or reference-card
+lookup is pending. It appears only after 180 ms and stays until all overlapping
+requests finish, including response parsing. With no pointer in the page it
+appears below the top bar instead. It does not block clicks, and reduced-motion
+preferences disable its animation.
+
+`kamotrace serve --database case.duckdb --log-level debug` enables detailed
+application timings. Set `KAMOTRACE_LOG_LEVEL=debug` in the environment instead
+when launching through `kamotrace auto`. The default is `info`; `warning` and
+`error` reduce output. Debug logging is limited to KamoTrace, not third-party
+HTTP/MCP libraries.
+
+At info level, each Store operation logs when it is queued, starts, and finishes.
+`lock_wait_ms` is time waiting behind another Store operation; `execution_ms`
+is time holding the lock; `total_ms` includes both. For example, a slow IP card
+may be waiting behind an event count rather than running a slow lookup itself.
+Request summaries include status and elapsed time through writing the response.
+The response's `X-Request-ID` header correlates these records with the browser
+Network panel. Debug records add query/count/page and JSON serialization timings;
+reference-card subqueries can also be followed by their thread name.
+
+Startup logs time enrichment, SSM, inventory, detections and metadata separately.
+Debug startup snapshots report DuckDB-managed bytes by tag, **not process RSS**.
+Snapshots are totals at that stage, not additive allocations. Large `BASE_TABLE`
+values can be cached evidence pages rather than enrichment rows. The server
+retains its existing 2 GB DuckDB memory budget; reducing a cache budget can make
+queries slower and is not a substitute for measuring the workload.
+
+New timing records use fixed operation/route names and omit query text,
+parameters, record IDs, IPs, identities and request/response payloads. Existing
+startup messages still contain local file paths. Review logs before sharing.
+
+### Common problems
+
 - **Missing database:** import a CloudTrail `Records` JSON export first, or pass
   `--database` with the correct path. An arbitrary DuckDB file will not have the
   required schema. The importer intentionally refuses to overwrite evidence.

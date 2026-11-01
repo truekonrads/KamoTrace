@@ -4,6 +4,40 @@ function setLoading(message = "") {
   $("app-loading").textContent = message;
   $("app-loading").hidden = !message;
 }
+let pendingRequests = 0,
+  busyTimer,
+  pointer = null;
+function positionBusyDuck() {
+  const duck = $("query-busy");
+  duck.style.left = `${pointer ? Math.max(8, Math.min(pointer.x + 18, innerWidth - 40)) : innerWidth - 48}px`;
+  duck.style.top = `${pointer ? Math.max(8, Math.min(pointer.y + 18, innerHeight - 40)) : document.querySelector(".topbar").getBoundingClientRect().bottom + 8}px`;
+}
+document.addEventListener("pointermove", (event) => {
+  pointer = { x: event.clientX, y: event.clientY };
+  if (!$("query-busy").hidden) positionBusyDuck();
+});
+document.documentElement.addEventListener("pointerleave", () => {
+  pointer = null;
+  positionBusyDuck();
+});
+window.addEventListener("resize", positionBusyDuck);
+function queryActivity(delta) {
+  pendingRequests += delta;
+  if (pendingRequests === 1 && delta === 1) {
+    // Avoid flashing for fast local requests. Overlapping requests share one indicator.
+    busyTimer = setTimeout(() => {
+      positionBusyDuck();
+      $("query-busy").hidden = false;
+      $("query-busy").showPopover();
+      $("query-status").textContent = "Query in progress";
+    }, 180);
+  } else if (pendingRequests === 0) {
+    clearTimeout(busyTimer);
+    if ($("query-busy").matches(":popover-open")) $("query-busy").hidePopover();
+    $("query-busy").hidden = true;
+    $("query-status").textContent = "";
+  }
+}
 let meta,
   table,
   lastResult,
@@ -2746,22 +2780,27 @@ const error = (message) => {
 };
 
 async function request(url, body) {
-  const res = await fetch(
-    url,
-    body === undefined
-      ? {}
-      : {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
-  );
-  const result = await res.json();
-  if (!res.ok)
-    throw Object.assign(new Error(result.error || `HTTP ${res.status}`), {
-      stale: result.stale === true,
-    });
-  return result;
+  queryActivity(1);
+  try {
+    const res = await fetch(
+      url,
+      body === undefined
+        ? {}
+        : {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          },
+    );
+    const result = await res.json();
+    if (!res.ok)
+      throw Object.assign(new Error(result.error || `HTTP ${res.status}`), {
+        stale: result.stale === true,
+      });
+    return result;
+  } finally {
+    queryActivity(-1);
+  }
 }
 
 function range(start, end) {

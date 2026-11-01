@@ -19,6 +19,10 @@
     <script defer src="/app.js"></script>
   </head>
   <body>
+    <div id="query-busy" popover="manual" aria-hidden="true" hidden>
+      <img src="/konami-duck.png" alt="" />
+    </div>
+    <span id="query-status" class="sr-only" role="status"></span>
     <div id="app-loading" class="grid-loading" role="status">
       Opening local evidence…
     </div>

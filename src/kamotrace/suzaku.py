@@ -197,9 +197,13 @@ def run_suzaku(executable, source, rules=None, min_level=None):
 
 
 def load_detections(connection, path):
-    """Server side: copy linked detections into a temp table. Returns the run metadata or None."""
-    connection.execute("""CREATE TEMP TABLE detections(source_record BIGINT, rule_id VARCHAR, rule_title VARCHAR,
+    """Server side: copy compact links and rule metadata into temp tables. Returns run metadata or None."""
+    connection.execute("""CREATE TEMP TABLE detection_rules(detection_rule BIGINT, rule_id VARCHAR, rule_title VARCHAR,
         level VARCHAR, level_rank TINYINT, tactics VARCHAR[], technique_ids VARCHAR[])""")
+    connection.execute("CREATE TEMP TABLE detection_links(source_record BIGINT, detection_rule BIGINT)")
+    connection.execute("""CREATE TEMP VIEW detections AS
+        SELECT l.source_record, r.rule_id, r.rule_title, r.level, r.level_rank, r.tactics, r.technique_ids
+        FROM detection_links l JOIN detection_rules r USING (detection_rule)""")
     if path is None:
         return None
     # A separate read-only connection, not ATTACH: DuckDB shares one instance per database file in a
@@ -215,16 +219,39 @@ def load_detections(connection, path):
             raise ValueError(f"{path} was built for a different evidence database; rebuild it with `kamotrace suzaku`")
         logger.info("Reading linked Suzaku detection rows")
         total = sidecar.execute("SELECT count(*) FROM detections WHERE link_status = 'linked'").fetchone()[0]
-        logger.info("Copying %s linked Suzaku detections into the in-memory table", format(total, ","))
-        sidecar.execute("""SELECT source_record, rule_id, rule_title, level, level_rank, tactics, technique_ids
-            FROM detections WHERE link_status = 'linked'""")
-        # Transfer bounded column batches: executemany runs an insert per detection. Typed UNNEST
-        # preserves empty/NULL lists without dependencies or ATTACH (external access may be disabled).
+        # Rule IDs alone are not a key: even malformed sidecars can contain distinct metadata for
+        # the same ID. Deduplicate the entire public tuple, including NULL/empty/ordered lists.
+        # This is a TEMP table on the read-only sidecar connection, never a persistent schema change.
+        # Keep first-occurrence order in both transfers, rather than arbitrarily reordering variants
+        # before the server's any_value aggregates (which are themselves unordered under parallelism).
+        sidecar.execute("""CREATE TEMP TABLE detection_rules AS
+            SELECT row_number() OVER (ORDER BY min(detection_link)) AS detection_rule,
+                rule_id, rule_title, level, level_rank, tactics, technique_ids
+            FROM (SELECT row_number() OVER () AS detection_link, *
+                FROM detections WHERE link_status = 'linked')
+            GROUP BY rule_id, rule_title, level, level_rank, tactics, technique_ids""")
+        sidecar.execute("SELECT * FROM detection_rules ORDER BY detection_rule")
         while rows := sidecar.fetchmany(8192):
-            connection.execute("""INSERT INTO detections SELECT
+            connection.execute("""INSERT INTO detection_rules SELECT
                 unnest(?::BIGINT[]), unnest(?::VARCHAR[]), unnest(?::VARCHAR[]),
                 unnest(?::VARCHAR[]), unnest(?::TINYINT[]), unnest(?::VARCHAR[][]), unnest(?::VARCHAR[][])
             """, list(zip(*rows)))
+        logger.info("Copying %s linked Suzaku detections into compact in-memory links", format(total, ","))
+        sidecar.execute("""SELECT d.source_record, r.detection_rule
+            FROM (SELECT row_number() OVER () AS detection_link, *
+                FROM detections WHERE link_status = 'linked') d JOIN detection_rules r
+                ON d.rule_id IS NOT DISTINCT FROM r.rule_id
+                AND d.rule_title IS NOT DISTINCT FROM r.rule_title
+                AND d.level IS NOT DISTINCT FROM r.level
+                AND d.level_rank IS NOT DISTINCT FROM r.level_rank
+                AND d.tactics IS NOT DISTINCT FROM r.tactics
+                AND d.technique_ids IS NOT DISTINCT FROM r.technique_ids
+            ORDER BY d.detection_link""")
+        # Transfer bounded column batches, not one Python object per retained link. Typed UNNEST
+        # preserves duplicates and NULL source records without ATTACH (external access may be disabled).
+        while rows := sidecar.fetchmany(8192):
+            connection.execute("INSERT INTO detection_links SELECT unnest(?::BIGINT[]), unnest(?::BIGINT[])",
+                               list(zip(*rows)))
     finally:
         sidecar.close()
     logger.info("Loaded %s linked Suzaku detections in %.1fs", format(total, ","), time.monotonic() - started)

@@ -168,6 +168,53 @@ class BrowserContract(unittest.TestCase):
             with error:
                 return error.code, json.load(error)
 
+    def test_request_timing_correlation_and_redaction(self):
+        request = Request(self.url + "/api/reference",
+                          data=json.dumps({"kind": "identity", "value": "private-identity-marker"}).encode(),
+                          headers={"Content-Type": "application/json"})
+        with self.assertLogs("kamotrace", level="DEBUG") as captured:
+            with urlopen(request, timeout=15) as response:
+                self.assertEqual(response.status, 200)
+                request_id = response.headers["X-Request-ID"]
+                self.assertEqual(json.load(response)["matches"], [])
+            self.assertEqual(self.call("/api/reference", {"kind": "private-kind-marker", "value": "private-value-marker"})[0], 400)
+            self.assertEqual(self.call("/api/events/private-record-marker?private-query-marker")[0], 400)
+        self.assertRegex(request_id, r"^[0-9a-f]{16}$")
+        output = "\n".join(captured.output)
+        self.assertIn(f"request_id={request_id} operation=reference", output)
+        self.assertIn(f"request_id={request_id} method=POST route=/api/reference status=200", output)
+        self.assertIn("operation=reference.events", output)
+        for field in ("lock_wait_ms", "execution_ms", "total_ms", "elapsed_ms", "bytes"):
+            self.assertRegex(output, rf"{field}=\d+(?:\.\d+)?")
+        self.assertIn("outcome=error", output)
+        for private in ("private-query-marker", "private-record-marker", "private-identity-marker", "private-kind-marker", "private-value-marker"):
+            self.assertNotIn(private, output)
+
+    def test_reference_only_cards_do_not_wait_for_event_queries(self):
+        contexts = [
+            ({"kind": "ip", "value": "1.1.1.1", "account": "123", "region": "ap-southeast-3"}, {"inventory", "enrichment"}),
+            ({"kind": "identity", "value": "arn:aws:iam::123:user/alice", "account": "123"}, set()),
+            ({"kind": "machine", "value": "i-alpha", "account": "123", "region": "ap-southeast-3"}, {"inventory"}),
+        ]
+        # Simulate a long-running event query owning the Store lock. Reference-only
+        # cards must still finish through the public HTTP endpoint, without history.
+        with self.store.lock:
+            for context, sources in contexts:
+                status, card = self.call("/api/reference", {**context, "include_history": False})
+                self.assertEqual(status, 200)
+                self.assertFalse(card["history_included"])
+                self.assertEqual({m["source"] for m in card["matches"]}, sources)
+                self.assertFalse(any("event_count" in m.get("identity", {}) or "command_count" in m for m in card["matches"]))
+        _, ip = self.call("/api/reference", {**contexts[0][0], "include_history": True})
+        self.assertTrue(ip["history_included"])
+        self.assertEqual([m["identity"]["event_count"] for m in ip["matches"] if m["source"] == "cloudtrail"], [1])
+        _, identity = self.call("/api/reference", {**contexts[1][0], "include_history": True})
+        self.assertEqual(sum(m["identity"]["event_count"] for m in identity["matches"]), 5)
+        _, machine = self.call("/api/reference", {**contexts[2][0], "include_history": True})
+        self.assertEqual({m["source"] for m in machine["matches"]}, {"inventory", "ssm"})
+        for value in (0, "false", None, []):
+            self.assertEqual(self.call("/api/reference", {**contexts[0][0], "include_history": value})[0], 400)
+
     def test_inventory_and_scope_aware_reference_cards(self):
         status, report = self.call("/api/inventory")
         self.assertEqual(status, 200)

@@ -1,9 +1,12 @@
 """Read-only inventory with scope-aware exact reference and IP network range lookups."""
 import ipaddress
 import json
+import logging
 from pathlib import Path
+import time
 
 
+logger = logging.getLogger(__name__)
 COLLECTIONS = ("resources", "vpcs", "security_groups", "relationships", "forwarding_paths", "listener_actions", "errors")
 
 
@@ -65,14 +68,17 @@ class Inventory:
                 if (not account or match["account"] == account) and (not region or match["region"] == region)]
 
 
-def reference(body, inventory, connection, commands):
-    """Caller holds the Store lock. Context narrows matches; it never supplies missing evidence."""
+def reference(body, inventory, connection, commands, enrichment):
+    """Only historical lookups need the Store lock. Missing history is never negative evidence."""
     kind, value = body.get("kind"), body.get("value")
     if kind not in ("identity", "machine", "ip") or not isinstance(value, str) or not 1 <= len(value) <= 2048:
         raise ValueError("Reference requires kind identity, machine or ip and a value up to 2048 characters")
     account, region = body.get("account"), body.get("region")
     if any(v is not None and (not isinstance(v, str) or len(v) > 256) for v in (account, region)):
         raise ValueError("Reference account and region must be strings up to 256 characters")
+    include_history = body.get("include_history", True)
+    if not isinstance(include_history, bool):
+        raise ValueError("Reference include_history must be a boolean")
     lookup_value = value
     if kind == "ip":
         try:
@@ -86,33 +92,32 @@ def reference(body, inventory, connection, commands):
         network_matches = [match for prefix, match in inventory.networks
                            if address in prefix and (not account or match["account"] == account)
                            and (not region or match["region"] == region)]
-    if kind in ("identity", "ip"):
+    if include_history and kind in ("identity", "ip"):
         # Group by account AND region: repeated names/addresses must never collapse scope.
-        actor_account = "coalesce(e.user_identity->>'$.accountId', CASE WHEN starts_with(b.identity, 'arn:') THEN split_part(b.identity, ':', 5) END, e.recipient_account_id, '')"
+        identity = "coalesce(e.identity_arn, e.user_identity->>'$.userName', e.user_identity->>'$.principalId', e.user_identity->>'$.invokedBy', '(unattributed)')"
+        actor_account = f"coalesce(e.user_identity->>'$.accountId', CASE WHEN starts_with({identity}, 'arn:') THEN split_part({identity}, ':', 5) END, e.recipient_account_id, '')"
         scope = actor_account if kind == "identity" else "coalesce(e.recipient_account_id, '')"
-        predicate = "(b.identity = ? OR e.user_identity->>'$.userName' = ?)" if kind == "identity" else "b.source_ip = ?"
+        predicate = f"({identity} = ? OR e.user_identity->>'$.userName' = ?)" if kind == "identity" else "e.source_ip = ?"
         params = [value, value] if kind == "identity" else [value]
         if account:
             predicate += f" AND {scope} = ?"
             params.append(account)
         if region:
-            predicate += " AND b.region = ?"
+            predicate += " AND e.aws_region = ?"
             params.append(region)
-        rows = connection.execute(f"""SELECT b.identity, {scope} AS account, b.region,
+        started = time.monotonic()
+        rows = connection.execute(f"""SELECT {identity} AS identity, {scope} AS account, e.aws_region AS region,
                 count(*), min(e.event_time)::VARCHAR, max(e.event_time)::VARCHAR
-            FROM browse_events b JOIN events e ON e.source_record = b.id
-            WHERE {predicate} GROUP BY ALL ORDER BY account, b.region, b.identity""", params).fetchall()
+            FROM events e WHERE {predicate} GROUP BY ALL ORDER BY account, region, identity""", params).fetchall()
+        logger.debug("query operation=reference.events kind=%s elapsed_ms=%.3f rows=%d",
+                     kind, (time.monotonic() - started) * 1000, len(rows))
         for identity, acct, rn, count, first, last in rows:
             matches.append({"kind": kind, "id": identity if kind == "identity" else value,
                             "name": identity if kind == "identity" else value, "account": acct, "region": rn,
                             "source": "cloudtrail", "identity": {"arn": identity, "event_count": count,
                             "first_seen": first, "last_seen": last}})
-        if kind == "ip":
-            row = connection.execute("SELECT country, city, asn, isp, ip_info FROM ip_enrichment WHERE ip = ?", [value]).fetchone()
-            if row:
-                matches.append({"kind": kind, "id": value, "name": value, "account": "", "region": "",
-                                "source": "enrichment", "enrichment": dict(zip(("country", "city", "asn", "isp", "ip_info"), row))})
-    elif kind == "machine":
+    elif include_history and kind == "machine":
+        started = time.monotonic()
         systems = {}
         for command in commands.commands.values():
             if (account and command["account"] != account) or (region and command["region"] != region):
@@ -125,6 +130,11 @@ def reference(body, inventory, connection, commands):
         for (acct, rn, identifier), count in sorted(systems.items()):
             matches.append({"kind": kind, "id": identifier, "name": value, "account": acct, "region": rn,
                             "source": "ssm", "command_count": count})
+        logger.debug("reference operation=reference.ssm elapsed_ms=%.3f groups=%d",
+                     (time.monotonic() - started) * 1000, len(systems))
+    if kind == "ip" and value in enrichment:
+        matches.append({"kind": kind, "id": value, "name": value, "account": "", "region": "",
+                        "source": "enrichment", "enrichment": enrichment[value]})
     # A lookup about an IP is not an assertion that historical traffic came from its current owner.
     # Flag competing owners/scopes without treating enrichment as another candidate entity.
     relevant = [m for m in matches if m["source"] != "enrichment"]
@@ -136,4 +146,4 @@ def reference(body, inventory, connection, commands):
         entities = {(m["account"], "" if kind == "identity" else m["region"], m["id"]) for m in relevant}
         ambiguous = len(entities) > 1
     return {"kind": kind, "value": value, "matches": matches, "network_matches": network_matches, "ambiguous": ambiguous,
-            "snapshot": inventory.report["metadata"]}
+            "snapshot": inventory.report["metadata"], "history_included": include_history}

@@ -757,6 +757,35 @@ main {
   bottom: auto;
   z-index: 100;
 }
+#query-busy {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  overflow: visible;
+  background: transparent;
+  pointer-events: none;
+}
+#query-busy::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border: 2px solid #d4e3e9;
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  background: #fffffff0;
+  animation: grid-spin 0.9s linear infinite;
+}
+#query-busy img {
+  position: absolute;
+  top: 7px;
+  width: 30px;
+  height: 17px;
+  object-fit: contain;
+}
 .grid-loading::before {
   content: "";
   width: 16px;
@@ -772,7 +801,8 @@ main {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .grid-loading::before {
+  .grid-loading::before,
+  #query-busy::before {
     animation: none;
   }
 }

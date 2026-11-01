@@ -211,6 +211,46 @@
           "IP enrichment is an address lookup, not evidence of ownership.",
           "reference-provenance",
         );
+      if (!data.history_included) {
+        line(
+          card,
+          "p",
+          "History not searched. Counts and first/last seen are available on request.",
+          "reference-provenance",
+        );
+        const label =
+          active.spec.kind === "machine"
+            ? "Load command history"
+            : "Load event history";
+        const load = line(card, "button", label);
+        load.type = "button";
+        load.onclick = async () => {
+          active.persistent = true;
+          const token = sequence;
+          load.disabled = true;
+          load.textContent = "Loading history…";
+          try {
+            const history = await request("/api/reference", {
+              ...active.spec,
+              include_history: true,
+            });
+            if (token !== sequence || !active.element.isConnected) return;
+            reveal(
+              history,
+              history.matches.length || history.network_matches?.length
+                ? ""
+                : "No matching history or loaded references.",
+            );
+            card.focus({ preventScroll: true });
+          } catch (error) {
+            if (token !== sequence) return;
+            load.disabled = false;
+            load.textContent = label;
+            line(card, "p", error.message, "reference-warning");
+            position();
+          }
+        };
+      }
     }
     const host = active.element.closest("dialog") || document.body;
     if (card.parentElement !== host) host.append(card);
@@ -232,21 +272,19 @@
     const token = ++sequence;
     active = { element, spec, persistent };
     try {
-      const response = await fetch("/api/reference", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(spec),
+      const data = await request("/api/reference", {
+        ...spec,
+        include_history: false,
       });
-      if (!response.ok)
-        throw new Error("Reference lookup unavailable. Try again later.");
-      const data = await response.json();
       if (sequence !== token || !element.isConnected) return;
       if (!Array.isArray(data.matches))
         throw new Error("Invalid reference response.");
-      if (data.matches.length || data.network_matches?.length) reveal(data);
-      else if (active.persistent)
-        reveal(null, "No known exact match in the loaded reference sources.");
-      else close();
+      reveal(
+        data,
+        data.matches.length || data.network_matches?.length
+          ? ""
+          : "No known exact match in the loaded reference sources.",
+      );
     } catch (error) {
       if (sequence !== token) return;
       if (active.persistent) reveal(null, error.message);

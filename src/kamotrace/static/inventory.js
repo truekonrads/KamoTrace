@@ -692,11 +692,7 @@
     $("status").textContent = "Loading local inventory snapshot…";
     $("retry").hidden = true;
     try {
-      const response = await fetch("/api/inventory", {
-        headers: { Accept: "application/json" },
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const report = await response.json();
+      const report = await request("/api/inventory");
       if (!report || typeof report.loaded !== "boolean")
         throw new Error("Invalid inventory response");
       data = report;
