@@ -114,6 +114,13 @@ def main():
                 identity.focus()
                 card = page.locator("#reference-card")
                 expect(card).to_be_visible()
+                expect(card).to_contain_text("History not searched")
+                expect(card).not_to_contain_text("Observed events")
+                page.screenshot(path=str(results / "identity-reference-unsearched.png"))
+                with page.expect_response(lambda response: "/api/reference" in response.url) as history:
+                    card.get_by_role("button", name="Load event history", exact=True).click()
+                assert history.value.request.post_data_json["include_history"] is True
+                assert history.value.json()["history_included"] is True
                 expect(card).to_contain_text("Observed events")
                 expect(card).to_contain_text("arn:aws:iam::123:user/alice")
                 page.screenshot(path=str(results / "identity-reference.png"))
