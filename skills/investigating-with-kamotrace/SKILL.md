@@ -75,7 +75,41 @@ that it is true before relying on a record.
 ## Queries
 
 Every search-like tool (`search_events`, `summarize_field`, `event_histogram`)
-takes the same `query` object. **Everything combines with AND.**
+takes the same `query` object. Top-level properties combine with AND; use
+`pipeline` for explicit OR and grouped Boolean expressions.
+
+```json
+{
+  "pipeline_version": 1,
+  "pipeline": "event_name = \"SendCommand\" OR event_name = \"StartSession\" | search \"ssm.amazonaws.com\"",
+  "start": "2026-10-24T00:00:00+08:00",
+  "end": "2026-10-26T00:00:00+08:00"
+}
+```
+
+Pipeline v1 has no `where`: pipes always mean AND, and OR must be explicit
+within a stage. Precedence is parentheses, NOT, AND, OR. Dates stay in
+`start`/`end` and bound every OR branch. Get schema keys, labels, descriptions
+and valid operators from `describe_schema().pipeline_fields`; table labels
+such as Operation are not keys (`event_name` is).
+
+- Values are JSON double-quoted strings. Scalar operators: `=`, `!=`, `in`,
+  `contains`, `is missing`, `is not missing`, `is empty`, `is not empty`.
+- `tag` matches exact slugs and `lead` exact IDs from `list_detections`; both
+  support `=`, `!=`, `in`. `lead in ("a", "b")` matches either; use
+  `lead = "a" AND lead = "b"` to require both.
+- `search "text"` is the existing literal, case-insensitive raw-JSON search,
+  usable with OR/NOT. It does not search enrichment, Findings or Lead titles.
+- Missing fields do not match equality, membership or contains. Inequality
+  and NOT include their complements, including missing fields. `is empty`
+  means null or empty string; `= ""` means only an actual empty string.
+- No SQL, arbitrary paths, functions, regex, wildcard expansion, dates, joins,
+  aggregates or projection. `time_local` remains a legacy filter only.
+- Syntax errors report line/column; correct the query instead of silently
+  removing conditions. Limits: 8,000 characters, 20 stages, 100 predicates,
+  nesting depth 20, 100 values per `in`, 2,000 characters per string.
+- New Finding contexts retain pipeline text/version. Legacy queries remain
+  supported with their existing AND semantics; the example below is legacy.
 
 ```json
 {

@@ -619,8 +619,9 @@ Detections are stored separately from the original records:
 
 In the browser, the expanded sidebar gains a **Detections** tab listing each
 rule, most severe first, with its severity letter (I/L/M/H/C), ATT&CK tags (on
-hover) and linked event count. Click a rule to add it to the query as a
-`Sigma: <rule>` scope; several rule scopes must all match, like tags. The grid's
+hover) and linked event count. Click a rule to add it to a pipeline
+`lead in (...)` stage; multiple sidebar selections match any selected Lead.
+Legacy saved rule scopes retain their all-of meaning. The grid's
 **Sigma** column shows the most severe level and the match count on one line;
 click it for the full rule list. The inspector lists an event's detections too.
 A correlation rule appears on each of its member events. A note saved by an
@@ -759,8 +760,9 @@ The **Event tags** tab lists every tag, its colour and its event count across
 the whole database, not just the current query.
 
 - Select a tag name to add it to the query. Select it again to remove it.
-- If you select several tags, events must have all of them to match. Each active
-  tag also appears as a removable chip above the grid.
+- Selecting several tags builds a pipeline any-of list. To require all tags,
+  write explicit equality predicates joined by AND. Legacy saved tag scopes
+  retain their all-of meaning.
 - Select a colour swatch to change that tag's colour everywhere.
 
 ### Read and manage findings
@@ -878,6 +880,53 @@ stay pinned and the grid fills the rest of the window.
   case-sensitive; contains/not-contains are case-insensitive.
 - The SSM shortcut selects SendCommand, StartSession and CancelCommand. It does
   not include routine agent reporting or prove that commands executed.
+
+### Pipeline queries
+
+Choose **Pipeline** beside the search editor for explicit Boolean filtering:
+
+```text
+event_name = "SendCommand" OR event_name = "StartSession"
+| source_ip in ("1.1.1.1", "8.8.8.8")
+| search "ssm.amazonaws.com"
+```
+
+Each pipe means **AND**: either operation, AND either IP, AND the raw-event
+substring. There is no `where` keyword. OR must be explicit within a stage;
+parentheses group expressions, with NOT binding before AND and OR. The date
+selector always bounds the entire pipeline.
+
+Schema suggestions match both table labels and keys: type **Operation** to find
+`event_name`, or **AWS service** to find `event_source`. Suggestions show the
+meaning and valid operators; Ctrl+Space opens them explicitly. Arrow keys move
+through suggestions, Enter accepts without running, and Escape dismisses.
+With suggestions closed, Enter runs; Shift+Enter inserts a newline.
+
+Use double-quoted JSON strings for values. Scalar predicates support `=`, `!=`,
+`in (...)`, `contains`, `is missing`, `is not missing`, `is empty` and
+`is not empty`. `search "text"` preserves literal, case-insensitive raw-event
+search, including escaped JSON text. It can also be combined with OR or NOT.
+Missing scalar values do not match equality, membership or contains; NOT and
+inequality include their complements. `is empty` includes null and `""`;
+`= ""` matches only an actual empty string. No regex or wildcard expansion.
+
+`tag in ("needs-review", "suspicious")` matches either Event tag. For both,
+write `tag = "needs-review" AND tag = "suspicious"`. Leads use `lead` and stable
+rule/context IDs, offered by autocomplete with their titles. Clicking multiple
+sidebar tags or Leads builds an any-of list within that category; categories
+combine with AND. Shortcuts never rewrite complex hand-written Boolean logic.
+
+Run applies the draft. Errors identify line/column and leave the previous
+results visible; Revert restores the applied query. Switching from Text search
+to Pipeline quotes the search and preserves existing filters. Complex pipelines
+cannot switch back to plain Text search without first simplifying or clearing
+the expression. Legacy saved queries retain their AND semantics, including
+older local-time field filters, which remain in Text search mode.
+
+Pipelines are filter-only: no SQL, aggregation, joins, projection or date
+expressions. Findings, SSM-command links and severity scopes remain visible
+outside the pipeline and AND with it. See the
+[v1 language specification](pipeline-language-v1.md) for exact rules and limits.
 
 ### Sort events and compare values
 

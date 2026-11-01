@@ -168,6 +168,156 @@ class BrowserContract(unittest.TestCase):
             with error:
                 return error.code, json.load(error)
 
+    def test_pipeline_boolean_null_search_and_external_scopes(self):
+        def check(text, expected, **external):
+            body = {"pipeline": text, "pipeline_version": 1, **external}
+            status, result = self.call("/api/events", body)
+            self.assertEqual(status, 200, result)
+            self.assertEqual({r["event_id"] for r in result["data"]}, {f"event-{i}" for i in expected})
+            self.assertEqual(result["last_row"], len(expected))
+            self.assertEqual(self.call("/api/histogram", body)[1]["total"], len(expected))
+            self.assertEqual(self.call("/api/column-values", {**body, "field": "event_name"})[1]["total"], len(expected))
+            return result
+        check('event_id = "event-0" OR event_id = "event-1" AND source_ip = "8.8.8.8"', [0])
+        check('(event_id = "event-0" OR event_id = "event-1") AND source_ip = "8.8.8.8"', [])
+        check('event_name = "SendCommand" OR event_name = "StartSession" | country = "Indonesia" OR event_id = "event-1"', [1, 2])
+        check('NOT user_agent contains "powershell"', [0, 2, 3, 4])
+        check('user_agent != "powershell"', [0, 1, 2, 3, 4])
+        check('user_agent is missing', [0, 2, 3, 4])
+        check('user_agent is empty', [0, 2, 3, 4])
+        check('user_agent is not empty AND user_agent is not missing', [1])
+        check('user_agent = ""', [])
+        check('user_agent contains ""', [1])
+        check('NOT user_agent in ("absent")', [0, 1, 2, 3, 4])
+        check('search ""', [0, 1, 2, 3, 4])
+        check('NOT search ""', [])
+        for value in ['"& C:', r'C:\\Temp\\a.ps1', '9007199254740993']:
+            check('search ' + json.dumps(value), [0, 1, 2, 3, 4] if value.isdigit() else [1])
+        check('search "left|right" OR search "雲"', [])
+        injected = check('event_name = ' + json.dumps("' OR TRUE --"), [])
+        self.assertNotIn("' OR TRUE --", injected["sql"])
+        self.assertIn("' OR TRUE --", injected["params"])
+        check('search "" OR event_id = "event-4"', [1, 2, 3],
+              start="2026-10-24T17:00:00Z", end="2026-10-25T17:00:00Z", timezone="Asia/Jakarta")
+        check('event_name = "SendCommand" OR search "StartSession"', [2],
+              filters=[{"field": "country", "op": "eq", "value": "Indonesia"}])
+        check('', [1], search="StartSession")
+
+    def test_pipeline_validation_spans_registry_and_limits(self):
+        def validate(text, version=1):
+            return self.call("/api/pipeline", {"pipeline": text, "pipeline_version": version})
+        text = ' tag in ("a|b", "c") \n| NOT lead = "x" OR region = "r" | (tag = "d") '
+        status, result = validate(text)
+        self.assertEqual(status, 200, result)
+        self.assertEqual([text[s["start"]:s["end"]] for s in result["stages"]],
+                         ['tag in ("a|b", "c")', 'NOT lead = "x" OR region = "r"', '(tag = "d")'])
+        self.assertEqual(result["stages"][0]["values"], ["a|b", "c"])
+        self.assertEqual(result["stages"][0]["field"], "tag")
+        self.assertEqual(set(result["stages"][1]["fields"]), {"lead", "region"})
+        self.assertEqual([s["field"] for s in result["stages"]][1:], [None, None])
+        for text, expected in [('  ', ''), ('SeArCh "a|b"', 'a|b'), ('NOT search "a"', None), ('(search "a")', None)]:
+            self.assertEqual(validate(text)[1]["search"], expected)
+        fields = self.call("/api/meta")[1]["pipeline_fields"]
+        self.assertNotIn("time_local", fields)
+        self.assertEqual(fields["event_name"]["label"], "Operation")
+        self.assertEqual(fields["event_source"]["label"], "AWS service")
+        self.assertEqual(fields["tag"]["operators"], ["=", "!=", "in"])
+        good = ['NOT ' * 20 + 'search ""', '(' * 20 + 'tag in ("a")' + ')' * 20,
+                ' | '.join(['search ""'] * 20), ' AND '.join(['search ""'] * 100),
+                'tag in (' + ','.join(['"a"'] * 100) + ')', 'search "' + 'a' * 2000 + '"',
+                'search "\\ud83d\\ude00"', 'region is not missing', 'search "\\n\\t\\\\\\\""']
+        for text in good:
+            self.assertEqual(validate(text)[0], 200, text[:100])
+        bad = ['| search ""', 'search "" |', 'search "" || search ""', 'search "" search ""',
+               'time_local = "today"', 'unknown = "x"', 'tag contains "x"', 'lead is missing',
+               'region = bare', "region = 'x'", 'search "\\q"', 'search "\\ud800"', 'search "x\ny"',
+               'searcher "x"', 'region = "x" ORDER BY id', '(search "" | search "")',
+               'NOT ' * 21 + 'search ""', '(' * 21 + 'search ""' + ')' * 21,
+               ' | '.join(['search ""'] * 21), ' AND '.join(['search ""'] * 101),
+               'tag in (' + ','.join(['"a"'] * 101) + ')', 'search "' + 'a' * 2001 + '"', ' ' * 8001]
+        for text in bad:
+            for endpoint in ("/api/pipeline", "/api/events", "/api/histogram", "/api/column-values"):
+                status, error = self.call(endpoint, {"pipeline": text, "pipeline_version": 1, "field": "region"})
+                self.assertEqual(status, 400, (endpoint, text[:100], error))
+                self.assertTrue({"line", "column", "start", "end"} <= error.keys(), error)
+        for version in (None, True, "1", 2):
+            self.assertEqual(validate('', version)[0], 400)
+        error = validate('search "" |\nunknown = "x"')[1]
+        self.assertEqual((error["line"], error["column"]), (2, 1))
+        text = 'search "😀" | tag = "x"'
+        stages = validate(text)[1]["stages"]
+        encoded = text.encode("utf-16-le")
+        self.assertEqual([encoded[s["start"] * 2:s["end"] * 2].decode("utf-16-le") for s in stages],
+                         ['search "😀"', 'tag = "x"'])
+        error = validate('search "😀" | unknown = "x"')[1]
+        self.assertEqual((error["start"], error["end"], error["column"]), (14, 21, 15))
+        error = validate('search "😀" |')[1]
+        self.assertEqual((error["start"], error["end"]), (13, 13))
+
+    def test_pipeline_tag_memberships_and_legacy_intersection(self):
+        rows = self.call("/api/events", {})[1]["data"]
+        hashes = {row["event_id"]: row["record_sha256"] for row in rows}
+        for slug, ids in [("pipeline-a", [0, 1]), ("pipeline-b", [1, 2])]:
+            self.assertEqual(self.call("/api/reviews", {"action": "tag", "slug": slug,
+                "color": "#123456", "hashes": [hashes[f"event-{i}"] for i in ids]})[0], 200)
+        try:
+            for text, ids, external in [
+                ('tag in ("pipeline-a", "pipeline-b")', [0, 1, 2], {}),
+                ('tag = "pipeline-a" AND tag = "pipeline-b"', [1], {}),
+                ('tag != "pipeline-a"', [2, 3, 4], {}),
+                ('NOT tag = "not-present"', [0, 1, 2, 3, 4], {}),
+                ('tag in ("pipeline-a", "pipeline-b")', [1], {"tags": ["pipeline-a", "pipeline-b"]}),
+                ('lead in ("absent") OR tag = "pipeline-a"', [0, 1], {})]:
+                body = {"pipeline": text, "pipeline_version": 1, **external}
+                status, result = self.call("/api/events", body)
+                self.assertEqual(status, 200, result)
+                self.assertEqual({r["event_id"] for r in result["data"]}, {f"event-{i}" for i in ids})
+                self.assertEqual(self.call("/api/histogram", body)[1]["total"], len(ids))
+        finally:
+            for slug in ("pipeline-a", "pipeline-b"):
+                self.call("/api/reviews", {"action": "untag", "slug": slug, "hashes": list(hashes.values())})
+
+    def test_pipeline_empty_values_and_summaries_beyond_first_page(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            events = [{"eventID": f"page-{i}", "eventTime": "2026-10-25T01:02:03Z",
+                       "eventName": "Synthetic", "awsRegion": "us-east-1",
+                       **({"userAgent": ""} if i < 10 else {"userAgent": " "} if i < 20 else {})}
+                      for i in range(35)]
+            source = root / "events.json"
+            source.write_text(json.dumps({"Records": events}), encoding="utf-8")
+            build(source, root / "events.duckdb")
+            store = Store(root / "events.duckdb")
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            def post(path, **body):
+                request = Request(f"http://127.0.0.1:{server.server_port}" + path, data=json.dumps(body).encode(),
+                                  headers={"Content-Type": "application/json"})
+                with urlopen(request, timeout=15) as response:
+                    return json.load(response)
+            try:
+                for text, count in [('user_agent = ""', 10), ('user_agent is missing', 15),
+                                    ('user_agent is empty', 25), ('NOT user_agent contains ""', 15),
+                                    ('user_agent contains ""', 20), ('user_agent = " "', 10),
+                                    ('user_agent != ""', 25)]:
+                    result = post('/api/events', pipeline=text, pipeline_version=1)
+                    self.assertEqual(result['last_row'], count, text)
+                body = {"pipeline": 'user_agent is empty OR user_agent = " "', "pipeline_version": 1, "size": 25}
+                first = post('/api/events', **body)
+                second = post('/api/events', **body, page=2)
+                self.assertEqual((len(first['data']), len(second['data']), first['last_row']), (25, 10, 35))
+                self.assertEqual(len({row['id'] for row in first['data'] + second['data']}), 35)
+                self.assertEqual(post('/api/histogram', **body)['total'], 35)
+                self.assertEqual(post('/api/column-values', **body, field='user_agent')['total'], 35)
+                self.assertEqual(post('/api/column-values', **body, field='user_agent', value=None), {"total": 35, "events": 15})
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                store.connection.close()
+                store.reviews.close()
+
     def test_request_timing_correlation_and_redaction(self):
         request = Request(self.url + "/api/reference",
                           data=json.dumps({"kind": "identity", "value": "private-identity-marker"}).encode(),
@@ -548,6 +698,38 @@ class BrowserContract(unittest.TestCase):
                 self.assertIn("not_missing", schema["operators"])
                 self.assertEqual(schema["timezone"], "UTC")
                 self.assertEqual(schema["first_event"], "2026-10-24T16:59:59+00:00")
+                self.assertEqual(schema["pipeline_fields"], rest("/api/meta")["pipeline_fields"])
+                # The end-user skill's pipeline example, through both real MCP transports.
+                pipeline_query = {"timezone": "Asia/Singapore", "start": "2026-10-24T00:00:00+08:00",
+                                  "end": "2026-10-26T00:00:00+08:00", "pipeline_version": 1,
+                                  "pipeline": 'event_name = "SendCommand" OR event_name = "StartSession" | search "ssm.amazonaws.com"'}
+                pipeline_result = await tool("search_events", query=pipeline_query,
+                                             sort=[{"field": "time_local", "dir": "asc"}])
+                expected_ids = ["event-0", "event-1", "event-2"]
+                self.assertEqual([event["event_id"] for event in pipeline_result["events"]], expected_ids)
+                self.assertEqual(pipeline_result["total"], 3)
+                self.assertEqual(sorted(event["event_id"] for event in rest("/api/events", pipeline_query)["data"]), expected_ids)
+                summary = await tool("summarize_field", field="event_name", query=pipeline_query)
+                self.assertEqual(summary["total"], 3)
+                self.assertEqual(summary["top"], [{"value": "SendCommand", "events": 2}, {"value": "StartSession", "events": 1}])
+                self.assertEqual((await tool("event_histogram", query=pipeline_query))["total"], 3)
+                pipeline_note = await tool("create_note", body="Pipeline example", query=pipeline_query,
+                                           hashes=[event["record_sha256"] for event in pipeline_result["events"]])
+                stored = {note["id"]: note for note in rest("/api/reviews")["annotations"]}[pipeline_note["id"]]
+                self.assertEqual(stored["context"]["pipeline"], pipeline_query["pipeline"])
+                self.assertEqual(stored["context"]["pipeline_version"], 1)
+                self.assertEqual(stored["events"], 3)
+                self.assertTrue((await tool("delete_note", id=pipeline_note["id"], updated=pipeline_note["updated"]))["deleted"])
+                for invalid, message in [({**pipeline_query, "pipeline_version": 2}, "Unsupported pipeline_version"),
+                                         ({"pipeline_version": 2}, "Unsupported pipeline_version"),
+                                         ({"pipeline": None, "pipeline_version": 2}, "Unsupported pipeline_version"),
+                                         ({**pipeline_query, "pipeline": 'region = "x" |'}, "line 1, column")]:
+                    for name, arguments in [("search_events", {}), ("summarize_field", {"field": "event_name"}),
+                                            ("event_histogram", {}),
+                                            ("create_note", {"body": "Invalid pipeline", "hashes": [pipeline_result["events"][0]["record_sha256"]]})]:
+                        error = await tool(name, query=invalid, **arguments)
+                        self.assertEqual(error[0], "error", (name, error))
+                        self.assertIn(message, error[1])
                 singapore = await tool("describe_schema", timezone="Asia/Singapore")
                 self.assertEqual(singapore["first_event"], "2026-10-25T00:59:59+08:00")
                 self.assertIn("America/New_York", singapore["timezones"])
@@ -714,6 +896,31 @@ class BrowserContract(unittest.TestCase):
             self.assertEqual(ids({"rules": ["rule-low", "rule-high"]}), ["event-0"])  # every rule must match
             self.assertEqual(ids({"min_level": "medium"}), ["event-0", "event-2"])
             self.assertEqual(ids({"rules": ["rule-chain"]}), ["event-0", "event-2"])  # every member event
+            http_server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+            http_thread.start()
+            try:
+                for text, expected in [
+                    ('lead in ("rule-low", "rule-high")', ["event-0", "event-2"]),
+                    ('lead = "rule-low" AND lead = "rule-high"', ["event-0"]),
+                    ('lead != "rule-low"', ["event-1", "event-3", "event-4"]),
+                    ('lead = "unknown"', []),
+                    ('lead = "rule-chain" OR lead = "rule-high"', ["event-0", "event-2"])]:
+                    body = {"pipeline": text, "pipeline_version": 1}
+                    for path in ("/api/events", "/api/histogram"):
+                        request = Request(f"http://127.0.0.1:{http_server.server_port}" + path,
+                                          data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+                        with urlopen(request, timeout=15) as response:
+                            result = json.load(response)
+                        if path == "/api/events":
+                            self.assertEqual(sorted(r["event_id"] for r in result["data"]), expected)
+                            self.assertEqual(result["last_row"], len(expected))
+                        else:
+                            self.assertEqual(result["total"], len(expected))
+            finally:
+                http_server.shutdown()
+                http_thread.join()
+                http_server.server_close()
             row = store.query({"rules": ["rule-high"]})["data"][0]
             self.assertEqual([(d["rule_id"], d["level"]) for d in row["detections"]],
                              [("rule-chain", "critical"), ("rule-high", "high"), ("rule-low", "low")])

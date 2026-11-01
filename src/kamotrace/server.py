@@ -21,18 +21,15 @@ from zoneinfo import ZoneInfo, available_timezones
 
 import duckdb
 
+from .pipeline import FIELDS as PIPELINE_FIELDS, PipelineError, compile_pipeline, describe as describe_pipeline
+
 
 logger = logging.getLogger(__name__)
 REQUEST_ID = ContextVar("request_id", default="startup")
 ROOT = Path(__file__).resolve().parent
 FIELDS = {
     "time_local": "Local time",
-    "event_name": "Operation", "event_source": "AWS service", "identity": "Identity",
-    "source_ip": "Source IP", "country": "Country", "key_id": "Access key ID",
-    "target": "Target instance", "error_code": "Error code", "identity_type": "Identity type",
-    "region": "Region", "user_agent": "User agent", "event_id": "Event ID",
-    "document_name": "SSM document", "isp": "Network / ISP",
-    "city": "City", "asn": "ASN", "ip_info": "IP attributes",
+    **{key: spec["label"] for key, spec in PIPELINE_FIELDS.items() if key not in ("tag", "lead")},
 }
 SORT_FIELDS = {*FIELDS, "time_local", "id"}
 OPERATORS = {"eq", "neq", "in", "contains", "not_contains", "empty", "not_empty", "missing", "not_missing"}
@@ -65,6 +62,12 @@ def parse_time(value):
 def build_query(body):
     """Only allowlisted SQL fragments; all user values remain bound parameters."""
     conditions, params = [], [query_timezone(body)]
+    if "pipeline" in body:
+        predicate, values = compile_pipeline(body)
+        conditions.append(predicate)
+        params.extend(values)
+    elif "pipeline_version" in body and (type(body["pipeline_version"]) is not int or body["pipeline_version"] != 1):
+        raise PipelineError("Unsupported pipeline_version; expected 1")
     source = "(SELECT * REPLACE (strftime(event_time AT TIME ZONE ?, '%Y-%m-%d %H:%M:%S') AS time_local) FROM browse_events)"
     start, end = body.get("start"), body.get("end")
     if start:
@@ -526,6 +529,7 @@ class Store:
             operation=f"metadata.facet.{field}")]
             for field in ("event_name", "event_source", "country", "identity_type", "error_code", "document_name")}
         return {**bounds, "histogram": histogram, "facets": facets, "fields": FIELDS,
+                "pipeline_fields": PIPELINE_FIELDS,
                 "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
                 "levels": LEVELS, "detections_loaded": self.suzaku_run is not None or self.guardduty_run is not None,
                 "enrichment": self.enrichment_run,
@@ -681,7 +685,7 @@ class Handler(SimpleHTTPRequestHandler):
                 route = self.path.split("?", 1)[0]
                 if route.startswith("/api/events/"):
                     route = "/api/events/:record"
-                elif route not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values",
+                elif route not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values",
                                    "/api/reviews", "/api/detections", "/api/inventory", "/api/reference",
                                    "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event",
                                    "/api/ssm-log", "/api/ssm-log-review", "/mcp"):
@@ -801,7 +805,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/reference"):
+        if self.path not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/reference"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -812,6 +816,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object")
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
+                         "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
                          "/api/reference": self.store.reference,
                          "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
@@ -820,6 +825,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(operation(body))
         except StaleSelection as error:
             self.respond({"error": str(error), "stale": True}, 409)
+        except PipelineError as error:
+            self.respond(error.response(), 400)
         except (ValueError, TypeError, AttributeError) as error:
             self.respond({"error": str(error)}, 400)
         except (duckdb.Error, sqlite3.Error) as error:

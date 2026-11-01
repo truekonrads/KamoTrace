@@ -169,6 +169,8 @@ function normalize(state) {
     start: Number.isFinite(start) ? start : meta.start_ms,
     end: Number.isFinite(end) ? end : meta.end_ms,
     search: typeof s.search === "string" ? s.search : "",
+    pipeline: typeof s.pipeline === "string" ? s.pipeline : null,
+    pipeline_version: s.pipeline_version ?? 1,
     filters: (Array.isArray(s.filters) ? s.filters : [])
       .filter((f) => f && meta.fields[f.field] && OPS[f.op])
       .map((f) => ({ field: f.field, op: f.op, value: String(f.value ?? "") })),
@@ -186,13 +188,34 @@ function normalize(state) {
   };
 }
 
-async function apply(state, push = true) {
+async function apply(state, push = true, guardDraft = false) {
   const requestId = ++latestApply;
   const next = normalize(state);
   if (!(next.start < next.end)) {
     error("Choose a valid time range: start must be before the exclusive end.");
     return;
   }
+  let validated = null;
+  if (next.pipeline !== null) {
+    try {
+      validated = await request("/api/pipeline", {
+        pipeline: next.pipeline,
+        pipeline_version: next.pipeline_version,
+      });
+      if (requestId !== latestApply) return;
+    } catch (e) {
+      if (requestId === latestApply) {
+        pipelineError(e.message);
+        if (Number.isInteger(e.start)) {
+          $("search").focus();
+          dismissPipelineSuggestions();
+          $("search").setSelectionRange(e.start, Math.max(e.start + 1, e.end));
+        }
+      }
+      return;
+    }
+  }
+  pipelineError("");
   if (next.timezone !== meta.timezone) {
     setLoading(`Applying ${next.timezone}…`);
     try {
@@ -211,6 +234,7 @@ async function apply(state, push = true) {
     document.querySelectorAll("dialog[open]").forEach((d) => d.close());
     if (commandKey) openCommand(commandKey, true);
   }
+  if (guardDraft && !pipelineShortcutReady()) return;
   $("timezone").value = meta.timezone;
   $("start").setAttribute("aria-label", `From (inclusive), ${meta.timezone}`);
   $("end").setAttribute("aria-label", `Until (exclusive), ${meta.timezone}`);
@@ -223,6 +247,7 @@ async function apply(state, push = true) {
     historyPos = queryHistory.length - 1;
   }
   applied = next;
+  pipelineInfo = validated;
   closeFilterEditor();
   syncInputs();
   renderScopes();
@@ -253,11 +278,20 @@ function query() {
     min_level: applied.min_level,
     command_key: applied.command_key,
     filters: applied.filters,
+    ...(applied.pipeline !== null
+      ? {
+          pipeline: applied.pipeline,
+          pipeline_version: applied.pipeline_version,
+        }
+      : {}),
   };
 }
 
 function syncInputs() {
-  $("search").value = applied.search;
+  $("query-mode").value = applied.pipeline === null ? "text" : "pipeline";
+  $("search").value = applied.pipeline ?? applied.search;
+  pipelinePresentation();
+  pipelineError("");
   $("start").value = inputTime(applied.start);
   $("end").value = inputTime(applied.end);
   updating = true;
@@ -268,9 +302,19 @@ function syncInputs() {
 }
 
 function draft() {
+  const pipeline = $("query-mode").value === "pipeline";
   return {
     ...applied,
-    search: $("search").value,
+    search: pipeline
+      ? applied.pipeline === null
+        ? ""
+        : applied.search
+      : $("search").value,
+    pipeline: pipeline ? $("search").value : null,
+    pipeline_version: 1,
+    ...(pipeline && applied.pipeline === null
+      ? { filters: [], tags: [], rules: [] }
+      : {}),
     start: parseInput($("start").value),
     end: parseInput($("end").value),
   };
@@ -280,6 +324,7 @@ function draftState() {
   const d = draft();
   const dirty =
     d.search !== applied.search ||
+    d.pipeline !== applied.pipeline ||
     d.start !== applied.start ||
     d.end !== applied.end ||
     (!$("filter-editor").hidden && filterEditorValue() !== null);
@@ -300,10 +345,21 @@ function runDraft() {
   }
   const pending = filterEditorValue();
   if (pending) {
-    const filters = [...applied.filters];
-    if (editingFilter === null) filters.push(pending);
-    else filters[editingFilter] = pending;
-    d.filters = filters;
+    if (d.pipeline !== null && editingFilter === null) {
+      try {
+        d.pipeline = [d.pipeline, pipelineFilter(pending)]
+          .filter(Boolean)
+          .join("\n| ");
+      } catch (e) {
+        pipelineError(e.message);
+        return;
+      }
+    } else {
+      const filters = [...applied.filters];
+      if (editingFilter === null) filters.push(pending);
+      else filters[editingFilter] = pending;
+      d.filters = filters;
+    }
   }
   apply(d);
 }
@@ -370,6 +426,17 @@ function renderScopes() {
         title: "Literal, case-insensitive substring of the raw event",
         onRemove: () => apply({ ...s, search: "" }),
       }),
+    );
+  if (s.pipeline !== null)
+    out.push(
+      chip(
+        `Applied pipeline · ${pipelineInfo?.stages.length || 0} stage${pipelineInfo?.stages.length === 1 ? "" : "s"}`,
+        {
+          title: `Applied within the selected dates:\n${s.pipeline.trim() || "All events"}`,
+          onClick: () => $("search").focus(),
+          onRemove: () => apply({ ...s, pipeline: "" }),
+        },
+      ),
     );
   s.filters.forEach((f, i) =>
     out.push(
@@ -500,7 +567,316 @@ function closeFilterEditor() {
 }
 
 function addFilter(field, op, value) {
+  if (applied.pipeline !== null) {
+    if (!pipelineShortcutReady()) return;
+    try {
+      const stage = pipelineFilter({ field, op, value });
+      apply(
+        {
+          ...applied,
+          pipeline: [applied.pipeline, stage].filter(Boolean).join("\n| "),
+        },
+        true,
+        true,
+      );
+    } catch (e) {
+      pipelineError(e.message);
+    }
+    return;
+  }
   apply({ ...applied, filters: [...applied.filters, { field, op, value }] });
+}
+
+// Pipeline syntax is validated by the server. Editor suggestions are only hints;
+// sidebar rewrites use validated stage spans, never split strings on literal pipes.
+let pipelineInfo = null,
+  pipelineMembershipQueue = Promise.resolve(),
+  pipelineSuggestions = [],
+  pipelineSuggestionIndex = 0;
+
+function pipelineError(message) {
+  $("pipeline-error").textContent = message
+    ? `${message} · Results still show the previous applied query.`
+    : "";
+  $("pipeline-error").hidden = !message;
+  $("search").setAttribute("aria-invalid", String(Boolean(message)));
+}
+
+function pipelinePresentation() {
+  const enabled = $("query-mode").value === "pipeline";
+  $("search").parentElement.classList.toggle("pipeline", enabled);
+  $("pipeline-hint").hidden = !enabled;
+  $("search").placeholder = enabled
+    ? 'Operation or event_name · e.g. event_name = "ConsoleLogin" | search "AccessDenied"'
+    : "Search entire raw event (literal, case-insensitive) — press / to focus";
+  $("search").setAttribute(
+    "aria-label",
+    enabled ? "Pipeline query" : "Search entire raw event",
+  );
+  $("search").rows = enabled
+    ? Math.min(6, Math.max(2, $("search").value.split("\n").length))
+    : 1;
+  dismissPipelineSuggestions();
+}
+
+function pipelineFilter({ field, op, value }) {
+  if (field === "time_local")
+    throw new Error(
+      "Local time filters remain in Text search mode; use the date selector in Pipeline mode.",
+    );
+  const q = JSON.stringify(value);
+  if (op === "eq") return `${field} = ${q}`;
+  if (op === "neq") return `${field} != ${q}`;
+  if (op === "in")
+    return `${field} in (${value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map(JSON.stringify)
+      .join(", ")})`;
+  if (op === "contains")
+    return value === "" ? 'search ""' : `${field} contains ${q}`;
+  if (op === "not_contains")
+    return value === "" ? 'NOT search ""' : `NOT ${field} contains ${q}`;
+  return `${field} is ${op.startsWith("not_") ? "not " : ""}${op.replace("not_", "")}`;
+}
+
+function legacyPipeline(state) {
+  return [
+    ...(state.pipeline !== null ? [state.pipeline] : []),
+    ...(state.search ? [`search ${JSON.stringify(state.search)}`] : []),
+    ...state.filters.map(pipelineFilter),
+    ...state.tags.map((v) => `tag = ${JSON.stringify(v)}`),
+    ...state.rules.map((v) => `lead = ${JSON.stringify(v)}`),
+  ]
+    .filter(Boolean)
+    .join("\n| ");
+}
+
+function pipelineShortcutReady() {
+  const d = draft();
+  if (
+    d.pipeline !== applied.pipeline ||
+    d.search !== applied.search ||
+    d.start !== applied.start ||
+    d.end !== applied.end ||
+    !$("filter-editor").hidden
+  ) {
+    pipelineError(
+      "Run or Revert the current draft before using a quick filter",
+    );
+    $("search").focus();
+    dismissPipelineSuggestions();
+    return false;
+  }
+  return true;
+}
+
+function togglePipelineMembership(field, value) {
+  // Preserve consecutive clicks while validation is in flight.
+  pipelineMembershipQueue = pipelineMembershipQueue.then(async () => {
+    if (!pipelineShortcutReady()) return;
+    const original = applied;
+    try {
+      const text = legacyPipeline(applied);
+      const info = await request("/api/pipeline", {
+        pipeline: text,
+        pipeline_version: 1,
+      });
+      if (applied !== original || !pipelineShortcutReady()) return;
+      const references = info.stages.filter((s) => s.fields.includes(field));
+      if (
+        references.length > 1 ||
+        (references.length === 1 && references[0].field !== field)
+      ) {
+        pipelineError(
+          `Edit the existing ${field} expression in Pipeline mode; a shortcut cannot safely rewrite its Boolean logic`,
+        );
+        $("search").focus();
+        dismissPipelineSuggestions();
+        return;
+      }
+      const stage = references[0];
+      let values = stage?.values || [];
+      values = values.includes(value)
+        ? values.filter((v) => v !== value)
+        : [...values, value];
+      const replacement = values.length
+        ? `${field} in (${values.map(JSON.stringify).join(", ")})`
+        : "";
+      const stages = info.stages
+        .map((s) =>
+          s === stage ? replacement : text.slice(s.start, s.end).trim(),
+        )
+        .filter(Boolean);
+      if (!stage && replacement) stages.push(replacement);
+      await apply(
+        {
+          ...applied,
+          pipeline: stages.join("\n| "),
+          pipeline_version: 1,
+          search: "",
+          tags: [],
+          rules: [],
+          filters: [],
+        },
+        true,
+        true,
+      );
+    } catch (e) {
+      pipelineError(e.message);
+    }
+  });
+}
+
+function pipelineMembership(field, value) {
+  return pipelineInfo?.stages.some(
+    (s) => s.field === field && s.values.includes(value),
+  );
+}
+
+function dismissPipelineSuggestions() {
+  $("pipeline-suggestions").hidden = true;
+  $("search").setAttribute("aria-expanded", "false");
+  $("search").removeAttribute("aria-activedescendant");
+  pipelineSuggestions = [];
+}
+
+function acceptPipelineSuggestion(index) {
+  const suggestion = pipelineSuggestions[index];
+  if (!suggestion) return;
+  const input = $("search");
+  input.setRangeText(
+    suggestion.insert,
+    suggestion.start,
+    suggestion.end,
+    "end",
+  );
+  input.focus();
+  dismissPipelineSuggestions();
+  draftState();
+}
+
+function selectPipelineSuggestion(index) {
+  pipelineSuggestionIndex = index;
+  for (const [i, node] of [...$("pipeline-suggestions").children].entries())
+    node.setAttribute("aria-selected", String(i === index));
+  const node = $("pipeline-suggestions").children[index];
+  if (node) {
+    $("search").setAttribute("aria-activedescendant", node.id);
+    node.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function suggestPipeline() {
+  dismissPipelineSuggestions();
+  if ($("query-mode").value !== "pipeline") return;
+  const input = $("search"),
+    prefix = input.value.slice(0, input.selectionStart);
+  const registry = meta.pipeline_fields || {};
+  // Tokens retain offsets and quoted strings, so a quoted OR or pipe is never a boundary.
+  const tokens = [
+    ...prefix.matchAll(/"(?:\\.|[^"\\])*"?|!=|[=(),|]|[^\s=(),|!\"]+/g),
+  ].map((m) => ({ text: m[0], start: m.index }));
+  let boundary = -1;
+  tokens.forEach((t, i) => {
+    if (
+      t.text === "|" ||
+      /^(AND|OR)$/i.test(t.text) ||
+      (/^NOT$/i.test(t.text) && tokens[i - 1]?.text.toLowerCase() !== "is")
+    )
+      boundary = i;
+  });
+  const tail = tokens.slice(boundary + 1);
+  while (tail[0]?.text === "(") tail.shift();
+  const field = tail[0]?.text;
+  const schema = Object.hasOwn(registry, field) ? registry[field] : null;
+  let choices = [],
+    start = input.selectionStart,
+    term = "";
+  if (
+    schema &&
+    tail.length >= 2 &&
+    /^(=|!=|contains|in)$/i.test(tail[1].text)
+  ) {
+    const last = tail.at(-1);
+    if (
+      !["=", "!=", "contains", "in", "(", ","].includes(last.text.toLowerCase())
+    ) {
+      start = last.start;
+      term = last.text.replace(/^"/, "").replace(/"$/, "");
+    }
+    const values =
+      field === "tag"
+        ? reviews.tags.map((t) => [t.slug, t.slug])
+        : field === "lead"
+          ? detections.rules.map((r) => [r.rule_id, r.title])
+          : (meta.facets[field] || []).map((v) => [String(v), String(v)]);
+    choices = values.map(([value, label]) => ({
+      label,
+      detail: value,
+      insert: JSON.stringify(value),
+    }));
+  } else if (
+    (schema && /\s$/.test(prefix.slice(tail[0].start))) ||
+    (schema && tail.length > 1)
+  ) {
+    start = tail[1]?.start ?? input.selectionStart;
+    term = prefix.slice(start);
+    choices = schema.operators.map((op) => ({
+      label: op,
+      detail: `Operator for ${schema.label}`,
+      insert: op === "in" ? "in (" : op + " ",
+    }));
+  } else {
+    start = tail[0]?.start ?? input.selectionStart;
+    term = prefix.slice(start);
+    choices = Object.entries(registry).map(([key, item]) => ({
+      label: `${item.label} — ${key}`,
+      detail: `${item.description} · ${item.operators.join(", ")}`,
+      insert: key + " ",
+    }));
+    choices.push({
+      label: "Raw event text — search",
+      detail: "Literal, case-insensitive raw JSON search",
+      insert: 'search "',
+    });
+  }
+  let end = input.selectionStart;
+  if (start < end) {
+    const quoted = input.value.slice(start).match(/^"(?:\\.|[^"\\])*"/);
+    if (quoted) end = start + quoted[0].length;
+    else end += input.value.slice(end).match(/^[\w-]*/)[0].length;
+  }
+  pipelineSuggestions = choices
+    .filter((c) =>
+      `${c.label} ${c.detail}`.toLowerCase().includes(term.toLowerCase()),
+    )
+    .slice(0, 25)
+    .map((c) => ({ ...c, start, end }));
+  const list = $("pipeline-suggestions");
+  list.replaceChildren(
+    ...pipelineSuggestions.map((c, i) => {
+      const node = document.createElement("div");
+      node.id = `pipeline-option-${i}`;
+      node.setAttribute("role", "option");
+      node.textContent = c.label;
+      const detail = document.createElement("small");
+      detail.textContent = c.detail;
+      node.append(detail);
+      node.onmousedown = (e) => {
+        e.preventDefault();
+        acceptPipelineSuggestion(i);
+      };
+      return node;
+    }),
+  );
+  list.hidden = !pipelineSuggestions.length;
+  input.setAttribute(
+    "aria-expanded",
+    String(Boolean(pipelineSuggestions.length)),
+  );
+  selectPipelineSuggestion(0);
 }
 
 // ---- SSM commands (JSON-backed in memory; grouped by account + region + command ID) ----------
@@ -2089,12 +2465,7 @@ function swatch(tag, onClick) {
 
 function toggleTagFilter(slug) {
   if (commandsActive) switchView(false, false);
-  apply({
-    ...applied,
-    tags: applied.tags.includes(slug)
-      ? applied.tags.filter((t) => t !== slug)
-      : [...applied.tags, slug],
-  });
+  togglePipelineMembership("tag", slug);
 }
 
 function renderTags() {
@@ -2105,7 +2476,10 @@ function renderTags() {
     .map((tag) => {
       const li = document.createElement("li");
       li.className =
-        "tag-item" + (applied.tags.includes(tag.slug) ? " active" : "");
+        "tag-item" +
+        (applied.tags.includes(tag.slug) || pipelineMembership("tag", tag.slug)
+          ? " active"
+          : "");
       const color = swatch(tag, (e) => {
         e.stopPropagation();
         $("recolor").dataset.slug = tag.slug;
@@ -2118,9 +2492,10 @@ function renderTags() {
       name.type = "button";
       name.className = "tag-name";
       name.textContent = tag.slug;
-      name.title = applied.tags.includes(tag.slug)
-        ? "Remove this tag filter"
-        : "Filter to events with this tag (added to the current query)";
+      name.title =
+        applied.tags.includes(tag.slug) || pipelineMembership("tag", tag.slug)
+          ? "Remove this tag filter"
+          : "Match this tag or another selected tag within the current query";
       name.onclick = () => toggleTagFilter(tag.slug);
       const count = document.createElement("span");
       count.className = "count";
@@ -2147,7 +2522,8 @@ function renderRail() {
   const focused = document.activeElement?.closest?.(".rail-tag")?.dataset.slug;
   const items = reviews.tags.map((tag) => {
     const li = document.createElement("li");
-    const active = applied.tags.includes(tag.slug);
+    const active =
+      applied.tags.includes(tag.slug) || pipelineMembership("tag", tag.slug);
     const b = document.createElement("button");
     b.type = "button";
     b.className = "rail-tag" + (active ? " active" : "");
@@ -2422,12 +2798,7 @@ function levelBadge(level) {
 
 function toggleRuleFilter(id) {
   if (commandsActive) switchView(false, false);
-  apply({
-    ...applied,
-    rules: applied.rules.includes(id)
-      ? applied.rules.filter((r) => r !== id)
-      : [...applied.rules, id],
-  });
+  togglePipelineMembership("lead", id);
 }
 
 function renderDetections() {
@@ -2445,7 +2816,11 @@ function renderDetections() {
     .map((rule) => {
       const li = document.createElement("li");
       li.className =
-        "tag-item" + (applied.rules.includes(rule.rule_id) ? " active" : "");
+        "tag-item" +
+        (applied.rules.includes(rule.rule_id) ||
+        pipelineMembership("lead", rule.rule_id)
+          ? " active"
+          : "");
       const name = document.createElement("button");
       name.type = "button";
       name.className = "tag-name";
@@ -2453,9 +2828,10 @@ function renderDetections() {
       name.title =
         `${rule.level} · ${[...rule.tactics, ...rule.techniques].join(", ") || "no ATT&CK tags"}\n` +
         `Rule ${rule.rule_id}\n` +
-        (applied.rules.includes(rule.rule_id)
+        (applied.rules.includes(rule.rule_id) ||
+        pipelineMembership("lead", rule.rule_id)
           ? "Remove this rule filter"
-          : "Filter to events this rule matched (added to the current query)");
+          : "Match this lead or another selected lead within the current query");
       name.onclick = () => toggleRuleFilter(rule.rule_id);
       const count = document.createElement("span");
       count.className = "count";
@@ -2683,6 +3059,8 @@ function renderNoteMenu() {
 
 function scopeSummary(s) {
   const parts = [`${shown(s.start)} → ${shown(s.end)}`];
+  if (s.pipeline !== null)
+    parts.push(`pipeline v${s.pipeline_version}: ${s.pipeline}`);
   if (s.search) parts.push(`search “${s.search}”`);
   for (const f of s.filters)
     parts.push(`${meta.fields[f.field]} ${OPS[f.op][1]} ${f.value}`);
@@ -2807,6 +3185,8 @@ async function request(url, body) {
     if (!res.ok)
       throw Object.assign(new Error(result.error || `HTTP ${res.status}`), {
         stale: result.stale === true,
+        start: result.start,
+        end: result.end,
       });
     return result;
   } finally {
@@ -3628,12 +4008,92 @@ async function init() {
   $("filter-save").onclick = () => {
     const value = filterEditorValue();
     if (!value) return $("filter-value").focus();
+    if (applied.pipeline !== null) {
+      // The explicit Add action applies this pending filter; the editor draft
+      // is included by runDraft rather than being silently discarded.
+      runDraft();
+      return;
+    }
     const filters = [...applied.filters];
     if (editingFilter === null) filters.push(value);
     else filters[editingFilter] = value;
     apply({ ...applied, filters });
   };
-  $("search").oninput = draftState;
+  $("query-mode").onchange = async () => {
+    dismissPipelineSuggestions();
+    try {
+      if ($("query-mode").value === "pipeline") {
+        $("search").value = legacyPipeline({
+          ...applied,
+          pipeline: null,
+          search: $("search").value,
+        });
+      } else {
+        const result = await request("/api/pipeline", {
+          pipeline: [
+            $("search").value,
+            ...(applied.pipeline !== null && applied.search
+              ? [`search ${JSON.stringify(applied.search)}`]
+              : []),
+          ]
+            .filter(Boolean)
+            .join("\n| "),
+          pipeline_version: 1,
+        });
+        if (result.search === null)
+          throw new Error(
+            "This expression cannot be represented as plain text search. Keep Pipeline mode or clear the query first.",
+          );
+        $("search").value = result.search;
+      }
+      pipelineError("");
+    } catch (e) {
+      $("query-mode").value =
+        $("query-mode").value === "pipeline" ? "text" : "pipeline";
+      pipelineError(e.message);
+    }
+    pipelinePresentation();
+    draftState();
+  };
+  $("search").oninput = () => {
+    pipelineError("");
+    const pipeline = $("query-mode").value === "pipeline";
+    $("search").rows = pipeline
+      ? Math.min(6, Math.max(2, $("search").value.split("\n").length))
+      : 1;
+    draftState();
+    suggestPipeline();
+  };
+  $("search").onfocus = suggestPipeline;
+  $("search").onblur = dismissPipelineSuggestions;
+  $("search").onkeydown = (e) => {
+    if (e.isComposing) return;
+    if (e.key === "Enter" && e.shiftKey) {
+      dismissPipelineSuggestions();
+      return;
+    }
+    if (e.ctrlKey && e.code === "Space") {
+      e.preventDefault();
+      suggestPipeline();
+    } else if (
+      pipelineSuggestions.length &&
+      ["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(e.key)
+    ) {
+      e.preventDefault();
+      if (e.key === "Enter") acceptPipelineSuggestion(pipelineSuggestionIndex);
+      else if (e.key === "Escape") dismissPipelineSuggestions();
+      else
+        selectPipelineSuggestion(
+          (pipelineSuggestionIndex +
+            (e.key === "ArrowDown" ? 1 : -1) +
+            pipelineSuggestions.length) %
+            pipelineSuggestions.length,
+        );
+    } else if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      runDraft();
+    }
+  };
   $("start").oninput = $("end").oninput = () => {
     paintSelection();
     draftState();

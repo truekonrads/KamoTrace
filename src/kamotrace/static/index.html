@@ -128,8 +128,8 @@
             />
             <p class="hint">
               Labels on individual events, separate from findings. Counts cover
-              all evidence. Click to filter; all tag filters must match. Click a
-              swatch to recolor it everywhere.
+              all evidence. Click to match any selected tag. Click a swatch to
+              recolor it everywhere.
             </p>
             <ul id="tag-list"></ul>
           </section>
@@ -147,7 +147,7 @@
             <p class="hint">
               Suzaku rule matches and labelled GuardDuty contextual leads, most
               severe first, with event counts. Context is not an exact event
-              match. Click to filter; all lead filters must match.
+              match. Click to match any selected lead.
             </p>
             <ul id="rule-list"></ul>
             <p id="detections-run" class="hint"></p>
@@ -498,13 +498,32 @@
             >
               ›
             </button>
-            <input
-              id="search"
-              type="search"
-              placeholder="Search entire raw event (literal, case-insensitive) — press / to focus"
-              aria-label="Search entire raw event"
-              autocomplete="off"
-            />
+            <select id="query-mode" aria-label="Search mode">
+              <option value="text">Text search</option>
+              <option value="pipeline">Pipeline</option>
+            </select>
+            <div class="query-input">
+              <textarea
+                id="search"
+                rows="1"
+                placeholder="Search entire raw event (literal, case-insensitive) — press / to focus"
+                aria-label="Search entire raw event"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-haspopup="listbox"
+                aria-describedby="pipeline-hint pipeline-error"
+                aria-controls="pipeline-suggestions"
+                aria-expanded="false"
+                autocomplete="off"
+                spellcheck="false"
+              ></textarea>
+              <div
+                id="pipeline-suggestions"
+                role="listbox"
+                aria-label="Query suggestions"
+                hidden
+              ></div>
+            </div>
             <button class="primary" type="submit" id="run">Run</button>
             <span id="query-state" class="state applied" role="status"
               >Applied</span
@@ -516,6 +535,11 @@
               SSM commands &amp; sessions</button
             ><button type="button" id="clear">Clear all</button>
           </form>
+          <p id="pipeline-hint" class="hint" hidden>
+            Pipes mean AND · OR is explicit · Dates stay in the selector · Enter
+            to run · Shift+Enter for a new line · Ctrl+Space for schema
+          </p>
+          <p id="pipeline-error" role="alert" hidden></p>
           <div class="scope-row">
             <span id="scopes" aria-label="Applied query scopes"></span>
             <button id="add-filter" type="button" class="text-button">

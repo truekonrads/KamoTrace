@@ -109,6 +109,71 @@ def main():
                 expect(page.locator("#load-status")).to_have_text("5 loaded · all")
                 expect(page.locator("#start")).to_have_value("2026-10-25 00:59:59")
 
+                # Reopening a hybrid API query must retain its external search on Run.
+                bounds = page.request.get(BrowserContract.url + "/api/meta").json()
+                event = page.request.post(BrowserContract.url + "/api/events", data={}).json()["data"][0]
+                hybrid = {"timezone": "Asia/Singapore", "start": bounds["start_ms"], "end": bounds["end_ms"],
+                          "pipeline": 'search "ssm.amazonaws.com"', "pipeline_version": 1, "search": "SendCommand"}
+                note = page.request.post(BrowserContract.url + "/api/reviews", data={
+                    "action": "annotate", "body": "Hybrid query regression", "hashes": [event["record_sha256"]],
+                    "context": hybrid}).json()
+                page.request.post(BrowserContract.url + "/api/reviews", data={
+                    "action": "tag", "slug": "review-race", "color": "#123456", "hashes": [event["record_sha256"]]})
+                page.reload()
+                expect(rows).to_have_count(5)
+                page.locator("#expand-sidebar").click()
+                page.locator(".note-head").filter(has_text="Hybrid query regression").click()
+                page.get_by_role("button", name="Reopen query", exact=True).click()
+                expect(page.locator("#load-status")).to_have_text("3 loaded · all")
+                expect(page.locator("#query-state")).to_have_text("Applied")
+                with page.expect_response(lambda response: "/api/events" in response.url) as rerun:
+                    page.locator("#run").click()
+                assert rerun.value.request.post_data_json["search"] == "SendCommand"
+                expect(rows).to_have_count(3)
+                expect(page.locator("#scopes")).to_contain_text("SendCommand")
+                page.screenshot(path=str(results / "pipeline-hybrid-preserved.png"))
+                # A single pipeline search plus an external search is not one plain-text query.
+                page.locator("#query-mode").select_option("text")
+                expect(page.locator("#query-mode")).to_have_value("pipeline")
+                expect(page.locator("#pipeline-error")).to_contain_text("cannot be represented")
+                expect(page.locator("#search")).to_have_value(hybrid["pipeline"])
+
+                # A shortcut must preserve text entered while validation is pending.
+                page.locator("#tags-tab").click()
+                with page.expect_response(lambda response: "/api/events" in response.url):
+                    page.locator("#run").click()
+                blocked = []
+                page.route("**/api/pipeline", lambda route: route.continue_() if blocked else blocked.append(route))
+                page.locator("#tag-list").get_by_role("button", name="review-race", exact=True).click()
+                expect(page.locator("#query-status")).to_have_text("Query in progress")
+                page.locator("#search").fill('event_name = "StartSession"')
+                for route in blocked:
+                    route.continue_()
+                expect(page.locator("#pipeline-error")).to_contain_text("Run or Revert")
+                page.unroute("**/api/pipeline")
+                expect(page.locator("#pipeline-suggestions")).to_be_hidden()
+                expect(page.locator("#search")).to_have_value('event_name = "StartSession"')
+                expect(page.locator("#query-state")).to_have_text("Draft · Run to apply")
+                expect(rows).to_have_count(3)
+                page.screenshot(path=str(results / "pipeline-draft-preserved.png"))
+                page.locator("#revert").click()
+
+                # Shift+Enter is a newline even with a highlighted completion.
+                page.locator("#search").fill("Operation")
+                expect(page.get_by_role("option", name="Operation — event_name")).to_be_visible()
+                page.locator("#search").press("Shift+Enter")
+                expect(page.locator("#search")).to_have_value("Operation\n")
+                expect(rows).to_have_count(3)
+                page.locator("#search").fill("Operation")
+                page.locator("#search").press("Enter")
+                expect(page.locator("#search")).to_have_value("event_name ")
+                expect(rows).to_have_count(3)
+                page.locator("#clear").click()
+                expect(page.locator("#load-status")).to_have_text("5 loaded · all")
+                page.locator("#collapse-sidebar").click()
+                page.request.post(BrowserContract.url + "/api/reviews", data={
+                    "action": "delete", "id": note["id"], "updated": note["updated"]})
+
                 # Context is read-only; focus/click must not open the event row or alter its query.
                 identity = rows.first.locator('[tabulator-field="identity"] .cell-text')
                 identity.focus()
@@ -298,7 +363,7 @@ def main():
                 expect(page.locator("#rail")).to_be_visible()
                 expect(rows).to_have_count(5)
                 assert not errors, f"Browser JavaScript errors: {errors}"
-                print("PASS: event search/timezone/history, reference cards, inventory map/tables/coverage, tab state, error/retry and no-snapshot; no JavaScript errors.")
+                print("PASS: event search/timezone/history, hybrid pipeline scopes, shortcut draft races, autocomplete/newlines, reference cards, inventory map/tables/coverage, tab state, error/retry and no-snapshot; no JavaScript errors.")
             except Exception:
                 page.screenshot(path=str(results / "failure.png"))
                 raise

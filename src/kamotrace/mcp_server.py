@@ -65,6 +65,8 @@ class Filter(BaseModel):
 class Query(BaseModel):
     timezone: str = Field("UTC", description="IANA timezone for time_local filters, results and histogram boundaries.")
     search: str = Field("", description="Case-insensitive substring over the raw event JSON.")
+    pipeline: str | None = Field(None, description='Optional v1 filter expression: pipes mean AND; OR is explicit. Example: event_name = "ConsoleLogin" OR event_name = "AssumeRole" | search "AccessDenied". Dates remain start/end. Fields and operators: describe_schema().pipeline_fields. Values use JSON double-quoted strings; tag/lead are membership fields. Existing query properties AND with the whole pipeline.')
+    pipeline_version: int = Field(1, strict=True, description="Pipeline language version. Only 1 is supported.")
     filters: list[Filter] = Field([], description="All filters must match (AND).")
     tags: list[str] = Field([], description="Events must carry every listed tag (AND).")
     note_id: int | None = Field(None, description="Only events linked to this note.")
@@ -78,7 +80,8 @@ class Query(BaseModel):
     def body(self):
         return {"timezone": self.timezone, "search": self.search, "filters": [f.model_dump() for f in self.filters], "tags": self.tags,
                 "annotation_id": self.note_id, "command_key": self.command_key, "start": self.start, "end": self.end,
-                "rules": self.rules, "min_level": self.min_level}
+                "rules": self.rules, "min_level": self.min_level, "pipeline_version": self.pipeline_version,
+                **({"pipeline": self.pipeline} if self.pipeline is not None else {})}
 
 
 class Sort(BaseModel):
@@ -157,6 +160,7 @@ def describe_schema(timezone: str = "UTC") -> dict[str, Any]:
             "first_event": datetime.fromtimestamp(meta["start_ms"] / 1000, zone).isoformat(),
             "end_exclusive": datetime.fromtimestamp(meta["end_ms"] / 1000, zone).isoformat(),
             "fields": meta["fields"], "operators": meta["operators"], "sort_fields": meta["sort_fields"],
+            "pipeline_version": 1, "pipeline_fields": meta["pipeline_fields"],
             "page_sizes": meta["page_sizes"], "facets": meta["facets"],
             # IP enrichment is a labelled lookup (country/city/asn/isp/ip_info), not evidence.
             "ip_enrichment_sources": [{k: s[k] for k in ("label", "kind", "evidence_ips_matched", "attribute_keys")}

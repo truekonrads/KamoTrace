@@ -50,6 +50,7 @@ body {
 }
 button,
 input,
+textarea,
 select {
   font: inherit;
   line-height: 16px;
@@ -109,6 +110,7 @@ select {
 }
 button:focus-visible,
 input:focus-visible,
+textarea:focus-visible,
 select:focus-visible,
 summary:focus-visible {
   outline: 3px solid #237c8b;
@@ -600,10 +602,68 @@ main {
   padding: 6px 0 0;
   box-shadow: 0 6px 6px -6px #19374a33;
 }
-.query-row #search,
+.query-input,
 #command-search {
   flex: 1;
   min-width: 220px;
+}
+.query-input {
+  position: relative;
+}
+.query-input #search {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 30px;
+  resize: vertical;
+  font: inherit;
+  padding: 4px 7px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--control-line);
+  border-radius: 2px;
+}
+.query-input.pipeline #search {
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+#pipeline-hint,
+#pipeline-error {
+  margin: 5px 0;
+  font-size: 12px;
+}
+#pipeline-error {
+  color: var(--error);
+}
+#search[aria-invalid="true"] {
+  border-color: var(--error);
+}
+#pipeline-suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 30;
+  width: max(100%, 390px);
+  max-height: 280px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid var(--line);
+  box-shadow: 0 4px 12px #19374a33;
+}
+#pipeline-suggestions [role="option"] {
+  padding: 7px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--line);
+}
+#pipeline-suggestions [aria-selected="true"] {
+  background: #e5f2f5;
+  outline: 1px solid var(--blue);
+  outline-offset: -1px;
+}
+#pipeline-suggestions small {
+  display: block;
+  color: var(--muted);
+  margin-top: 3px;
 }
 .state {
   font-size: 11px;
