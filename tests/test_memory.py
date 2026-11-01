@@ -49,9 +49,9 @@ class MemoryLogging(unittest.TestCase):
                 (location / "memory.stat").write_text(f"inactive_file {cached}\n")
             original = Path.read_text
             def read(path, *args, **kwargs):
-                if str(path) == "/proc/self/cgroup":
+                if path == Path("/proc/self/cgroup"):
                     return "0::/slice/child\n"
-                if str(path) == "/proc/self/mountinfo":
+                if path == Path("/proc/self/mountinfo"):
                     mount = str(root).replace(" ", r"\040")
                     return f"1 0 0:1 /slice {mount} rw - cgroup2 cgroup rw\n"
                 return original(path, *args, **kwargs)
