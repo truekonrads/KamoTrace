@@ -29,7 +29,8 @@ HTTP_BASE = ContextVar("kamotrace_http_base", default=None)
 NEW_TAG_COLOR = "#c45436"  # Same default as the browser's quick-tag colour picker.
 OPENER = build_opener(ProxyHandler({}))  # Never route loopback evidence traffic through a system proxy.
 
-mcp = MCPServer("kamotrace", instructions="""\
+# Tool/resource lists are fixed; the buffered HTTP bridge cannot stream subscriptions.
+mcp = MCPServer("kamotrace", subscriptions=False, instructions="""\
 Search and annotate CloudTrail evidence held by a local, read-only KamoTrace browser.
 If Suzaku detections were imported, list_detections shows Sigma rules; filter with query.rules / min_level.
 Call describe_schema first for valid fields, operators, sort fields, page sizes and time bounds.

@@ -591,6 +591,33 @@ class BrowserContract(unittest.TestCase):
             with self.subTest(transport=str(transport)):
                 anyio.run(session, transport)
 
+    def test_mcp_http_get_declines_optional_event_stream(self):
+        for accept in ("*/*", "text/event-stream", "application/json"):
+            with self.subTest(accept=accept):
+                request = Request(self.url + "/mcp", headers={"Accept": accept})
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request, timeout=2)
+                with raised.exception as response:
+                    self.assertEqual(response.code, 405)
+                    self.assertEqual(response.headers["Allow"], "POST, DELETE")
+                    self.assertEqual(response.read(), b"")
+        for headers in ({"Host": "evil.example"}, {"Origin": "https://evil.example"}):
+            self.assertEqual(self.call("/mcp", headers=headers)[0], 403)
+
+    def test_mcp_http_discovery_does_not_advertise_streaming_subscriptions(self):
+        status, response = self.call("/mcp", {
+            "jsonrpc": "2.0", "id": "discover", "method": "server/discover",
+            "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                  "io.modelcontextprotocol/clientInfo": {"name": "contract-test", "version": "1"},
+                                  "io.modelcontextprotocol/clientCapabilities": {}}},
+        }, headers={"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2026-07-28",
+                    "MCP-Method": "server/discover"})
+        self.assertEqual(status, 200, response)
+        capabilities = response["result"]["capabilities"]
+        for name in ("tools", "prompts", "resources"):
+            self.assertFalse(capabilities[name].get("listChanged", False), name)
+        self.assertFalse(capabilities["resources"].get("subscribe", False))
+
     def test_mcp_http_rejects_cross_site_requests_and_oversized_bodies(self):
         for headers in ({"Host": "evil.example"}, {"Origin": "https://evil.example"}):
             self.assertEqual(self.call("/mcp", {}, headers=headers)[0], 403)
