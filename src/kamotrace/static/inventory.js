@@ -1,6 +1,9 @@
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(`inventory-${id}`);
+  const params = new URLSearchParams(location.search);
+  const popout = params.get("view") === "aws-map";
+  const filterIds = ["search", "region", "kind", "assessment", "exposure"];
   const list = (value) => (Array.isArray(value) ? value : []);
   const str = (value) =>
     value == null
@@ -883,9 +886,21 @@
       options("assessment", statuses);
       $("content").hidden = false;
       $("open-explorer").hidden = false;
+      if (popout)
+        filterIds.forEach((id) => {
+          $(id).value = params.get(id) || "";
+        });
       renderCoverage();
       render();
       fitMap();
+      if (popout) {
+        const resource = list(data.resources).find(
+          (r) =>
+            str(r.id) === params.get("resource") &&
+            str(r.region) === params.get("resource-region"),
+        );
+        if (resource) inspect("resource", resource);
+      }
     } catch (error) {
       data = null;
       $("status").textContent =
@@ -943,6 +958,18 @@
   $("zoom-in").addEventListener("click", () => setZoom(zoom * 1.2));
   $("zoom-out").addEventListener("click", () => setZoom(zoom / 1.2));
   $("fit").addEventListener("click", fitMap);
+  $("pop-out").addEventListener("click", () => {
+    const url = new URL(location.pathname, location.origin);
+    url.searchParams.set("view", "aws-map");
+    filterIds.forEach((id) => {
+      if ($(id).value) url.searchParams.set(id, $(id).value);
+    });
+    if (selected && list(data?.resources).includes(selected)) {
+      url.searchParams.set("resource", str(selected.id));
+      url.searchParams.set("resource-region", str(selected.region));
+    }
+    window.open(url, "_blank", "noopener,noreferrer");
+  });
   $("fit-all").addEventListener("click", () => {
     const canvas = $("canvas");
     setZoom(
@@ -1027,5 +1054,11 @@
     redrawTables();
     $("open-explorer").focus({ preventScroll: true });
   });
-  window.kamotraceInventory = { show, hide, selectResource };
+  if (popout) {
+    document.body.classList.add("inventory-popout");
+    document.body.append(panel);
+    $("fit-all").after($("clear"));
+    document.title = "AWS map · KamoTrace";
+  }
+  window.kamotraceInventory = { show, hide, selectResource, popout };
 })();

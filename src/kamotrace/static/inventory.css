@@ -329,6 +329,57 @@
   max-height: 100%;
   box-sizing: border-box;
 }
+body.inventory-popout {
+  padding: 16px;
+  box-sizing: border-box;
+  height: 100vh;
+  overflow: hidden;
+  background: #fff;
+}
+body.inventory-popout > :not(#inventory-panel),
+.inventory-popout #inventory-panel > .inventory-heading,
+.inventory-popout #inventory-filters,
+.inventory-popout #inventory-pop-out,
+.inventory-popout #inventory-views {
+  display: none;
+}
+.inventory-popout #inventory-panel,
+.inventory-popout #inventory-content:not([hidden]),
+.inventory-popout .inventory-main,
+.inventory-popout #inventory-map-view:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.inventory-popout #inventory-panel {
+  height: 100%;
+  padding: 0;
+}
+.inventory-popout .inventory-workspace {
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
+}
+.inventory-popout .inventory-main {
+  overflow: auto;
+}
+.inventory-popout #inventory-canvas {
+  flex: 1;
+  height: auto;
+  min-height: 160px;
+  max-height: none;
+}
+.inventory-popout #inventory-inspector {
+  position: static;
+  max-height: 100%;
+  box-sizing: border-box;
+}
+.inventory-popout
+  #inventory-content:has(#inventory-map-view[hidden])
+  #inventory-views {
+  display: flex;
+}
 #inventory-topology {
   display: block;
   max-width: none;
