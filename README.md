@@ -197,6 +197,7 @@ filters, value counts and the timeline.
 
 - [User guide](docs/user-guide.md): browser controls, detections, enrichment, SSM and MCP tools.
 - [Data preparation](docs/preparation.md): downloads, permissions, S3 trails, imports and inventory.
+- [Components and design choices](docs/architecture.md): ownership, evidence boundaries, query flow and MCP transport.
 - [Troubleshooting](docs/user-guide.md#troubleshooting-and-limitations) and [known limitations](docs/BUGS.md).
 - [Development checks](docs/user-guide.md#verification) and [contributor guidance](AGENTS.md).
 

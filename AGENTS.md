@@ -7,85 +7,44 @@ HTTP server with static HTML/JavaScript, not a hosted service. Keep it simple;
 there is no frontend build or runtime Node dependency. Mobile compatibility is
 not a requirement.
 
-## Code map
+## Navigation and scope
 
-Package layout: `src/kamotrace/`, installed as the `kamotrace` command
-(`pyproject.toml`). Loading data and enrichment are CLI steps; the browser UI
-only reads them.
+Code lives in `src/kamotrace/`, with static frontend assets under `static/` and
+synthetic tests under `tests/`. Read [components and design choices](docs/architecture.md)
+for ownership boundaries and rationale; use the [user guide](docs/user-guide.md)
+and [preparation reference](docs/preparation.md) for usage. Keep component details
+in `docs/`; this file holds rules and recurring-mistake guardrails.
 
-- `cli.py`: `kamotrace auto | import | download | trailcheck | ssmcheck | get-suzaku | suzaku | get-dbip | enrich | serve | mcp` dispatcher.
-- `auto.py`: full-auto, rerunnable pipeline over the other modules (tools, download, import, enrich,
-  suzaku, serve). It holds no logic of its own beyond deciding per stage whether verified
-  completed work can be reused; never let it overwrite evidence or trust unpublished partials.
-  Derived sidecars are replaced only when positively identified, never over an input.
-  Every writer of a database or sidecar holds `importer.write_lock(output)` (`<stem>.lock`) through
-  validation, private staging (`importer.staging`) and publication (`importer.publish`); never
-  stage at, or delete, a predictable path.
-- `get_suzaku.py`: downloads the official Suzaku 3.x release for the platform,
-  verifies GitHub's published SHA-256, refuses unsafe archive paths, and installs
-  into `$KAMOTRACE_TOOLS` (default `~/.kamotrace/tools`), where `kamotrace suzaku`
-  finds it. Suzaku is fetched by the user at run time, never baked into the image.
-- `Dockerfile`: two-stage `uv sync --locked` image on Debian trixie (Suzaku's gnu
-  build needs glibc 2.39+). It sets `KAMOTRACE_BIND=0.0.0.0`; docs must always
-  publish `-p 127.0.0.1:PORT:PORT` with equal host/container ports.
-- `importer.py`: streaming CloudTrail JSON importer, canonical hashes and source
-  provenance (`build_info`). Refuses to overwrite existing evidence databases.
-- `suzaku.py`: runs or imports Suzaku 3.x `aws-ct-timeline -t duckdb` output into
-  a derived `<db>.detections.duckdb`, linked by exact eventID + region + event
-  time; also the server-side read-only loader. Never bundle Suzaku (AGPL-3.0).
-- `enrich.py`: offline IP enrichment from GeoLite2 `.mmdb` (via `maxminddb`)
-  and/or provider-neutral JSONL (schema in README) into `<db>.enrichment.duckdb`,
-  bound to the evidence identity; also the server-side priority-merging loader.
-  `.mmdb` files are matched by name case-insensitively (city/country, asn).
-  Never bundle geolocation data or download MaxMind databases (EULA, account);
-  never call online lookup services.
-- `get_dbip.py`: downloads the free DB-IP Lite City/ASN `.mmdb` release listed on
-  DB-IP's download pages, verifies the published SHA-1 of each decompressed file
-  and its `DBIP-` database type, and installs into `$KAMOTRACE_TOOLS/dbip-lite-YYYY-MM`.
-  Keep the CC BY 4.0 attribution in its output and docs.
-- `trailcheck.py`: read-only trail audit (Describe/Get/List only, never `GetObject`).
-  It keeps configured scope, logging/delivery state, observed S3 date prefixes and
-  verified days apart, and never claims complete logs from prefixes. Denied/failed is
-  unknown, never absent; S3 listing is bounded and caps are reported as truncated.
-- `server.py`: loopback HTTP endpoints, allowlisted parameterized DuckDB queries,
-  enrichment, detections, and SQLite annotation/tag persistence.
-- `ssm.py`: local SSM export loading, account/region/command joins, separate
-  system/plugin outputs, and command/spreadsheet query endpoints.
-- `ssmcheck.py`: read-only, bounded (`--max-items`) per-region report of where SSM
-  session and Run Command output is configured to go: Session Manager preferences,
-  session document types, observed sessions/commands, associations and
-  maintenance-window tasks. Keep configured, not_configured, observed, denied/error
-  and truncated states distinct; never treat history as a default, read output
-  payloads or report parameter values or caller ARNs.
-- `mcp_server.py`: HTTP/stdio MCP adapter (official `mcp` SDK). It owns no database or
-  sidecar handle; every tool calls `server.py`'s loopback REST endpoints, so the
-  browser and agents share one Store, its validation and its review temp tables.
-  Add capabilities to `server.py`/`ssm.py` first; keep the adapter a thin mapping.
-  Write tools take explicit `record_sha256` lists, never a whole query.
-- `skills/investigating-with-kamotrace/SKILL.md`: the end-user agent skill for
-  the MCP tools. When a tool, argument, operator, error message or identity rule
-  changes, update the skill too, and recheck its examples through a real MCP session.
-- `static/app.js`, `app.css`, `index.html`: desktop UI. Reuse the vendored
-  Tabulator grid and noUiSlider rather than introducing a framework. The UI calls
-  notes **Findings** (evidence-linked observations, not necessarily confirmed)
-  and keeps **Event tags** separate; the API, sidecar and MCP keep note/annotation
-  names. The left sidebar collapses to a persistent tag rail, never disappears.
-- `static/vendor/`: unmodified third-party assets and their licenses.
-- `tests/test_contract.py`: synthetic end-to-end HTTP contract tests using real
-  DuckDB, a real stdio MCP client session, and Suzaku import/linkage.
-- `README.md`: human installation, usage, storage and safety documentation.
+Reuse existing stage implementations, the shared REST/Store query and write paths,
+and vendored Tabulator/noUiSlider. Do not introduce a parallel query engine or
+modify third-party assets under `static/vendor/`. Keep documentation and the
+[investigation skill](skills/investigating-with-kamotrace/SKILL.md) aligned with
+public interface changes; recheck changed skill examples through a real MCP session.
 
 ## Evidence and security contracts
 
 - Open the CloudTrail database read-only. Temporary tables/views are allowed;
   investigator annotations/tags belong in the separate SQLite sidecar.
+- Never overwrite original evidence or inputs. Hold `importer.write_lock(output)`
+  through validation, private `staging()` and `publish()` for database/sidecar writes.
+  Replace only positively identified derived outputs; never trust a partial file
+  merely because it exists, or stage at/delete a predictable temporary path.
 - KamoTrace's own model is authoritative: original records and canonical hashes.
   Suzaku detections are derived, read-only leads linked to records; never merge
-  them into the evidence database, never link by guesses (time-only, IP), and
-  keep unmatched/ambiguous Suzaku rows counted but unattached.
+  them into evidence or link by time/IP guesses. Keep unmatched/ambiguous rows
+  counted but unattached. GuardDuty associations are contextual, not exact matches.
 - IP enrichment is a labelled lookup about addresses, not evidence: keep it in
   its own sidecar with per-source provenance, and keep the JSONL schema
-  provider-neutral (provider-specific values go in `attributes`).
+  provider-neutral (provider-specific values go in `attributes`). Keep enrichment
+  offline; never call online lookup services.
+- Configuration snapshots are not incident-time observations or effective-access
+  calculations. Keep configured, observed, absent and unknown distinct: denied,
+  failed, partial or uncollected data is not absence. Report truncation and coverage
+  gaps; neither date prefixes nor an event-time extent proves complete logs.
+- Keep AWS audits read-only and bounded. `trailcheck` never reads object bodies;
+  `ssmcheck` never reads output payloads or reports parameter values/caller ARNs.
+  Browsing never triggers AWS/DNS/network lookups. Do not bundle Suzaku or geolocation
+  data, download MaxMind databases, or remove DB-IP Lite's CC BY 4.0 attribution.
 - SSM command/output data is currently JSON-backed in memory, not persistent
   DuckDB tables. Do not describe it as imported into DuckDB.
 - Preserve raw JSON numeric precision and canonical record hashes. Never use
@@ -110,10 +69,22 @@ only reads them.
 - Keep loopback binding, Host/Origin checks, CSP, parameter binding and sort/field
   allowlists. Do not introduce an arbitrary-SQL, arbitrary-path or network-fetch
   endpoint. Server startup paths come from CLI arguments, not browser requests.
+- Docker examples must publish `-p 127.0.0.1:PORT:PORT` with equal host/container
+  ports; a wildcard container bind is not permission to expose this unauthenticated app.
 - Displayed time and bucket boundaries use the selected IANA timezone (default UTC); ranges are
   start-inclusive/end-exclusive. Counts, sorting and prevalence apply to the
   entire filtered selection, not just loaded rows. SSM search matches commands
   and keeps their system/plugin results together.
+- Preserve all query restrictions across rows, summaries, histograms, saved queries
+  and MCP. OR must not escape external scopes; legacy tag/rule arrays remain all-of.
+  Follow the [pipeline contract](docs/pipeline-language-v1.md), not a second interpretation.
+- Keep drafts separate from applied results. Stale asynchronous responses must not
+  overwrite newer edits; errors must not silently relax filters or present old
+  results as matching the failed query. Preserve recovery controls in simplified views.
+- Initial reference cards must not launch historical scans; expensive history is
+  explicit optional work, and **not searched** is not **no activity**.
+- The UI calls notes **Findings** and keeps **Event tags** separate. The collapsed
+  sidebar remains a usable tag rail, not a hidden panel.
 - Never commit real exports, databases, enrichment, investigator notes, secrets,
   or screenshots containing real evidence. Use synthetic fixtures. Keep private
   files outside this repository or in ignored `data/`; inspect staged files.
@@ -137,11 +108,14 @@ For formatting changed frontend files, use the existing Prettier style:
 npx --yes prettier@3.6.2 --write src/kamotrace/static/app.js src/kamotrace/static/app.css src/kamotrace/static/index.html
 ```
 
-Add public HTTP contract coverage to `tests/test_contract.py` for behavior changes.
-Use asymmetric multi-system/plugin fixtures and both sides of time boundaries.
-Tests must never write to real evidence. For UI changes, render the affected
-desktop states, exercise interactions and inspect screenshots; syntax checks
-alone are not visual verification. Use synthetic data for review artifacts.
+Test changes through the affected public interface: collector/CLI tests for
+preparation, HTTP contracts for REST, real client sessions for MCP, and browser
+interactions for UI behavior. Unittest discovery does not run browser smoke;
+follow the [browser-check instructions](docs/user-guide.md#run-the-browser-check-locally)
+and CI's dependency pin. Use asymmetric multi-system/plugin fixtures and both
+sides of time boundaries. For UI changes, render affected desktop states,
+exercise interactions and inspect screenshots; syntax checks alone are not
+visual verification. Tests and review artifacts must use synthetic evidence.
 
 The surrounding investigation workspace may have a separately configured copy
 of this app. Repository defaults must stay portable: no account IDs, incident

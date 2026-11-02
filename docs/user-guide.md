@@ -4,6 +4,8 @@
 
 Use this guide to investigate CloudTrail events, add supporting data and save
 findings. For a first-time setup, [start with the README](../README.md#get-started).
+For implementation responsibilities and rationale, see
+[components and design choices](architecture.md).
 
 ## Contents
 
@@ -14,6 +16,7 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 - [Check trails and S3 log coverage](#cloudtrail-trail-check)
 - [Run KamoTrace in Docker](#docker)
 - [Add Suzaku detections](#suzaku-detections)
+- [Add GuardDuty context](#guardduty-context)
 - [Add offline IP enrichment](#ip-enrichment)
 - [Browse AWS inventory and map](#aws-inventory-and-map)
 - [Record findings and tag events](#findings-and-event-tags)
@@ -150,6 +153,11 @@ inspector together in a full-window dialog. Close it or press Escape to return;
 filters and selection are retained. Drag the map background to pan, scroll to
 zoom around the pointer, or focus the map and use + / −. **Reset** (or Home)
 returns to a width-fitting overview; **Fit all** fits the entire topology.
+Choose **Pop out map ↗** beside **Fit all** to open only the map and inspector
+in a separate tab/window. It starts with the current filters and selected
+resource, if any; subsequent changes are independent of the original tab.
+Use **Clear filters** in the pop-out toolbar if the inherited filters hide
+the systems you want to inspect. Browser settings determine tab versus window.
 Load balancers occupy the first VPC column, with other systems to their right.
 Service icons identify resource types; labelled status dots distinguish
 configuration assessments. Selected nodes use a blue outline.
@@ -322,12 +330,13 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | --- | --- |
 | `kamotrace auto CASE_FOLDER [options]` | [Full-auto](#full-auto-preparation): tools, AWS download, import, enrichment, detections, then `serve`; rerun to resume |
 | `kamotrace import --source FILE_OR_FOLDER... --database NEW.duckdb` | Combine CloudTrail JSON/gzip exports; repeat `--source`, or use `-` for binary stdin |
-| `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume CloudTrail/SSM collection with an existing AWS login; optional gzip output |
-| `kamotrace inventory [--output FOLDER] [--emit-policy PATH\|-]` | [Current network inventory](#aws-inventory-and-map); policy-only mode without `--output` makes no AWS calls |
+| `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume selected CloudTrail, SSM, GuardDuty or inventory collection with an existing AWS login; CloudTrail/SSM by default |
+| `kamotrace inventory [--output FOLDER] [--emit-policy PATH\|-]` | [Current network and IAM inventory](#aws-inventory-and-map); policy-only mode without `--output` makes no AWS calls |
 | `kamotrace policy [--output PATH\|-] [--bucket NAME]... [--kms-key ARN]... [--validate \| --validate-file PATH]` | [Combined collection policy](preparation.md#aws-collection-iam-policy) for CloudTrail, SSM and inventory; offline generation, optional AWS IAM Access Analyzer validation |
 | `kamotrace trailcheck [--regions all] [--json PATH\|-] [--emit-policy PATH\|-] [--max-items N] [--max-s3-calls N] [--probe-buckets]` | [Read-only audit](#cloudtrail-trail-check) of trails, logging/delivery state, S3 destinations and observed log dates |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
 | `kamotrace suzaku --database DB (--source FILE [--suzaku EXE] \| --timeline FILE)` | Run or import Suzaku detections into `<database>.detections.duckdb` |
+| `kamotrace guardduty --database DB --findings FILE [--output PATH] [--replace]` | Import [contextual GuardDuty leads](#guardduty-context) into a separate sidecar |
 | `kamotrace get-dbip [--dest FOLDER]` | Download and verify the free DB-IP Lite City and ASN databases (CC BY 4.0, no account) |
 | `kamotrace enrich --database DB (--geolite2 FOLDER \| --jsonl FILE)...` | Add offline IP enrichment into `<database>.enrichment.duckdb` |
 | `kamotrace serve --database DB [options]` | Start the browser UI on `127.0.0.1` |
@@ -344,15 +353,18 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `--enrichment PATH` | IP enrichment sidecar from `kamotrace enrich` | `<database stem>.enrichment.duckdb` if present; otherwise special-use addresses are classified and other countries show as unmapped |
 | `--annotations PATH` | Notes and tags SQLite sidecar | `<database stem>.annotations.sqlite3` |
 | `--detections PATH` | Suzaku detections sidecar | `<database stem>.detections.duckdb` if present |
+| `--guardduty PATH` | GuardDuty contextual-lead sidecar | `<database stem>.guardduty.duckdb` if present |
 | `--ssm-export PATH` | Consolidated SSM command/output JSON | None; optional |
+| `--inventory-export FOLDER` | Current network/IAM inventory export containing `report.json` | None; optional |
 | `--port NUMBER` | Local listening port | `8765` |
 | `--mcp-transport http\|stdio` | Serve MCP at `/mcp`, or print local stdio adapter setup commands; also accepted by `auto` | `http` |
 | `--bind ADDRESS` | Listening address; only for containers (see [Docker](#docker)) | `127.0.0.1` (`0.0.0.0` in the image) |
+| `--log-level debug\|info\|warning\|error` | Application logging; see [request diagnostics](#investigating-slow-requests) | `info`, or `$KAMOTRACE_LOG_LEVEL` |
 
 Paths are relative to your terminal's current folder unless absolute. Quote
 paths containing spaces. The evidence database and any explicitly supplied
-enrichment, detections or SSM input files must exist. The server creates the
-annotations file if needed.
+enrichment, detections, GuardDuty or SSM input files must exist; an inventory
+export must be an existing folder. The server creates the annotations file if needed.
 
 For example, load an SSM export alongside the evidence database:
 
@@ -360,9 +372,9 @@ For example, load an SSM export alongside the evidence database:
 kamotrace serve --database "C:\evidence\case.duckdb" --ssm-export "C:\evidence\ssm_command_session_activity.enriched.json"
 ```
 
-The server never calls external services. Detections and IP enrichment sidecars
-beside the database are picked up automatically. Changing enrichment, detections
-or the SSM export requires restarting the server.
+The server never calls external services. Suzaku, GuardDuty and IP enrichment
+sidecars beside the database are picked up automatically. Changing a sidecar,
+the inventory snapshot or the SSM export requires restarting the server.
 
 Only code, synthetic tests and third-party browser assets belong in this
 repository. Databases, `event_history*.json`, enrichment JSONL, `.mmdb` files and
@@ -371,7 +383,8 @@ the `data/` directory are gitignored; keep evidence outside the repository.
 ## Full-auto preparation
 
 `kamotrace auto CASE_FOLDER` prepares a whole case with one command. It runs the
-other commands' code in dependency order, printing `[N/7 stage]` progress to stderr:
+other commands' code in dependency order, printing `[N/9 stage]` progress to stderr
+(including skipped stages):
 
 | Stage | Default | Override or skip |
 | --- | --- | --- |
@@ -381,7 +394,9 @@ other commands' code in dependency order, printing `[N/7 stage]` progress to std
 | 4. `import` | `CASE_FOLDER/case.duckdb` from `cloudtrail.json[.gz]` | `--database` |
 | 5. `enrich` | `<database stem>.enrichment.duckdb` from DB-IP Lite | as stage 2 |
 | 6. `suzaku` | `<database stem>.detections.duckdb`, running Suzaku on the imported CloudTrail file | `--rules`, `--min-level` |
-| 7. `serve` | `127.0.0.1:8765`, with the downloaded SSM export | `--port`, `--ssm-export FILE` (with existing data), `--no-serve` |
+| 7. `guardduty` | Skipped unless findings were collected or supplied; writes `<database stem>.guardduty.duckdb` | Include `guardduty` in `--services`, or pass `--guardduty-findings FILE` for existing JSON |
+| 8. `inventory` | Current network/IAM snapshot in `CASE_FOLDER/inventory` for online runs; reuses `download/inventory` when collected there; offline runs do not collect | `--inventory-export FOLDER`, `--skip-inventory` (omit `inventory` from `--services` too) |
+| 9. `serve` | `127.0.0.1:8765`, with prepared sidecars, SSM export and inventory | `--port`, `--mcp-transport http\|stdio`, `--ssm-export FILE` (with existing data), `--no-serve` |
 
 The tools folder defaults to `$KAMOTRACE_TOOLS` or `~/.kamotrace/tools`
 (`--tools`), so installed tools are shared between cases. Tools are set up
@@ -426,18 +441,24 @@ command**. Each stage checks what already exists:
   named `.<name>.staging`, since a later stage could remove it.
 - **Enrichment and detections** are derived sidecars, written atomically.
   They are reused only if they are bound to this evidence database. Enrichment
-  must also have the same source files and hashes. Detections must have the same
-  CloudTrail input and the same Suzaku executable, rules, config and
+  must also have the same source files and hashes. Suzaku detections must have
+  the same CloudTrail input and the same executable, rules, config and
   `--min-level` (or the same `--timeline` hash). Otherwise they are rebuilt.
   Rules updated in place in Suzaku's own `rules` folder count as a change.
+  GuardDuty context is reused only with the same findings-file hash and evidence
+  identity; changed findings rebuild that derived sidecar, not the evidence.
   To force a rebuild anyway, pass `--rebuild-sidecars`.
   A file at a sidecar path that is not that kind of KamoTrace sidecar is never
   replaced, and no output may be one of the inputs: move it or pick another `--database`.
   Each output is checked again just before publication; without `--replace`
   publication never overwrites a file that appeared meanwhile.
-- One process at a time writes each output: `auto`, `import`, `enrich` and
-  `suzaku` lock every path they publish with `<output stem>.lock` beside it
-  (`auto` locks the database and both sidecars). A second writer of the same
+- **Inventory** is reused only as a verified completed snapshot with matching
+  scope. Existing incomplete or mismatched destinations are refused, not
+  overwritten. Use a new case folder for fresh configuration, or explicitly
+  attach an existing snapshot with `--inventory-export`.
+- One process at a time writes each output: database/sidecar preparation commands,
+  including `guardduty`, lock their outputs with `<output stem>.lock` beside them
+  (`auto` locks the database and derived sidecars). A second writer of the same
   database or sidecar, even from another case folder or with a custom
   `--output`, stops with a "being prepared by another KamoTrace process" error.
   Locks are released when the UI starts and if the process dies.
@@ -717,6 +738,50 @@ click it for the full rule list. The inspector lists an event's detections too.
 A correlation rule appears on each of its member events. A note saved by an
 agent with a minimum level reopens with a removable `Sigma ≥ <level>` scope.
 Detections are automated leads: tag events or record a finding about what you observe.
+
+## GuardDuty context
+
+GuardDuty findings are optional, contextual leads alongside Suzaku detections.
+To collect them during preparation, opt in explicitly:
+
+```powershell
+kamotrace auto C:\cases\example-gd --profile investigation --services cloudtrail ssm guardduty
+```
+
+Or collect and import findings against an existing evidence database:
+
+```powershell
+kamotrace download --dest C:\cases\gd-export --profile investigation --regions all --services guardduty
+kamotrace guardduty --database C:\cases\example\case.duckdb --findings C:\cases\gd-export\guardduty.json
+```
+
+The importer also accepts an AWS `GetFindings` object with a `Findings` array,
+or a bare findings array, without AWS access. For offline auto preparation, pass
+`--guardduty-findings FILE` alongside `--source`. The default output is
+`<database stem>.guardduty.duckdb`; `--output PATH` changes it. `--replace` rebuilds
+only a recognised GuardDuty sidecar, never the original evidence. Restart
+`serve` to load it automatically, or select a custom path with `--guardduty PATH`.
+
+The **Detections** tab includes **GuardDuty context (not exact)** leads. Select
+them like other Leads; pipeline predicates use `lead`, and MCP uses `query.rules`
+or `query.min_level`. An association requires the finding's account to match
+`userIdentity.accountId`, region, exact access key and event time within
+`[EventFirstSeen, EventLastSeen)`. This does **not** establish that GuardDuty
+detected that particular CloudTrail event. Missing keys/times, zero-length
+intervals and unsupported resources stay unlinked, never guessed from IPs.
+All findings remain in the source and sidecar. Linked raw finding JSON is
+available in event details and MCP `get_event`, separately from CloudTrail JSON.
+
+Collection requires `guardduty:ListDetectors`, `guardduty:ListFindings` and
+`guardduty:GetFindings` in addition to the default generated collection policy,
+plus normal STS identity and EC2 Region discovery access when using `--regions all`.
+It never enables or changes detectors. Archived findings are included; GuardDuty
+generally retains findings for 90 days. `--start`/`--end` filter finding
+**updatedAt**, not activity time. Omit them for retained findings through collection
+start. No enabled detector and a successful empty result are reported separately;
+denied calls fail collection rather than report no findings. Checkpoints resume
+the original snapshot, not a live refresh; use a new destination to collect again.
+`--compress` does not compress `guardduty.json`. Keep exports private.
 
 ## IP enrichment
 
@@ -1288,8 +1353,11 @@ For each region it checks:
 Read the states literally:
 
 - `configured` / `not_configured`: the API answered, and the setting is set or
-  absent. A region without the preferences document has never saved
-  Session Manager preferences, so shell sessions there are not logged.
+  absent. A missing regional preferences document means there is no logging
+  configuration from that document, not that every shell session is unlogged:
+  custom `Standard_Stream` session documents can supply their own logging inputs.
+  Check the document's `content_logging` basis and destinations as well as the
+  regional preferences. Neither establishes historical delivery or retention.
 - `observed`: what recent executions did. Run Command has **no regional output
   default**: each sender chooses a destination. Observed commands never prove
   what future commands will log.
@@ -1334,17 +1402,10 @@ and holds no database handle.
 Every tool calls the already running browser server's REST API on loopback, so
 the browser and agents share one authoritative state: the same read-only
 evidence connection, the same validation, and the same notes/tags sidecar.
-
-```text
-agent client -- HTTP --> /mcp ---------> loopback REST API
-agent client -- stdio -> kamotrace mcp -> loopback REST API
-browser tab --------------------------> loopback REST API
-                                              |
-                                        one shared Store
-                                              |
-                         evidence/detections DuckDB (read-only)
-                         notes/tags SQLite sidecar (writable)
-```
+The HTTP endpoint uses stateless JSON responses, not a persistent event stream;
+GET `/mcp` returns 405 by design. See
+[MCP transport and shared state](architecture.md#mcp-transport-and-shared-state)
+for the bridge's design and subscription limitations.
 
 ### Connect your client
 
@@ -1422,17 +1483,20 @@ changed the note since, the call fails without writing; re-read it and retry.
 
 | Tool | What it does |
 | --- | --- |
-| `describe_schema` | Filter fields, operators, sort fields, page sizes, facet values, supported IANA timezones, time bounds and tags. Takes `timezone` (default `UTC`). Call first. |
-| `search_events` | `query` (search, filters, all-of tags, note, SSM command, start/end) plus sort, page and size. Returns the full filtered total and one page with hashes, tags and note IDs. |
+| `describe_schema` | Filter fields, operators, `pipeline_fields` and version, sort fields, page sizes, facet values, supported IANA timezones, time bounds and tags. Takes `timezone` (default `UTC`). Call first. |
+| `search_events` | `query` (search, filters, `pipeline`/`pipeline_version`, all-of tags/rules, minimum level, note, SSM command, start/end and timezone) plus sort, page and size. Returns the full filtered total and one page with hashes, tags and note IDs. External query properties AND with the whole pipeline. |
 | `summarize_field` | Top/bottom five values, distinct count and total for a field across the whole filtered result. |
 | `event_histogram` | Counts per `query.timezone`-aligned bucket (empty buckets included, at most 2,000), with epoch-millisecond boundaries. |
-| `get_event` | Exact stored raw JSON by `id`, its `record_sha256`, a recomputed hash check, and linked SSM commands. |
+| `get_event` | Exact stored raw JSON by `id`, its `record_sha256`, a recomputed hash check, linked SSM commands and separate linked GuardDuty finding JSON. |
 | `list_tags` / `tag_events` / `untag_events` | Tags with event counts; add or remove one tag on explicit hashes. Adding is additive and keeps an existing tag's colour (new tags default to the browser's colour). |
 | `list_notes` / `get_note` | Notes (searchable), with linked event counts and the query they were written from; one note plus a page of its linked events. `get_note` takes `timezone` (default `UTC`) for those events. |
 | `create_note` / `edit_note` / `delete_note` | Markdown notes (sanitised when the browser renders them). `create_note` can record the agent's query so **Reopen query** works in the browser. |
 | `link_note_events` / `unlink_note_events` | Add or remove linked events; a note keeps at least one. |
-| `list_detections` | Imported Suzaku rules (severity, ATT&CK tags, linked event counts) and the import's provenance. Takes no arguments; to search a rule's events use `query.rules` (all must match) or `query.min_level` in `search_events`, `summarize_field` or `event_histogram`. |
+| `list_detections` | Suzaku rules and labelled GuardDuty contextual leads, with linked event counts and separate provenance. `run` is null without Suzaku; `guardduty` is null without GuardDuty. Takes no arguments; filter events using `query.rules` (all must match) or `query.min_level` in `search_events`, `summarize_field` or `event_histogram`. GuardDuty context is not an exact event match. |
 | `search_ssm_commands` / `get_ssm_command` / `get_ssm_event` | SSM commands from the JSON-backed export, each system/plugin output kept separate, linked CloudTrail events by exact account/region/command ID. |
+| `search_ssm_log` | Oldest-first activity entries, 100 per page, with literal search, raw/enhanced/both scope and start/end bounds. Pass page 1's `revision` for later pages of non-empty both/enhanced searches; restart at page 1 if stale. |
+| `get_ssm_log_entry` | One current entry and its saved analyst review by exact `entry_id`, independent of the current search. Use to re-read after an edit conflict. |
+| `edit_ssm_log_entry` | Save an explicit entry's interpretation text, entry tags and entry finding using its current `updated` stamp (null for a new review). Stale writes fail; raw evidence and event tags/findings are not changed. |
 
 ### Set query times and treat results as untrusted
 
@@ -1477,14 +1541,18 @@ To scope it to one case instead, put it in that case folder's
 | CloudTrail events and provenance | Imported DuckDB file | No; opened read-only |
 | Annotations, event links and coloured tags | `<evidence-stem>.annotations.sqlite3` (or `--annotations`) | Yes (browser and MCP agents, through the same server) |
 | Suzaku detections and their provenance | `<evidence-stem>.detections.duckdb` (or `--detections`), written by `kamotrace suzaku` | No; read-only, rebuilt from Suzaku output |
+| GuardDuty findings, contextual links and provenance | `<evidence-stem>.guardduty.duckdb` (or `--guardduty`), written by `kamotrace guardduty` | No; read-only, derived from finding JSON |
+| Current network/IAM configuration and coverage | Inventory export folder (passed with `--inventory-export`), including raw responses, report and manifest | No; loaded at startup |
 | SSM commands, outputs and enrichment | Original JSON export, loaded into memory | No; **not imported into persistent DuckDB tables** |
 | IP enrichment and its provenance | `<evidence-stem>.enrichment.duckdb` (or `--enrichment`), written by `kamotrace enrich` | No; read-only, rebuilt from DB-IP/GeoLite2 `.mmdb` and/or JSONL; no online lookups |
 | SSM-to-CloudTrail query links | Temporary DuckDB table | Memory only; rebuilt on startup |
 
 Stop the server before backing up the annotation sidecar. Keep it with the exact
 evidence database it describes, plus the source exports and enrichment cache.
-The app does not collect AWS data or refresh exports: replace/update local files
-and restart to reload them. It does not fetch output URLs or run shell commands.
+The running browser server does not collect AWS data or refresh exports: prepare
+new data with the CLI and restart to reload it. It does not fetch output URLs
+or run shell commands. See [evidence and state ownership](architecture.md#evidence-derived-context-and-investigator-state)
+for why these files remain separate.
 
 ## Troubleshooting and limitations
 
@@ -1669,4 +1737,5 @@ and tool downloads: a target-only run that fails mid-collection, resumes with th
 same frozen range, then reruns as a no-op; stage failures, refreshed sidecars,
 refusal of different evidence and of concurrent runs.
 They never modify the real CloudTrail evidence database. For contributor
-architecture and evidence-handling rules, see [AGENTS.md](../AGENTS.md).
+ownership and design rationale, see [components and design choices](architecture.md);
+for safety and recurring-mistake guardrails, see [AGENTS.md](../AGENTS.md).
