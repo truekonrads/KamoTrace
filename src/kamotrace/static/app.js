@@ -2662,8 +2662,7 @@ function renderNotes() {
       if (expandedNotes.has(note.id)) {
         const body = document.createElement("div");
         body.className = "markdown";
-        // The card heading already shows the first line; render the rest.
-        markdown(body, note.body.replace(/^\s*[^\n]*\n?/, ""));
+        markdown(body, note.body);
         const actions = document.createElement("div");
         actions.className = "note-actions";
         const action = (label, handler, title) => {
@@ -4134,6 +4133,49 @@ async function init() {
   };
   $("note-body").oninput = () =>
     markdown($("note-preview"), $("note-body").value);
+  for (const button of document.querySelectorAll("#note-toolbar button")) {
+    button.onclick = () => {
+      const editor = $("note-body");
+      let start = editor.selectionStart;
+      let end = editor.selectionEnd;
+      const block = button.dataset.block;
+      if (block) {
+        start = start === 0 ? 0 : editor.value.lastIndexOf("\n", start - 1) + 1;
+        if (end > start && editor.value[end - 1] === "\n") end--;
+        const lineEnd = editor.value.indexOf("\n", end);
+        end = lineEnd === -1 ? editor.value.length : lineEnd;
+      }
+      const selected = editor.value.slice(start, end);
+      const prefix = button.dataset.prefix;
+      const suffix = button.dataset.suffix || "";
+      const text = selected || button.dataset.placeholder;
+      const before = block && start > 0 ? "\n" : "";
+      const after = block && end < editor.value.length ? "\n" : "";
+      const formatted = block
+        ? text
+            .split("\n")
+            .map(
+              (line, i) => (block === "ordered" ? `${i + 1}. ` : prefix) + line,
+            )
+            .join("\n")
+        : prefix + text + suffix;
+      const replacement = before + formatted + after;
+      if (
+        editor.value.length - (end - start) + replacement.length >
+        editor.maxLength
+      )
+        return;
+      editor.setRangeText(replacement, start, end, "select");
+      editor.focus();
+      editor.setSelectionRange(
+        start + before.length + (block ? 0 : prefix.length),
+        start +
+          before.length +
+          (block ? formatted.length : prefix.length + text.length),
+      );
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+  }
   $("save-note").onclick = async () => {
     try {
       const result = await request(

@@ -972,12 +972,83 @@
       <label for="note-body"
         >Finding (Markdown; the first line is its title)</label
       >
+      <div id="note-toolbar" role="group" aria-label="Markdown formatting">
+        <button
+          type="button"
+          data-prefix="**"
+          data-suffix="**"
+          data-placeholder="bold text"
+          title="Bold selected text"
+        >
+          Bold
+        </button>
+        <button
+          type="button"
+          data-prefix="_"
+          data-suffix="_"
+          data-placeholder="italic text"
+          title="Italicize selected text"
+        >
+          Italic
+        </button>
+        <button
+          type="button"
+          data-prefix="`"
+          data-suffix="`"
+          data-placeholder="code"
+          title="Format selected text as inline code"
+        >
+          Code
+        </button>
+        <button
+          type="button"
+          data-prefix="["
+          data-suffix="](https://example.com)"
+          data-placeholder="link text"
+          title="Insert a link; replace the example URL"
+        >
+          Link
+        </button>
+        <button
+          type="button"
+          data-block="heading"
+          data-prefix="## "
+          data-placeholder="Heading"
+          title="Make selected lines level-two headings"
+        >
+          Heading
+        </button>
+        <button
+          type="button"
+          data-block="unordered"
+          data-prefix="- "
+          data-placeholder="List item"
+          title="Make selected lines a bulleted list"
+        >
+          Bulleted list
+        </button>
+        <button
+          type="button"
+          data-block="ordered"
+          data-prefix="1. "
+          data-placeholder="List item"
+          title="Make selected lines a numbered list"
+        >
+          Numbered list
+        </button>
+      </div>
       <textarea
         id="note-body"
         maxlength="30000"
         rows="7"
+        aria-describedby="note-help"
         placeholder="What did you observe? Use **bold**, lists, links or code."
       ></textarea>
+      <p id="note-help" class="hint">
+        Select text to format it, or write Markdown directly: # heading, - list
+        item, &gt; quote, and triple backticks for a code block. HTML is
+        sanitized.
+      </p>
       <h3>Preview</h3>
       <div id="note-preview" class="markdown"></div>
       <button id="save-note" class="primary">Save finding</button>
