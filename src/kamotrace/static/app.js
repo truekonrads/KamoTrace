@@ -4715,7 +4715,10 @@ async function init() {
   });
 })();
 
-init().catch((e) => {
+(window.kamotraceInventory.popout
+  ? window.kamotraceInventory.show()
+  : init()
+).catch((e) => {
   setLoading();
   error(e.message);
 });
