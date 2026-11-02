@@ -143,6 +143,14 @@ def collect_iam(session, regions, out):
               "profiles": profiles, "errors": errors, "raw_directory": raw.relative_to(out).as_posix()}
     # Authorization details include inline documents, group memberships, trust policies,
     # boundaries and every customer-managed version, without fetching AWS policy documents.
+    def pages(operation, **params):
+        responses = (client.get_paginator(operation).paginate(**params) if client.can_paginate(operation)
+                     else [getattr(client, operation)(**params)])
+        label = params.get("UserName") or params.get("AccessKeyId") or "account"
+        for number, page in enumerate(responses, 1):
+            write_json(raw / operation / label / f"{number:05}.json", page)
+            yield page
+
     for operation, params, fields in [
         ("get_account_authorization_details", {"Filter": ["User", "Role", "Group", "LocalManagedPolicy"]},
          {"UserDetailList": "users", "RoleDetailList": "roles", "GroupDetailList": "groups", "Policies": "policies"}),
@@ -151,12 +159,62 @@ def collect_iam(session, regions, out):
         for field in fields.values():
             result[field] = []
         try:
-            for number, page in enumerate(client.get_paginator(operation).paginate(**params), 1):
-                write_json(raw / operation / f"{number:05}.json", page)
+            for page in pages(operation, **params):
                 for key, field in fields.items():
                     result[field].extend(page.get(key, []))
         except Exception as exc:
             errors.append({"region": "global", "operation": f"iam.{operation}", "error": str(exc)})
+    users = {user["Arn"]: user for user in result["users"]}
+    changed_users = set()
+    for user in users.values():
+        user["activity"] = {"console_status": "unknown", "access_keys_status": "unknown", "access_keys": [],
+                            "mfa_status": "unknown", "mfa_devices": [], "login_profile_status": "unknown"}
+    try:
+        for page in pages("list_users"):
+            for listed in page.get("Users", []):
+                user = users.get(listed["Arn"])
+                if user is None:
+                    continue
+                if listed["UserId"] != user["UserId"]:
+                    changed_users.add(listed["Arn"])
+                    errors.append({"region": "global", "operation": "iam.list_users", "resource": listed["Arn"],
+                                   "error": "User identity changed during collection; console activity is unknown"})
+                    continue
+                user["activity"].update(console_status="collected", password_last_used=listed.get("PasswordLastUsed"))
+    except Exception as exc:
+        errors.append({"region": "global", "operation": "iam.list_users", "error": str(exc)})
+    for user in users.values():
+        activity = user["activity"]
+        if user["Arn"] in changed_users:
+            continue
+        try:
+            for page in pages("list_access_keys", UserName=user["UserName"]):
+                for key in page.get("AccessKeyMetadata", []):
+                    entry = {**key, "last_used_status": "unknown"}
+                    activity["access_keys"].append(entry)
+                    try:
+                        for response in pages("get_access_key_last_used", AccessKeyId=key["AccessKeyId"]):
+                            entry.update(last_used_status="collected", last_used=response.get("AccessKeyLastUsed", {}))
+                    except Exception as exc:
+                        errors.append({"region": "global", "operation": "iam.get_access_key_last_used",
+                                       "resource": key["AccessKeyId"], "error": str(exc)})
+            activity["access_keys_status"] = "collected"
+        except Exception as exc:
+            errors.append({"region": "global", "operation": "iam.list_access_keys", "resource": user["Arn"], "error": str(exc)})
+        try:
+            for page in pages("list_mfa_devices", UserName=user["UserName"]):
+                activity["mfa_devices"].extend(page.get("MFADevices", []))
+            activity["mfa_status"] = "collected"
+        except Exception as exc:
+            errors.append({"region": "global", "operation": "iam.list_mfa_devices", "resource": user["Arn"], "error": str(exc)})
+        try:
+            for response in pages("get_login_profile", UserName=user["UserName"]):
+                activity.update(login_profile_status="collected", login_profile=response["LoginProfile"])
+        except Exception as exc:
+            if isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                activity["login_profile_status"] = "not_configured"
+            else:
+                errors.append({"region": "global", "operation": "iam.get_login_profile", "resource": user["Arn"], "error": str(exc)})
     result["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
     write_json(out / "iam.json", result)
     print(f"IAM: {len(result['users'])} users, {len(result['roles'])} roles, {len(result['policies'])} customer policies, "

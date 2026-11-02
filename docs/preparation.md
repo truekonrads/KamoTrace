@@ -98,6 +98,15 @@ lookups (which must authenticate to the exported account). Original inputs are
 copied byte-for-byte, not updated. Every output must be a new folder: it is privately
 staged and published atomically while holding the shared writer lock.
 
+Each collected IAM user's `activity` includes current MFA device metadata
+(`mfa_devices`, with `mfa_status` of `collected` or `unknown`) and login-profile
+metadata (`login_profile` on success, with `login_profile_status` of `collected`,
+`not_configured` or `unknown`). `GetLoginProfile` returning `NoSuchEntity` positively
+means no login profile is configured; denied or other failed reads remain unknown
+with explicit errors. Partial MFA pages are retained but their status is unknown.
+These read-only calls return neither passwords nor MFA secrets. They describe
+current posture, not whether MFA was used for a historical CloudTrail event.
+
 This is **current configuration, not historical incident-time evidence**. Collection
 is non-atomic across services/regions. Allowed/Restricted means exported SG, route
 and ACL configuration permits a modeled path, not that a connection succeeds or a
@@ -400,7 +409,12 @@ key owner's account and Region, not aliases or bare key IDs.
         "elasticloadbalancing:DescribeTargetGroupAttributes",
         "iam:GetInstanceProfile",
         "iam:GetAccountAuthorizationDetails",
-        "iam:ListPolicies"
+        "iam:ListPolicies",
+        "iam:ListUsers",
+        "iam:ListAccessKeys",
+        "iam:GetAccessKeyLastUsed",
+        "iam:ListMFADevices",
+        "iam:GetLoginProfile"
       ],
       "Resource": "*"
     },

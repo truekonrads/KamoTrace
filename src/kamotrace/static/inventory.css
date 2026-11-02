@@ -458,6 +458,20 @@
   max-width: 78ch;
   line-height: 1.5;
 }
+#inventory-iam-table .tabulator-cell {
+  height: auto;
+}
+#inventory-iam-table
+  .tabulator-cell:is(
+    [tabulator-field="review"],
+    [tabulator-field="activity"],
+    [tabulator-field="mfa"],
+    [tabulator-field="memberships"]
+  ) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
 @media (min-width: 1600px) {
   .inventory-workspace {
     grid-template-columns: minmax(0, 1fr) 400px;

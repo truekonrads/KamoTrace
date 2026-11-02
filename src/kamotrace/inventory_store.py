@@ -117,6 +117,7 @@ def reference(body, inventory, connection, commands, enrichment):
             raise ValueError("Reference ip must be an IPv4 or IPv6 address") from None
     matches = inventory.lookup(kind, lookup_value, account, region)
     network_matches = []
+    history_association = None
     if kind == "ip":
         address = ipaddress.ip_address(lookup_value)
         network_matches = [match for prefix, match in inventory.networks
@@ -129,6 +130,22 @@ def reference(body, inventory, connection, commands, enrichment):
         scope = actor_account if kind == "identity" else "coalesce(e.recipient_account_id, '')"
         predicate = f"({identity} = ? OR e.user_identity->>'$.userName' = ?)" if kind == "identity" else "e.source_ip = ?"
         params = [value, value] if kind == "identity" else [value]
+        association = "Exact event identity; no incident-time association to the current IAM snapshot is established"
+        iam_matches = [m for m in matches if m.get("iam")]
+        if kind == "identity" and len(iam_matches) == 1:
+            entity = iam_matches[0]["iam"]
+            if entity.get("UserName"):
+                predicate = "e.identity_arn = ? AND e.user_identity->>'$.principalId' = ?"
+                params = [entity["Arn"], entity["UserId"]]
+                association = "Exact IAM user ARN and stable principal ID; events missing that ID are excluded"
+            elif entity.get("RoleName") and value in (entity["Arn"], entity["RoleName"], entity["RoleId"]):
+                predicate = "e.user_identity->>'$.sessionContext.sessionIssuer.arn' = ? AND e.user_identity->>'$.sessionContext.sessionIssuer.principalId' = ?"
+                params = [entity["Arn"], entity["RoleId"]]
+                association = "Exact role session-issuer ARN and stable ID; sessions remain separate and do not identify the human actor"
+            elif entity.get("GroupName"):
+                predicate, params = "false", []
+                association = "IAM groups are not event principals; member activity is not attributed to the group"
+        history_association = association
         if account:
             predicate += f" AND {scope} = ?"
             params.append(account)
@@ -136,16 +153,41 @@ def reference(body, inventory, connection, commands, enrichment):
             predicate += " AND e.aws_region = ?"
             params.append(region)
         started = time.monotonic()
-        rows = connection.execute(f"""SELECT {identity} AS identity, {scope} AS account, e.aws_region AS region,
-                count(*), min(e.event_time)::VARCHAR, max(e.event_time)::VARCHAR
-            FROM events e WHERE {predicate} GROUP BY ALL ORDER BY account, region, identity""", params).fetchall()
+        # Classify only explicitly reported values. False session context is not proof
+        # of no upstream IdP MFA, and failed sign-ins are not successful authentication.
+        buckets = {
+            "console_success_with_mfa": "console AND login_result = 'Success' AND console_mfa = 'Yes'",
+            "console_success_without_mfa": "console AND login_result = 'Success' AND console_mfa = 'No'",
+            "console_success_mfa_unknown": "console AND login_result = 'Success' AND (console_mfa IS NULL OR console_mfa NOT IN ('Yes', 'No'))",
+            "console_failed_or_result_unknown": "console AND (login_result IS NULL OR login_result <> 'Success')",
+            "session_mfa_authenticated": "NOT console AND session_mfa = 'true'",
+            "session_mfa_not_authenticated": "NOT console AND session_mfa = 'false'",
+            "session_mfa_unknown": "NOT console AND (session_mfa IS NULL OR session_mfa NOT IN ('true', 'false'))",
+        }
+        counts = ", ".join(f"count(*) FILTER (WHERE {test})" for test in buckets.values())
+        samples = ", ".join(f"min(record_sha256) FILTER (WHERE {test})" for test in buckets.values())
+        rows = connection.execute(f"""WITH observed AS (
+                SELECT {identity} AS identity, {scope} AS account, e.aws_region AS region,
+                    e.user_identity->>'$.principalId' AS principal_id, e.event_time, e.record_sha256,
+                    coalesce(e.event_source = 'signin.amazonaws.com' AND e.event_name = 'ConsoleLogin', false) AS console,
+                    CASE WHEN e.error_code IS NULL THEN e.raw_event->>'$.responseElements.ConsoleLogin' END AS login_result,
+                    e.raw_event->>'$.additionalEventData.MFAUsed' AS console_mfa,
+                    e.user_identity->>'$.sessionContext.attributes.mfaAuthenticated' AS session_mfa
+                FROM events e WHERE {predicate})
+            SELECT identity, account, region, principal_id, count(*), min(event_time)::VARCHAR, max(event_time)::VARCHAR,
+                {counts}, {samples}
+            FROM observed GROUP BY ALL ORDER BY account, region, identity, principal_id""", params).fetchall()
         logger.debug("query operation=reference.events kind=%s elapsed_ms=%.3f rows=%d",
                      kind, (time.monotonic() - started) * 1000, len(rows))
-        for identity, acct, rn, count, first, last in rows:
+        for identity, acct, rn, principal_id, count, first, last, *activity in rows:
             matches.append({"kind": kind, "id": identity if kind == "identity" else value,
                             "name": identity if kind == "identity" else value, "account": acct, "region": rn,
                             "source": "cloudtrail", "identity": {"arn": identity, "event_count": count,
-                            "first_seen": first, "last_seen": last}})
+                            "principal_id": principal_id, "first_seen": first, "last_seen": last},
+                            "association": association,
+                            "mfa": {**dict(zip(buckets, activity[:len(buckets)])),
+                                    "samples": [{"category": key, "record_sha256": hash_}
+                                                for key, hash_ in zip(buckets, activity[len(buckets):]) if hash_]}})
     elif include_history and kind == "machine":
         started = time.monotonic()
         systems = {}
@@ -175,6 +217,13 @@ def reference(body, inventory, connection, commands, enrichment):
     else:
         entities = {(m["account"], "" if kind == "identity" else m["region"], m["id"]) for m in relevant}
         ambiguous = len(entities) > 1
+    history_coverage = None
+    if include_history and kind in ("identity", "ip"):
+        first, last = connection.execute("SELECT min(event_time)::VARCHAR, max(event_time)::VARCHAR FROM events").fetchone()
+        history_coverage = {"first_event": first, "last_event": last, "account": account, "region": region,
+                            "scope": "Entire imported CloudTrail database, independent of the active event filters; gaps and uncollected dates may exist"}
     return {"kind": kind, "value": value, "matches": matches, "network_matches": network_matches, "ambiguous": ambiguous,
             "snapshot": inventory.report["metadata"], "history_included": include_history,
+            "history_coverage": history_coverage,
+            "history_association": history_association,
             "iam_coverage": {key: inventory.report.get("iam", {}).get(key) for key in ("started_at_utc", "completed_at_utc", "errors")}}

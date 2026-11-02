@@ -147,13 +147,6 @@
     heading.append(icon, label);
     host.replaceChildren(heading);
     if (kind === "iam") {
-      facts(host, [
-        ["Collection", item.kind],
-        ["ARN", item.id],
-        ["Region", "global"],
-        ["Created", item.record.CreateDate],
-        ["Updated", item.record.UpdateDate],
-      ]);
       if (item.identity && item.id) {
         const reference = el("span", item.id);
         window.kamotraceReference?.attach(reference, {
@@ -163,18 +156,30 @@
         });
         host.append(el("h3", "Identity reference"), reference);
       }
+      if (item.identity)
+        window.kamotraceReference.iamDetails(host, item.context, data.iam);
+      else {
+        window.kamotraceReference.renderIamReview(host, item.signals, data.iam);
+        facts(host, [
+          ["Collection", item.kind],
+          ["ARN", item.id],
+          ["Region", "global"],
+          ["Created", item.record.CreateDate],
+          ["Updated", item.record.UpdateDate],
+        ]);
+      }
       host.append(
         el(
           "p",
           item.awsManaged
             ? "AWS-managed policy metadata only. Policy documents were not collected."
             : item.identity
-              ? "Current IAM configuration, not incident-time state or effective permissions. Open the identity reference for resolved policy and group context."
+              ? "Current IAM configuration, not incident-time state or effective permissions. The identity reference opens the same context from event and identity fields."
               : "Customer-managed policy snapshot, including collected version documents. This is not an effective-permissions evaluation.",
           "hint",
         ),
       );
-      raw(host, "Native IAM record", item.record, true);
+      raw(host, "Native IAM record", item.record);
     } else if (kind === "resource") {
       facts(host, [
         ["Kind / status", `${display(item.kind)} / ${statusOf(item)}`],
@@ -385,7 +390,11 @@
             return button;
           },
         },
-        ...columns.map(([field, heading]) => ({ field, title: heading })),
+        ...columns.map(([field, heading, options = {}]) => ({
+          field,
+          title: heading,
+          ...options,
+        })),
       ],
     });
     tables.set(id, grid);
@@ -539,28 +548,111 @@
         ),
       );
     const records = list(iam?.[key]);
+    const policies = [
+      ...list(iam?.policies),
+      ...list(iam?.aws_managed_policies).map((p) => ({
+        ...p,
+        aws_managed: true,
+      })),
+    ];
     const rows = records
-      .filter((record) => searchable(record, q))
-      .map((record) => ({
-        id: record.Arn,
-        name: record[nameField],
-        kind: label,
-        identity: ["users", "roles", "groups"].includes(key),
-        awsManaged: key === "aws_managed_policies",
-        created: record.CreateDate,
-        updated: record.UpdateDate,
-        record,
-      }));
+      .map((record) => {
+        const groups = list(iam.groups).filter((g) =>
+          list(record.GroupList).includes(g.GroupName),
+        );
+        const context = {
+          iam:
+            key === "aws_managed_policies"
+              ? { ...record, aws_managed: true }
+              : record,
+          iam_groups: groups,
+          iam_members: list(iam.users).filter(
+            (u) =>
+              record.GroupName && list(u.GroupList).includes(record.GroupName),
+          ),
+          iam_policies: policies,
+        };
+        const signals = window.kamotraceReference.iamReview(context, iam);
+        const review = signals.filter((s) => s.level === "review");
+        const unknown = signals.filter((s) => s.level === "unknown");
+        const activity = record.activity;
+        const keys = list(activity?.access_keys);
+        const policyCount = (owner) =>
+          [
+            ...list(owner.UserPolicyList),
+            ...list(owner.RolePolicyList),
+            ...list(owner.GroupPolicyList),
+            ...list(owner.AttachedManagedPolicies),
+          ].length;
+        return {
+          id: record.Arn,
+          name: record[nameField],
+          kind: label,
+          identity: ["users", "roles", "groups"].includes(key),
+          awsManaged: key === "aws_managed_policies",
+          review:
+            [
+              ...new Set(review.map((s) => s.label)),
+              ...(unknown.length
+                ? [`${unknown.length} coverage / unknown signals`]
+                : []),
+            ].join("; ") ||
+            "No signals from limited checks; not a safety assessment",
+          activity: record.UserName
+            ? `${activity ? `${keys.filter((k) => k.Status === "Active").length} active / ${keys.length} recorded keys${activity.access_keys_status === "collected" ? "" : " (incomplete)"}` : "Keys not collected"}; console: ${activity?.console_status === "collected" ? activity.password_last_used || "timestamp unreported" : "unknown / not collected"}`
+            : record.RoleName
+              ? `Last used: ${record.RoleLastUsed?.LastUsedDate || "unreported"}${record.RoleLastUsed?.Region ? ` (${record.RoleLastUsed.Region})` : ""}`
+              : "Not applicable",
+          mfa: record.UserName
+            ? `${activity?.mfa_status === "collected" ? `${list(activity.mfa_devices).length} enrolled devices` : "Enrollment unknown / incomplete"}; ${activity?.login_profile_status === "collected" ? "console password present" : activity?.login_profile_status === "not_configured" ? "no console password" : "console password unknown"}`
+            : "Not applicable",
+          memberships: record.UserName
+            ? list(record.GroupList).join(", ") || "None recorded"
+            : record.GroupName
+              ? `${context.iam_members.length} recorded members`
+              : "Not applicable",
+          policies: record.PolicyName
+            ? `${record.DefaultVersionId || "Default version unknown"}${key === "aws_managed_policies" ? "; metadata only" : ""}`
+            : `${policyCount(record)} direct; ${groups.reduce((n, g) => n + policyCount(g), 0)} from groups`,
+          created: record.CreateDate,
+          updated: record.UpdateDate,
+          record,
+          context,
+          signals,
+        };
+      })
+      .filter((row) =>
+        searchable(
+          {
+            record: row.record,
+            review: row.review,
+            activity: row.activity,
+            memberships: row.memberships,
+          },
+          q,
+        ),
+      );
     $("count").textContent =
       `${rows.length} of ${records.length} collected ${label.toLowerCase()} (global)`;
     table(
       "iam-table",
       rows,
       [
-        ["name", "Name"],
+        ["name", "Name", { width: 170 }],
+        ["review", "Review signals", { width: 280, variableHeight: true }],
+        [
+          "activity",
+          "Credential / role activity",
+          { width: 250, variableHeight: true },
+        ],
+        [
+          "memberships",
+          "Groups / members",
+          { width: 180, variableHeight: true },
+        ],
+        ["mfa", "MFA / console password", { width: 210, variableHeight: true }],
+        ["policies", "Policies / default version", { width: 180 }],
         ["id", "ARN"],
-        ["created", "Created"],
-        ["updated", "Updated"],
       ],
       "iam",
     );

@@ -34,11 +34,13 @@
 .reference-card header strong {
   font-size: 15px;
 }
-.reference-card p {
+.reference-card p,
+.reference-iam p {
   margin: 7px 0;
   white-space: pre-wrap;
 }
-.reference-card h3 {
+.reference-card h3,
+.reference-iam h3 {
   margin: 0;
   font-size: 14px;
 }
@@ -49,25 +51,31 @@
   border-top: 1px solid var(--line);
   padding: 10px 0;
 }
-.reference-card .reference-provenance {
+.reference-card .reference-provenance,
+.reference-iam .reference-provenance,
+.iam-review .reference-provenance {
   color: var(--muted);
   font-size: 12px;
 }
-.reference-card .reference-warning {
+.reference-card .reference-warning,
+.reference-iam .reference-warning {
   background: var(--warn-bg);
   color: var(--warn-ink);
   padding: 8px;
 }
-.reference-card dl {
+.reference-card dl,
+.reference-iam dl {
   display: grid;
   grid-template-columns: 110px minmax(0, 1fr);
   gap: 3px 10px;
   margin: 8px 0 0;
 }
-.reference-card dt {
+.reference-card dt,
+.reference-iam dt {
   color: var(--muted);
 }
-.reference-card dd {
+.reference-card dd,
+.reference-iam dd {
   margin: 0;
   white-space: pre-wrap;
 }
@@ -83,7 +91,8 @@
   outline: 2px solid var(--blue);
   outline-offset: 2px;
 }
-.reference-card pre {
+.reference-card pre,
+.reference-iam pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-height: 300px;
@@ -97,4 +106,47 @@
   flex-wrap: wrap;
   gap: 6px 14px;
   margin: 8px 0;
+}
+.reference-iam {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.iam-review {
+  margin-block: 12px 18px;
+  overflow-wrap: anywhere;
+}
+:is(#inventory-panel, .reference-card) .iam-review .iam-signal {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 0;
+  border-left: 3px solid var(--amber);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  font-size: 12px;
+}
+:is(#inventory-panel, .reference-card) .iam-review .iam-signal-unknown {
+  border-color: var(--context);
+  background: var(--surface);
+  color: var(--muted);
+}
+.iam-review summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.iam-review p {
+  margin-block: 6px;
+}
+.reference-mfa-history {
+  margin-block: 14px;
+  padding-block: 10px;
+  border-block: 1px solid var(--line);
+}
+.reference-mfa-history dl {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 12px;
+}
+.reference-mfa-history dd {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }

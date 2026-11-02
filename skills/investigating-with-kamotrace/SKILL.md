@@ -35,6 +35,19 @@ browser on the next refresh, and theirs show up for you.
   account and role name; this does not merge its historical session activity or
   establish incident-time ownership. Group memberships and policy attachments
   may have changed. Failed or partial collection is unknown, not absence.
+  New snapshots also include AWS-reported console sign-in and access-key activity
+  (key IDs/status/creation and last-used date/service/region, never secret keys).
+  Missing activity timestamps do not prove never used; older snapshots may not
+  have collected activity, and denied or partial reads remain unknown.
+  MFA enrollment and console login-profile metadata describe collection time,
+  not historical use. Browser cards can explicitly load CloudTrail MFA evidence:
+  successful ConsoleLogin MFAUsed Yes/No/unknown, failed/unknown-result sign-ins,
+  and other events' session mfaAuthenticated true/false/unknown remain separate.
+  Comparisons require exact user ARN + stable user ID, or exact role issuer ARN
+  + stable role ID with sessions separate. Recreated identities and records
+  missing those IDs are excluded, not guessed. The displayed imported time
+  extent is not proof of complete logs. Session false/missing does not establish
+  absence of upstream IdP MFA, and current enrollment cannot rewrite history.
 - Raw events can contain secrets (keys, tokens, passwords in parameters). Keep
   them inside the investigation. Don't paste them into external services.
 

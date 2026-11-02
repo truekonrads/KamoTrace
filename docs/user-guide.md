@@ -50,7 +50,9 @@ The exact actions are in the
 STS identity, EC2 Region/network describes and managed prefix list entry reads,
 RDS describes, ELB/ELBv2 describes (including listeners, rules, targets,
 attributes and tags), `iam:GetInstanceProfile`, `iam:GetAccountAuthorizationDetails`
-and `iam:ListPolicies`. The inventory-only policy
+and `iam:ListPolicies`, plus `iam:ListUsers`, `iam:ListAccessKeys`,
+`iam:GetAccessKeyLastUsed`, `iam:ListMFADevices` and `iam:GetLoginProfile` for user
+credential activity and authentication configuration. The inventory-only policy
 grants no S3 or KMS access and does not establish effective access. Unlike the
 trail/SSM checks, this policy needs no discovery audit.
 
@@ -67,9 +69,63 @@ policies; customer-managed policies include all collected version documents and
 the default version. Permission boundaries are retained. AWS-managed policies
 are enumerated as **metadata only**: their documents are not downloaded or modified.
 Group cards show collected members and policies; user cards include group policy
-context. This is not an effective-permissions evaluation: session/resource policies,
-SCPs and other controls may restrict access. No credentials or access-key secrets
+context. Identity cards summarize group memberships and direct/group policies
+before the detailed documents. Role last-used date and region are retained when
+AWS reports them; a missing value is not proof of never used. User console sign-in
+timestamps come from `ListUsers.PasswordLastUsed`. Access keys include IDs,
+active/inactive status and creation dates (`ListAccessKeys`), and AWS-reported
+last-used date, service and region (`GetAccessKeyLastUsed`). No secret access keys
+or passwords are returned. Missing timestamps do not mean never used or password
+disabled. Denied/failed calls are marked unknown; a failed paginated key listing
+retains collected keys but is labelled incomplete. Older exports show activity
+as not collected; create a new snapshot or explicitly refresh IAM into a new
+output to include it. IAM users do not have role memberships; assumable roles
+are not evaluated.
+This is not an effective-permissions evaluation: session/resource policies,
+SCPs and other controls may restrict access. No passwords or access-key secrets
 are collected. Errors and partial pagination remain visible as coverage gaps.
+
+The IAM table exposes **Review signals**, credential/role activity, groups or
+member counts, and policy counts. **Inspect** opens the same summary and policy
+context directly in the inspector; identity reference cards show it from event
+fields too. Expand a review signal for the key ID or policy/trust statement that
+triggered it. Checks flag active keys at least 90 days old, active keys or roles
+whose reported last use was at least 90 days before IAM collection, broad action
+or all-resource Allow statements, and wildcard/cross-account trust principals.
+Age is measured at snapshot completion, not the day you open the app. Policy
+checks inspect inline and inherited group documents and only the default
+customer-managed policy version; a permissions boundary is not treated as a grant.
+Conditions are called out but not evaluated, and Deny statements are not Allow
+signals. These are investigation leads, not confirmed vulnerabilities or an
+effective-access calculation. AWS-managed documents remain unavailable; missing
+activity, incomplete collection, and unavailable MFA/console-password posture
+are explicit unknowns. No signals is never a declaration that an identity is safe.
+
+User snapshots also retain enrolled MFA device metadata (`ListMFADevices`) and
+console login-profile metadata (`GetLoginProfile`, never the password). A
+successful empty MFA listing means no devices enrolled at collection;
+`NoSuchEntity` for the login profile means no console password configured at
+collection. Denied or partial reads stay unknown. A login profile without any
+enrolled MFA devices is a review signal, not a claim about MFA enforcement.
+
+In the inspector or identity card, **Load CloudTrail MFA evidence** compares
+this current posture with historical records. History is loaded explicitly so
+opening a reference does not block on a database scan. Successful `ConsoleLogin`
+events are counted separately for `additionalEventData.MFAUsed=Yes`, `No`, and
+missing/unrecognized values; failed or unknown-result sign-ins are separate.
+Other events are counted by `sessionContext.attributes.mfaAuthenticated=true`,
+`false`, or unknown. A session flag describes AWS credential context, not a fresh
+MFA challenge for each API call; upstream IdP / Identity Center MFA may not be
+represented. Supporting canonical event hashes are supplied per observed group.
+
+The comparison reports the imported database's event-time extent and requested
+account/Region; it is independent of the active event-grid search/time filters.
+That extent does not prove uninterrupted or complete log collection. IAM user
+history requires exact ARN and stable user ID, excluding recreated users and
+records missing that ID. Role history requires exact session-issuer ARN and
+stable role ID, with sessions kept separate; an exact STS session lookup stays
+limited to that session. Current enrollment does not rewrite historical MFA
+observations. Missing events/fields remain unknown, never proof of no MFA.
 
 `download` can collect the same snapshot alongside logs, or on its own:
 

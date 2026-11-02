@@ -329,7 +329,9 @@ class InventoryExportTest(unittest.TestCase):
             "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeLoadBalancerAttributes",
             "elasticloadbalancing:DescribeTags", "elasticloadbalancing:DescribeTargetGroups",
             "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroupAttributes",
-            "iam:GetInstanceProfile", "iam:GetAccountAuthorizationDetails", "iam:ListPolicies"})
+            "iam:GetInstanceProfile", "iam:GetAccountAuthorizationDetails", "iam:ListPolicies",
+            "iam:ListUsers", "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed",
+            "iam:ListMFADevices", "iam:GetLoginProfile"})
         before = target.read_bytes()
         for args in (["--emit-policy", target], ["--output", self.root / "new", "--emit-policy", self.root / "new/policy.json"],
                      ["--from-export", self.source, "--emit-policy", self.source / "policy.json"]):
@@ -424,6 +426,32 @@ class InventoryExportTest(unittest.TestCase):
                                           {"Filter": ["User", "Role", "Group", "LocalManagedPolicy"], "Marker": "second"})
                     stub.add_response("list_policies", {"Policies": [], "IsTruncated": True, "Marker": "aws-second"}, {"Scope": "AWS", "OnlyAttached": False})
                     stub.add_response("list_policies", {"Policies": [aws], "IsTruncated": False}, {"Scope": "AWS", "OnlyAttached": False, "Marker": "aws-second"})
+                    if denied:
+                        stub.add_client_error("list_users", "AccessDenied", "synthetic denial", expected_params={})
+                    else:
+                        listed = {k: v for k, v in user.items() if k not in ("GroupList", "UserPolicyList")}
+                        listed["PasswordLastUsed"] = stamp
+                        listed["Path"] = "/"
+                        stub.add_response("list_users", {"Users": [], "IsTruncated": True, "Marker": "users-next"}, {})
+                        stub.add_response("list_users", {"Users": [listed], "IsTruncated": False}, {"Marker": "users-next"})
+                    key = {"UserName": "analyst", "AccessKeyId": "AKIASYNTHETICKEY1", "Status": "Active", "CreateDate": stamp}
+                    stub.add_response("list_access_keys", {"AccessKeyMetadata": [key], "IsTruncated": True, "Marker": "keys-next"}, {"UserName": "analyst"})
+                    if denied:
+                        stub.add_client_error("get_access_key_last_used", "AccessDenied", "synthetic denial", expected_params={"AccessKeyId": key["AccessKeyId"]})
+                        stub.add_client_error("list_access_keys", "AccessDenied", "synthetic denial", expected_params={"UserName": "analyst", "Marker": "keys-next"})
+                    else:
+                        stub.add_response("get_access_key_last_used", {"UserName": "analyst", "AccessKeyLastUsed": {
+                            "LastUsedDate": stamp, "ServiceName": "s3", "Region": "ap-southeast-1"}}, {"AccessKeyId": key["AccessKeyId"]})
+                        stub.add_response("list_access_keys", {"AccessKeyMetadata": [{**key, "AccessKeyId": "AKIASYNTHETICKEY2", "Status": "Inactive"}], "IsTruncated": False}, {"UserName": "analyst", "Marker": "keys-next"})
+                        stub.add_response("get_access_key_last_used", {"UserName": "analyst", "AccessKeyLastUsed": {"ServiceName": "N/A", "Region": "N/A"}}, {"AccessKeyId": "AKIASYNTHETICKEY2"})
+                    device = {"UserName": "analyst", "SerialNumber": "arn:aws:iam::123456789012:mfa/analyst", "EnableDate": stamp}
+                    stub.add_response("list_mfa_devices", {"MFADevices": [device], "IsTruncated": True, "Marker": "mfa-next"}, {"UserName": "analyst"})
+                    if denied:
+                        stub.add_client_error("list_mfa_devices", "AccessDenied", "synthetic denial", expected_params={"UserName": "analyst", "Marker": "mfa-next"})
+                        stub.add_client_error("get_login_profile", "AccessDenied", "synthetic denial", expected_params={"UserName": "analyst"})
+                    else:
+                        stub.add_response("list_mfa_devices", {"MFADevices": [{**device, "SerialNumber": "synthetic-hardware-device"}], "IsTruncated": False}, {"UserName": "analyst", "Marker": "mfa-next"})
+                        stub.add_response("get_login_profile", {"LoginProfile": {"UserName": "analyst", "CreateDate": stamp, "PasswordResetRequired": False}}, {"UserName": "analyst"})
                     out = self.root / f"iam-{denied}"
                     source = self.root / "iam-False" if denied else self.source
                     before = {p.relative_to(source): p.read_bytes() for p in (source / "raw").rglob("*") if p.is_file()}
@@ -438,14 +466,79 @@ class InventoryExportTest(unittest.TestCase):
                 self.assertEqual(iam["users"][0]["GroupList"], ["investigators"])
                 self.assertEqual(iam["aws_managed_policies"], [aws])
                 self.assertNotIn("PolicyVersionList", iam["aws_managed_policies"][0])
-                self.assertEqual(len(iam["errors"]), int(denied))
+                self.assertEqual(len(iam["errors"]), 6 if denied else 0)
                 self.assertEqual(report["errors"], iam["errors"])
-                self.assertTrue((out / iam["raw_directory"] / "get_account_authorization_details" / "00001.json").is_file())
+                self.assertTrue((out / iam["raw_directory"] / "get_account_authorization_details" / "account" / "00001.json").is_file())
+                activity = iam["users"][0]["activity"]
+                self.assertEqual(activity["mfa_status"], "unknown" if denied else "collected")
+                self.assertEqual(len(activity["mfa_devices"]), 1 if denied else 2)
+                self.assertEqual(activity["mfa_devices"][0], {**device, "EnableDate": str(stamp)})
+                self.assertEqual(activity["login_profile_status"], "unknown" if denied else "collected")
+                raw = out / iam["raw_directory"]
+                self.assertTrue((raw / "list_mfa_devices" / "analyst" / "00001.json").is_file())
+                if denied:
+                    self.assertNotIn("login_profile", activity)
+                    self.assertEqual({e["operation"] for e in iam["errors"]}, {
+                        "iam.get_account_authorization_details", "iam.list_users", "iam.list_access_keys",
+                        "iam.get_access_key_last_used", "iam.list_mfa_devices", "iam.get_login_profile"})
+                else:
+                    self.assertEqual(activity["login_profile"], {"UserName": "analyst", "CreateDate": str(stamp), "PasswordResetRequired": False})
+                    self.assertTrue((raw / "list_mfa_devices" / "analyst" / "00002.json").is_file())
+                    self.assertTrue((raw / "get_login_profile" / "analyst" / "00001.json").is_file())
+                self.assertEqual(activity["console_status"], "unknown" if denied else "collected")
+                self.assertEqual(activity["access_keys_status"], "unknown" if denied else "collected")
+                self.assertEqual(len(activity["access_keys"]), 1 if denied else 2)
+                self.assertEqual(activity["access_keys"][0]["last_used_status"], "unknown" if denied else "collected")
                 if not denied:
+                    self.assertEqual(activity["password_last_used"], "2026-01-01 00:00:00+00:00")
+                    self.assertEqual(activity["access_keys"][0]["last_used"]["Region"], "ap-southeast-1")
+                    self.assertEqual(activity["access_keys"][1]["Status"], "Inactive")
+                    self.assertNotIn("LastUsedDate", activity["access_keys"][1]["last_used"])
                     self.assertEqual(iam["groups"][0]["GroupName"], "investigators")
                     self.assertEqual(iam["policies"][0]["DefaultVersionId"], "v1")
                     self.assertIn("s3:GetObject", str(iam["policies"][0]["PolicyVersionList"][0]["Document"]))
                 self.assertTrue(inventory.completed_export(out))
+
+    def test_iam_login_profile_absence_failures_and_recreated_user(self):
+        from boto3.session import Session
+        from botocore.stub import Stubber
+        from datetime import datetime, timezone
+        sdk = Session(aws_access_key_id="synthetic", aws_secret_access_key="synthetic", region_name="us-east-1")
+        user = {"UserName": "analyst", "UserId": "AIDASYNTHETICUSER", "Arn": "arn:aws:iam::123456789012:user/analyst",
+                "Path": "/", "CreateDate": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+        for state in ("NoSuchEntity", "ServiceFailure", "AccessDenied", "recreated"):
+            with self.subTest(state=state):
+                client = sdk.client("iam")
+                session = Mock()
+                session.client.return_value = client
+                out = self.root / state
+                with Stubber(client) as stub:
+                    stub.add_response("get_account_authorization_details", {"UserDetailList": [copy.deepcopy(user)], "IsTruncated": False},
+                                      {"Filter": ["User", "Role", "Group", "LocalManagedPolicy"]})
+                    stub.add_response("list_policies", {"Policies": [], "IsTruncated": False}, {"Scope": "AWS", "OnlyAttached": False})
+                    listed = {**user, "UserId": "AIDARECREATEDUSER"} if state == "recreated" else user
+                    stub.add_response("list_users", {"Users": [listed], "IsTruncated": False}, {})
+                    if state != "recreated":
+                        stub.add_response("list_access_keys", {"AccessKeyMetadata": [], "IsTruncated": False}, {"UserName": "analyst"})
+                        if state == "NoSuchEntity":
+                            stub.add_response("list_mfa_devices", {"MFADevices": [], "IsTruncated": False}, {"UserName": "analyst"})
+                        else:
+                            stub.add_client_error("list_mfa_devices", state, "synthetic failure", expected_params={"UserName": "analyst"})
+                        stub.add_client_error("get_login_profile", state, "synthetic failure", expected_params={"UserName": "analyst"})
+                    with redirect_stdout(io.StringIO()):
+                        iam = inventory.collect_iam(session, [], out)
+                    stub.assert_no_pending_responses()
+                activity = iam["users"][0]["activity"]
+                self.assertEqual(activity["login_profile_status"], "not_configured" if state == "NoSuchEntity" else "unknown")
+                self.assertNotIn("login_profile", activity)
+                self.assertEqual(activity["mfa_status"], "collected" if state == "NoSuchEntity" else "unknown")
+                self.assertEqual(activity["mfa_devices"], [])
+                expected = set() if state == "NoSuchEntity" else {"iam.list_users"} if state == "recreated" else {
+                    "iam.list_mfa_devices", "iam.get_login_profile"}
+                self.assertEqual({e["operation"] for e in iam["errors"]}, expected)
+                if state == "recreated":
+                    self.assertEqual(activity["access_keys_status"], "unknown")
+                    self.assertFalse((out / iam["raw_directory"] / "list_mfa_devices").exists())
 
     def test_collector_keeps_partial_pages_and_denied_calls_as_errors(self):
         from botocore.exceptions import ClientError

@@ -35,6 +35,8 @@ INVENTORY_ACTIONS = [
     "elasticloadbalancing:DescribeTags", "elasticloadbalancing:DescribeTargetGroups",
     "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroupAttributes",
     "iam:GetInstanceProfile", "iam:GetAccountAuthorizationDetails", "iam:ListPolicies",
+    "iam:ListUsers", "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed",
+    "iam:ListMFADevices", "iam:GetLoginProfile",
 ]
 
 

@@ -80,9 +80,18 @@ def inventory_fixture(folder):
         "started_at_utc": "2026-10-29T15:01:00Z", "completed_at_utc": "2026-10-29T15:02:00Z", "errors": [],
         "users": [{"UserName": "analyst", "UserId": "AIDANALYST", "Arn": "arn:aws:iam::123:user/team/analyst",
                    "GroupList": ["investigators"], "CreateDate": "2025-01-01T00:00:00Z",
+                   "activity": {"console_status": "collected", "password_last_used": "2026-10-27T12:30:00Z", "access_keys_status": "collected", "access_keys": [
+                       {"AccessKeyId": "AKIASYNTHETICKEY1", "Status": "Active", "CreateDate": "2025-03-04T00:00:00Z", "last_used_status": "collected",
+                        "last_used": {"LastUsedDate": "2026-10-28T04:10:00Z", "ServiceName": "s3", "Region": "ap-southeast-1"}},
+                       {"AccessKeyId": "AKIASYNTHETICKEY2", "Status": "Inactive", "CreateDate": "2025-03-05T00:00:00Z", "last_used_status": "collected", "last_used": {}}]},
                    "UserPolicyList": [{"PolicyName": "inline-user", "PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"}]}}]}],
         "roles": [{"RoleName": "auditor", "RoleId": "AROAUDITOR", "Arn": "arn:aws:iam::123:role/team/auditor",
-                   "AssumeRolePolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"Service": "ec2.amazonaws.com"}}]},
+                   "RoleLastUsed": {"LastUsedDate": "2026-10-28T09:15:00Z", "Region": "ap-southeast-1"},
+                   "AssumeRolePolicyDocument": {"Statement": [
+                       {"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"Service": "ec2.amazonaws.com"}},
+                       {"Sid": "Partner", "Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"AWS": ["*", "arn:aws:iam::456:root"]},
+                        "Condition": {"StringEquals": {"sts:ExternalId": "synthetic"}}},
+                       {"Effect": "Deny", "Action": "sts:AssumeRole", "Principal": "*"}]},
                    "RolePolicyList": [{"PolicyName": "inline-role", "PolicyDocument": {"Statement": []}}],
                    "AttachedManagedPolicies": [{"PolicyName": "ReadOnlyAccess", "PolicyArn": "arn:aws:iam::aws:policy/ReadOnlyAccess"}],
                    "PermissionsBoundary": {"PermissionsBoundaryType": "Policy", "PermissionsBoundaryArn": "arn:aws:iam::123:policy/Boundary"}}],
@@ -90,8 +99,8 @@ def inventory_fixture(folder):
                     "GroupPolicyList": [{"PolicyName": "inline-group", "PolicyDocument": {"Statement": [{"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"}]}}],
                     "AttachedManagedPolicies": [{"PolicyName": "CaseRead", "PolicyArn": "arn:aws:iam::123:policy/CaseRead"}]}],
         "policies": [{"PolicyName": name, "Arn": f"arn:aws:iam::123:policy/{name}", "DefaultVersionId": "v2",
-                      "PolicyVersionList": [{"VersionId": "v1", "IsDefaultVersion": False, "Document": {"Statement": []}},
-                                            {"VersionId": "v2", "IsDefaultVersion": True, "Document": {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::synthetic/*"}]}}]}
+                      "PolicyVersionList": [{"VersionId": "v1", "IsDefaultVersion": False, "Document": {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}},
+                                            {"VersionId": "v2", "IsDefaultVersion": True, "Document": {"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::synthetic/*"}]}}]}
                      for name in ("CaseRead", "Boundary")],
         "aws_managed_policies": [{"PolicyName": "ReadOnlyAccess", "Arn": "arn:aws:iam::aws:policy/ReadOnlyAccess", "DefaultVersionId": "v99"}]}
     folder.mkdir()
@@ -1920,6 +1929,95 @@ class GuardDutyContract(unittest.TestCase):
                 combined.connection.close()
                 combined.reviews.close()
             self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+
+
+class MFAContract(unittest.TestCase):
+    """Current IAM state and historical MFA are separate, exactly linked evidence."""
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        root = Path(cls.temp.name)
+        cls.database = root / "events.duckdb"
+        cls.inventory_export = root / "inventory"
+        report = inventory_fixture(cls.inventory_export)
+        user = report["iam"]["users"][0]
+        user["activity"].update(mfa_status="collected", mfa_devices=[{"SerialNumber": "arn:aws:iam::123:mfa/synthetic"}],
+                                login_profile_status="collected", login_profile={"PasswordResetRequired": False})
+        (cls.inventory_export / "report.json").write_text(json.dumps(report), encoding="utf-8")
+        principal = {"type": "IAMUser", "accountId": "123", "arn": user["Arn"], "principalId": user["UserId"]}
+        cls.events = []
+        for value, result in [("Yes", "Success"), ("Yes", "Success"), ("No", "Success"),
+                              (None, "Success"), ("No", "Failure"), ("Yes", "Success")]:
+            cls.events.append({"eventName": "ConsoleLogin", "eventSource": "signin.amazonaws.com", "userIdentity": principal,
+                               "responseElements": {"ConsoleLogin": result}, "additionalEventData": {"MFAUsed": value}})
+        cls.events[-1]["errorCode"] = "SyntheticDenied"  # Never count errored success-shaped data as authentication.
+        for flag in (True, "false", None, "unrecognized"):
+            cls.events.append({"eventName": "ListBuckets", "eventSource": "s3.amazonaws.com", "userIdentity": {
+                **principal, "sessionContext": {"attributes": {"mfaAuthenticated": flag}}}})
+        cls.events.append({"eventName": "ConsoleLogin", "eventSource": "signin.amazonaws.com", "userIdentity": {
+            **principal, "principalId": "AIDOLDRECREATED"}, "responseElements": {"ConsoleLogin": "Success"}, "additionalEventData": {"MFAUsed": "No"}})
+        for name, role_id, flag in (("one", "AROAUDITOR", "true"), ("two", "AROAUDITOR", "false"), ("old", "AROOLD", "true")):
+            cls.events.append({"eventName": "ListBuckets", "eventSource": "s3.amazonaws.com", "userIdentity": {
+                "type": "AssumedRole", "accountId": "123", "arn": f"arn:aws:sts::123:assumed-role/auditor/{name}", "principalId": f"{role_id}:{name}",
+                "sessionContext": {"sessionIssuer": {"arn": "arn:aws:iam::123:role/team/auditor", "principalId": role_id},
+                                   "attributes": {"mfaAuthenticated": flag}}}})
+        for index, event in enumerate(cls.events):
+            event.update(eventID=f"mfa-{index}", eventTime=f"2026-10-01T00:{index:02}:00Z", awsRegion="us-east-1")
+        # A different Region remains a separate group, even for the same user.
+        cls.events[1]["awsRegion"] = "eu-west-1"
+        source = root / "events.json"
+        source.write_text(json.dumps({"Records": cls.events}), encoding="utf-8")
+        build(source, cls.database)
+        cls.before = hashlib.sha256(cls.database.read_bytes()).hexdigest()
+        cls.store = Store(cls.database, inventory_export=cls.inventory_export)
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=cls.store))
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.thread.join()
+        cls.server.server_close()
+        cls.store.connection.close()
+        cls.store.reviews.close()
+        assert hashlib.sha256(cls.database.read_bytes()).hexdigest() == cls.before
+        cls.temp.cleanup()
+
+    call = BrowserContract.call
+
+    def test_mfa_history_keeps_unknown_failed_recreated_and_role_sessions_distinct(self):
+        spec = {"kind": "identity", "value": "arn:aws:iam::123:user/team/analyst", "account": "123"}
+        self.assertIsNone(self.call("/api/reference", {**spec, "include_history": False})[1]["history_coverage"])
+        status, card = self.call("/api/reference", spec)
+        self.assertEqual(status, 200, card)
+        current = next(m for m in card["matches"] if m.get("iam"))
+        self.assertEqual(current["iam"]["activity"]["mfa_status"], "collected")
+        groups = [m for m in card["matches"] if m["source"] == "cloudtrail"]
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(sum(m["identity"]["event_count"] for m in groups), 10)
+        expected = {"console_success_with_mfa": 2, "console_success_without_mfa": 1,
+                    "console_success_mfa_unknown": 1, "console_failed_or_result_unknown": 2,
+                    "session_mfa_authenticated": 1, "session_mfa_not_authenticated": 1, "session_mfa_unknown": 2}
+        for key, count in expected.items():
+            self.assertEqual(sum(m["mfa"][key] for m in groups), count, key)
+        _, events = self.call("/api/events", {})
+        event_ids = {row["record_sha256"]: row["event_id"] for row in events["data"]}
+        sample_ids = dict(zip(expected, ({"mfa-0", "mfa-1"}, {"mfa-2"}, {"mfa-3"}, {"mfa-4", "mfa-5"}, {"mfa-6"}, {"mfa-7"}, {"mfa-8", "mfa-9"})))
+        for group in groups:
+            for sample in group["mfa"]["samples"]:
+                self.assertIn(event_ids[sample["record_sha256"]], sample_ids[sample["category"]])
+        self.assertIn("stable principal ID", card["history_association"])
+        self.assertEqual(card["history_coverage"]["first_event"], "2026-10-01 00:00:00+00")
+        _, scoped = self.call("/api/reference", {**spec, "region": "eu-west-1"})
+        self.assertEqual([m["mfa"]["console_success_with_mfa"] for m in scoped["matches"] if m["source"] == "cloudtrail"], [1])
+        _, role = self.call("/api/reference", {"kind": "identity", "value": "auditor"})
+        sessions = [m for m in role["matches"] if m["source"] == "cloudtrail"]
+        self.assertEqual({m["id"].rsplit("/", 1)[-1] for m in sessions}, {"one", "two"})
+        self.assertEqual([m["identity"]["event_count"] for m in sessions], [1, 1])
+        _, session = self.call("/api/reference", {"kind": "identity", "value": "arn:aws:sts::123:assumed-role/auditor/one"})
+        self.assertEqual([m["identity"]["event_count"] for m in session["matches"] if m["source"] == "cloudtrail"], [1])
 
 
 if __name__ == "__main__":

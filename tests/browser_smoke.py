@@ -1,9 +1,10 @@
 """CI-only browser check; run with `uv run --with playwright==1.64.1 python tests/browser_smoke.py`."""
+import copy
 from pathlib import Path
 
 from playwright.sync_api import expect, sync_playwright
 
-from test_contract import BrowserContract
+from test_contract import BrowserContract, MFAContract
 
 
 def main():
@@ -322,19 +323,69 @@ def main():
                 page.locator('#inventory-views [data-view="iam"]').click()
                 iam_table = page.locator("#inventory-iam-table")
                 expect(iam_table.locator(".tabulator-row")).to_have_count(1)
+                expect(iam_table).to_contain_text("Active key ≥90 days old")
+                expect(iam_table).to_contain_text("1 active / 2 recorded keys")
+                expect(iam_table).to_contain_text("2026-10-27T12:30:00Z")
+                for field in ("review", "activity"):
+                    cell = iam_table.locator(f'.tabulator-row [tabulator-field="{field}"]')
+                    assert cell.evaluate("e => e.scrollHeight <= e.clientHeight + 1"), f"Clipped IAM {field}"
                 iam_table.get_by_role("button", name="Inspect analyst", exact=True).click()
+                inspector = page.locator("#inventory-evidence")
+                review = inspector.locator(".iam-review")
+                expect(inspector.locator(".reference-iam-summary")).to_contain_text("investigators")
+                expect(review).to_contain_text("Active key ≥90 days old")
+                expect(review).to_contain_text("investigators / CaseRead")
+                expect(review).to_contain_text("Action s3:*")
+                expect(review).not_to_contain_text("Action *;")  # Non-default versions are not grants.
+                expect(review).not_to_contain_text("s3:DeleteObject")  # Denies are not allow signals.
+                expect(review).not_to_contain_text("AKIASYNTHETICKEY2")  # Inactive keys are not stale active keys.
+                inspector.get_by_role("button", name="Load CloudTrail MFA evidence", exact=True).click()
+                expect(inspector.locator(".reference-mfa-history")).to_contain_text("No matching CloudTrail events")
                 page.screenshot(path=str(results / "inventory-iam-users.png"))
                 page.locator("#inventory-evidence .reference-trigger").click()
                 expect(card).to_contain_text("Group membership")
+                expect(card.locator(".iam-review")).to_have_text(review.text_content())
+                card.locator(".iam-review").get_by_text("Active key ≥90 days old", exact=True).click()
+                page.screenshot(path=str(results / "iam-user-risk.png"))
+                summary = card.locator(".reference-iam-summary")
+                expect(summary).to_contain_text("investigators")
+                expect(summary).to_contain_text("investigators: inline-group, CaseRead")
+                expect(summary).to_contain_text("inline-user")
+                expect(summary).to_contain_text("2026-10-27T12:30:00Z")
+                expect(summary).to_contain_text("2 recorded")
+                page.screenshot(path=str(results / "iam-user-summary.png"))
+                keys = card.locator(".reference-access-key")
+                expect(keys).to_have_count(2)
+                keys.first.locator("summary").click()
+                expect(keys.first).to_contain_text("2026-10-28T04:10:00Z")
+                expect(keys.first).to_contain_text("s3")
+                expect(keys.first).to_contain_text("ap-southeast-1")
+                keys.last.locator("summary").click()
+                expect(keys.last).to_contain_text("Inactive")
+                expect(keys.last).to_contain_text("No last-use timestamp reported by AWS")
+                page.screenshot(path=str(results / "iam-access-key-activity.png"))
                 expect(card).to_contain_text("CaseRead (Customer managed)")
                 card.get_by_text("Inline: inline-group", exact=True).click()
                 expect(card).to_contain_text("s3:DeleteObject")
                 page.screenshot(path=str(results / "iam-user-card.png"))
                 page.keyboard.press("Escape")
                 page.locator("#inventory-iam-collection").select_option("roles")
+                expect(iam_table).to_contain_text("Wildcard trust principal")
+                expect(iam_table).to_contain_text("Cross-account trust")
                 iam_table.get_by_role("button", name="Inspect auditor", exact=True).click()
+                expect(review.locator("summary").filter(has_text="Wildcard trust principal")).to_have_count(1)
+                expect(review).not_to_contain_text("Broad action allow")  # Boundaries do not grant permissions.
+                expect(review).to_contain_text("AWS-managed metadata only")
                 page.locator("#inventory-evidence .reference-trigger").click()
                 expect(card).to_contain_text("ReadOnlyAccess (AWS managed; metadata only)")
+                expect(summary).to_contain_text("IAM role")
+                expect(summary).to_contain_text("auditor")
+                expect(summary).to_contain_text("2026-10-28T09:15:00Z")
+                expect(summary).to_contain_text("ap-southeast-1")
+                card.locator(".iam-review").get_by_text("Cross-account trust", exact=True).click()
+                expect(card.locator(".iam-review")).to_contain_text("Conditions are present")
+                expect(card.locator(".iam-review")).to_contain_text("arn:aws:iam::456:root")
+                page.screenshot(path=str(results / "iam-role-summary.png"))
                 card.get_by_text("Trust policy", exact=True).click()
                 expect(card).to_contain_text("sts:AssumeRole")
                 expect(card).to_contain_text("Permissions boundary")
@@ -369,6 +420,92 @@ def main():
                 expect(card).to_be_visible()
                 expect(card).to_contain_text("Source:")
                 page.keyboard.press("Escape")
+
+                # Collection-time boundaries and unknowns must not become "unused" or "safe".
+                snapshot = context.request.get(BrowserContract.url + "/api/inventory").json()
+                variant = context.new_page()
+                variant.on("pageerror", lambda error: errors.append(str(error)))
+                for scenario in ("boundary", "partial", "legacy"):
+                    report = copy.deepcopy(snapshot)
+                    user = report["iam"]["users"][0]
+                    activity = user["activity"]
+                    if scenario == "boundary":
+                        key = activity["access_keys"][0]
+                        key["CreateDate"] = "2026-07-31T15:02:00Z"  # Exactly 90 days before collection.
+                        key["last_used"]["LastUsedDate"] = "2026-07-31T15:02:00Z"
+                        recent = copy.deepcopy(key)
+                        recent.update(AccessKeyId="AKIARECENT89DAYS", CreateDate="2026-08-01T15:02:00Z")
+                        recent["last_used"]["LastUsedDate"] = "2026-08-01T15:02:00Z"
+                        activity["access_keys"].append(recent)
+                    elif scenario == "partial":
+                        activity.update(console_status="unknown", access_keys_status="unknown")
+                        activity["access_keys"][0].update(last_used_status="unknown", last_used={})
+                    else:
+                        del user["activity"]
+                    variant.route("**/api/inventory", lambda route: route.fulfill(json=report))
+                    variant.goto(BrowserContract.url)
+                    expect(variant.locator("#load-status")).to_have_text("5 loaded · all")
+                    variant.locator("#inventory-tab").click()
+                    variant.locator('#inventory-views [data-view="iam"]').click()
+                    variant.locator("#inventory-iam-table").get_by_role("button", name="Inspect analyst", exact=True).click()
+                    evidence = variant.locator("#inventory-evidence")
+                    checks = evidence.locator(".iam-review")
+                    if scenario == "boundary":
+                        expect(checks).to_contain_text("Active key last used ≥90 days ago")
+                        expect(checks).to_contain_text("90 days old at collection")
+                        expect(checks).not_to_contain_text("AKIARECENT89DAYS")
+                        expect(checks).not_to_contain_text("AKIASYNTHETICKEY2")
+                    else:
+                        expect(checks).to_contain_text("Credential coverage gap")
+                        expect(checks).not_to_contain_text("Active key usage unreported")
+                        expect(evidence.locator(".reference-iam-summary")).to_contain_text("incomplete" if scenario == "partial" else "Not collected")
+                        if scenario == "partial":
+                            expect(checks).to_contain_text("Key usage unknown")
+                        variant.screenshot(path=str(results / f"iam-{scenario}.png"))
+                    variant.unroute("**/api/inventory")
+                variant.close()
+
+                MFAContract.setUpClass()
+                try:
+                    mfa_page = context.new_page()
+                    mfa_page.on("pageerror", lambda error: errors.append(str(error)))
+                    mfa_page.goto(MFAContract.url)
+                    expect(mfa_page.locator("#load-status")).to_have_text("14 loaded · all")
+                    mfa_page.locator("#inventory-tab").click()
+                    mfa_page.locator('#inventory-views [data-view="iam"]').click()
+                    mfa_page.get_by_role("button", name="Inspect analyst", exact=True).click()
+                    mfa_inspector = mfa_page.locator("#inventory-evidence")
+                    expect(mfa_inspector.locator(".reference-iam-summary")).to_contain_text("1 enrolled devices at collection")
+                    expect(mfa_inspector.locator(".reference-iam-summary")).to_contain_text("Login profile present")
+                    expect(mfa_inspector.locator(".iam-review")).not_to_contain_text("Console password with no enrolled MFA")
+                    mfa_inspector.get_by_role("button", name="Load CloudTrail MFA evidence", exact=True).click()
+                    observations = mfa_inspector.locator(".reference-mfa-history")
+                    expect(observations.locator(".reference-mfa-observation")).to_have_count(2)
+                    observations.locator(".reference-mfa-observation > summary").filter(has_text="9 events").click()
+                    expect(observations).to_contain_text("2026-10-01 00:00:00+00")
+                    expect(observations).to_contain_text("successful console sign-ins explicitly reported MFAUsed=No")
+                    us_observation = observations.locator(".reference-mfa-observation").filter(has_text="9 events")
+                    expect(us_observation.get_by_text("Failed / unknown-result sign-ins", exact=True).locator("xpath=following-sibling::dd[1]")).to_have_text("2")
+                    observations.screenshot(path=str(results / "iam-mfa-observed.png"))
+                    mfa_inspector.locator(".reference-trigger").click()
+                    mfa_card = mfa_page.locator("#reference-card")
+                    mfa_card.get_by_role("button", name="Load CloudTrail MFA evidence", exact=True).click()
+                    expect(mfa_card.locator(".reference-mfa-observation")).to_have_count(2)
+                    mfa_card.locator(".reference-mfa-observation > summary").filter(has_text="9 events").click()
+                    expect(mfa_card).to_contain_text("MFA enrollment")
+                    mfa_card.locator(".reference-mfa-history").screenshot(path=str(results / "iam-mfa-card.png"))
+                    without_mfa = mfa_page.request.get(MFAContract.url + "/api/inventory").json()
+                    without_mfa["iam"]["users"][0]["activity"]["mfa_devices"] = []
+                    mfa_page.route("**/api/inventory", lambda route: route.fulfill(json=without_mfa))
+                    mfa_page.reload()
+                    expect(mfa_page.locator("#load-status")).to_have_text("14 loaded · all")
+                    mfa_page.locator("#inventory-tab").click()
+                    mfa_page.locator('#inventory-views [data-view="iam"]').click()
+                    mfa_page.get_by_role("button", name="Inspect analyst", exact=True).click()
+                    expect(mfa_inspector.locator(".iam-review")).to_contain_text("Console password with no enrolled MFA")
+                    mfa_page.close()
+                finally:
+                    MFAContract.tearDownClass()
 
                 # Fresh page: API failure is actionable, Retry recovers, absent snapshot is distinct.
                 page.reload()
