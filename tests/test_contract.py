@@ -76,6 +76,24 @@ def inventory_fixture(folder):
         "relationships": [], "forwarding_paths": [route], "listener_actions": [],
         "errors": [{"region": "us-east-1", "operation": "describe_db_instances", "error": "AccessDenied (synthetic)"}],
         "counts": {"Restricted": 2, "Blocked": 2}}
+    report["iam"] = {
+        "started_at_utc": "2026-10-29T15:01:00Z", "completed_at_utc": "2026-10-29T15:02:00Z", "errors": [],
+        "users": [{"UserName": "analyst", "UserId": "AIDANALYST", "Arn": "arn:aws:iam::123:user/team/analyst",
+                   "GroupList": ["investigators"], "CreateDate": "2025-01-01T00:00:00Z",
+                   "UserPolicyList": [{"PolicyName": "inline-user", "PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"}]}}]}],
+        "roles": [{"RoleName": "auditor", "RoleId": "AROAUDITOR", "Arn": "arn:aws:iam::123:role/team/auditor",
+                   "AssumeRolePolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"Service": "ec2.amazonaws.com"}}]},
+                   "RolePolicyList": [{"PolicyName": "inline-role", "PolicyDocument": {"Statement": []}}],
+                   "AttachedManagedPolicies": [{"PolicyName": "ReadOnlyAccess", "PolicyArn": "arn:aws:iam::aws:policy/ReadOnlyAccess"}],
+                   "PermissionsBoundary": {"PermissionsBoundaryType": "Policy", "PermissionsBoundaryArn": "arn:aws:iam::123:policy/Boundary"}}],
+        "groups": [{"GroupName": "investigators", "GroupId": "AGPINVESTIGATORS", "Arn": "arn:aws:iam::123:group/team/investigators",
+                    "GroupPolicyList": [{"PolicyName": "inline-group", "PolicyDocument": {"Statement": [{"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"}]}}],
+                    "AttachedManagedPolicies": [{"PolicyName": "CaseRead", "PolicyArn": "arn:aws:iam::123:policy/CaseRead"}]}],
+        "policies": [{"PolicyName": name, "Arn": f"arn:aws:iam::123:policy/{name}", "DefaultVersionId": "v2",
+                      "PolicyVersionList": [{"VersionId": "v1", "IsDefaultVersion": False, "Document": {"Statement": []}},
+                                            {"VersionId": "v2", "IsDefaultVersion": True, "Document": {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::synthetic/*"}]}}]}
+                     for name in ("CaseRead", "Boundary")],
+        "aws_managed_policies": [{"PolicyName": "ReadOnlyAccess", "Arn": "arn:aws:iam::aws:policy/ReadOnlyAccess", "DefaultVersionId": "v99"}]}
     folder.mkdir()
     (folder / "report.json").write_text(json.dumps(report), encoding="utf-8")
     return report
@@ -364,6 +382,34 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual({m["source"] for m in machine["matches"]}, {"inventory", "ssm"})
         for value in (0, "false", None, []):
             self.assertEqual(self.call("/api/reference", {**contexts[0][0], "include_history": value})[0], 400)
+
+    def test_iam_inventory_cards_resolve_global_scope_groups_and_sts_roles(self):
+        status, report = self.call("/api/inventory")
+        self.assertEqual(status, 200)
+        self.assertEqual(report["iam"]["groups"][0]["GroupName"], "investigators")
+        for value in ("auditor", "AROAUDITOR", "arn:aws:iam::123:role/team/auditor",
+                      "arn:aws:sts::123:assumed-role/auditor/test-session"):
+            status, card = self.call("/api/reference", {"kind": "identity", "value": value, "account": "123",
+                                                       "region": "ap-southeast-1", "include_history": False})
+            self.assertEqual(status, 200)
+            self.assertFalse(card["ambiguous"])
+            match, = card["matches"]
+            self.assertEqual(match["id"], "arn:aws:iam::123:role/team/auditor")
+            self.assertEqual(match["region"], "global")
+            custom, aws = match["iam_policies"]
+            self.assertFalse(custom["aws_managed"])
+            self.assertEqual(custom["PolicyVersionList"][1]["VersionId"], "v2")
+            self.assertTrue(aws["aws_managed"])
+            self.assertNotIn("PolicyVersionList", aws)
+            self.assertIn("AssumeRolePolicyDocument", match["iam"])
+        for value in ("arn:aws:sts::999:assumed-role/auditor/test-session", "arn:aws:sts::123:assumed-role/missing/test-session"):
+            self.assertEqual(self.call("/api/reference", {"kind": "identity", "value": value, "include_history": False})[1]["matches"], [])
+        _, user = self.call("/api/reference", {"kind": "identity", "value": "analyst", "include_history": False})
+        self.assertEqual(user["matches"][0]["iam_groups"][0]["GroupName"], "investigators")
+        self.assertEqual(user["matches"][0]["iam_policies"][0]["PolicyName"], "CaseRead")
+        _, group = self.call("/api/reference", {"kind": "identity", "value": "arn:aws:iam::123:group/team/investigators", "include_history": False})
+        self.assertEqual(group["matches"][0]["iam"]["GroupPolicyList"][0]["PolicyName"], "inline-group")
+        self.assertEqual(self.call("/api/reference", {"kind": "identity", "value": "analyst", "account": "999", "include_history": False})[1]["matches"], [])
 
     def test_inventory_and_scope_aware_reference_cards(self):
         status, report = self.call("/api/inventory")

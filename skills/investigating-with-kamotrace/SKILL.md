@@ -28,6 +28,13 @@ browser on the next refresh, and theirs show up for you.
 - **Leads are not findings.** Suzaku detections and IP geography are leads.
   Tag or annotate only what the raw records support, and in notes, say which
   parts you observed and which you inferred.
+- **IAM inventory is current configuration, not historical or effective access.**
+  Browser identity cards can show exported users, roles, groups, inline/customer
+  policy documents and AWS-managed policy metadata (no AWS policy documents).
+  An STS assumed-role ARN resolves current role context by exact partition,
+  account and role name; this does not merge its historical session activity or
+  establish incident-time ownership. Group memberships and policy attachments
+  may have changed. Failed or partial collection is unknown, not absence.
 - Raw events can contain secrets (keys, tokens, passwords in parameters). Keep
   them inside the investigation. Don't paste them into external services.
 

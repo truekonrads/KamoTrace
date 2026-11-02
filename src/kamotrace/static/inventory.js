@@ -146,7 +146,36 @@
     );
     heading.append(icon, label);
     host.replaceChildren(heading);
-    if (kind === "resource") {
+    if (kind === "iam") {
+      facts(host, [
+        ["Collection", item.kind],
+        ["ARN", item.id],
+        ["Region", "global"],
+        ["Created", item.record.CreateDate],
+        ["Updated", item.record.UpdateDate],
+      ]);
+      if (item.identity && item.id) {
+        const reference = el("span", item.id);
+        window.kamotraceReference?.attach(reference, {
+          kind: "identity",
+          value: item.id,
+          account: data.metadata?.account,
+        });
+        host.append(el("h3", "Identity reference"), reference);
+      }
+      host.append(
+        el(
+          "p",
+          item.awsManaged
+            ? "AWS-managed policy metadata only. Policy documents were not collected."
+            : item.identity
+              ? "Current IAM configuration, not incident-time state or effective permissions. Open the identity reference for resolved policy and group context."
+              : "Customer-managed policy snapshot, including collected version documents. This is not an effective-permissions evaluation.",
+          "hint",
+        ),
+      );
+      raw(host, "Native IAM record", item.record, true);
+    } else if (kind === "resource") {
       facts(host, [
         ["Kind / status", `${display(item.kind)} / ${statusOf(item)}`],
         ["ID", item.id],
@@ -169,6 +198,16 @@
         ["Instance profile", item.iam_instance_profile],
         ["Assessment", item.summary],
       ]);
+      for (const arn of list(item.iam_role_arns)) {
+        const reference = el("p", arn);
+        window.kamotraceReference?.attach(reference, {
+          kind: "identity",
+          value: arn,
+          account: data.metadata?.account,
+          region: item.region,
+        });
+        host.append(reference);
+      }
       host.append(el("h3", "Security groups"));
       list(data.security_groups)
         .filter((g) => attached(g, item))
@@ -296,7 +335,7 @@
       }
       raw(host, "Network evidence", item.network_evidence, true);
     }
-    raw(host, "Complete collected record", item);
+    if (kind !== "iam") raw(host, "Complete collected record", item);
     $("inspector").focus({ preventScroll: true });
     $("topology")
       .querySelectorAll(".inventory-node")
@@ -425,6 +464,106 @@
       ),
     );
     raw(host, "Snapshot metadata", m);
+    host.append(el("h3", "IAM coverage"));
+    if (data.iam) {
+      facts(host, [
+        ["Started (UTC)", data.iam.started_at_utc],
+        ["Completed (UTC)", data.iam.completed_at_utc],
+        ["Errors / denials", list(data.iam.errors).length],
+      ]);
+      list(data.iam.errors).forEach((error) =>
+        raw(host, "IAM collection error / denial", error, true),
+      );
+      link(host, "Browse IAM snapshot and limitations", () => setView("iam"));
+    } else
+      host.append(
+        el("p", "No IAM snapshot was collected in this export.", "hint"),
+      );
+  }
+  const iamCollections = [
+    ["users", "Users", "UserName"],
+    ["roles", "Roles", "RoleName"],
+    ["groups", "IAM groups", "GroupName"],
+    ["policies", "Customer-managed policies", "PolicyName"],
+    [
+      "aws_managed_policies",
+      "AWS-managed policies (metadata only)",
+      "PolicyName",
+    ],
+  ];
+  function renderIam(q) {
+    const host = $("iam-coverage"),
+      iam = data.iam;
+    host.replaceChildren(el("h3", "IAM snapshot coverage"));
+    host.append(
+      el(
+        "p",
+        "Search applies to IAM records. Network region, kind, assessment and exposure filters do not apply: IAM is global. Current configuration is not incident-time state or an effective-permissions evaluation. Missing, denied or failed collection is unknown, not absent. AWS-managed policy documents are not collected.",
+        "hint",
+      ),
+    );
+    if (!iam) {
+      host.append(
+        el(
+          "p",
+          "No IAM snapshot was collected in this export.",
+          "inventory-empty",
+        ),
+      );
+    } else {
+      facts(host, [
+        ["Started (UTC)", iam.started_at_utc],
+        ["Completed (UTC)", iam.completed_at_utc],
+        ["Errors / denials", list(iam.errors).length],
+      ]);
+      if (!iam.completed_at_utc)
+        host.append(
+          el(
+            "p",
+            "IAM collection completion is not recorded.",
+            "inventory-warning",
+          ),
+        );
+      list(iam.errors).forEach((error) =>
+        raw(host, "IAM collection error / denial", error, true),
+      );
+    }
+    const key = $("iam-collection").value;
+    const [, label, nameField] = iamCollections.find(([name]) => name === key);
+    if (!Array.isArray(iam?.[key]))
+      host.append(
+        el(
+          "p",
+          `${label} were not collected in this export. Collect a new snapshot to include them.`,
+          "inventory-warning",
+        ),
+      );
+    const records = list(iam?.[key]);
+    const rows = records
+      .filter((record) => searchable(record, q))
+      .map((record) => ({
+        id: record.Arn,
+        name: record[nameField],
+        kind: label,
+        identity: ["users", "roles", "groups"].includes(key),
+        awsManaged: key === "aws_managed_policies",
+        created: record.CreateDate,
+        updated: record.UpdateDate,
+        record,
+      }));
+    $("count").textContent =
+      `${rows.length} of ${records.length} collected ${label.toLowerCase()} (global)`;
+    table(
+      "iam-table",
+      rows,
+      [
+        ["name", "Name"],
+        ["id", "ARN"],
+        ["created", "Created"],
+        ["updated", "Updated"],
+      ],
+      "iam",
+    );
   }
   function render() {
     if (!data?.loaded) return;
@@ -472,6 +611,7 @@
         (!(kind || status || exposure) ||
           list(data.resources).some((r) => scope(r) && related(p, r))),
     );
+    if (view === "iam") renderIam(q);
     if (view === "map") renderMap();
     if (view === "systems")
       table(
@@ -819,7 +959,7 @@
       .forEach((b) =>
         b.setAttribute("aria-pressed", String(b.dataset.view === view)),
       );
-    ["map", "systems", "routes", "groups", "coverage"].forEach(
+    ["map", "systems", "routes", "groups", "iam", "coverage"].forEach(
       (key) => ($(`${key}-view`).hidden = key !== view),
     );
     render();
@@ -909,6 +1049,32 @@
   function hide() {
     $("panel").hidden = true;
   }
+  // Keep this optional collection view self-contained; older exports remain usable.
+  const iamButton = el("button", "IAM");
+  iamButton.type = "button";
+  iamButton.dataset.view = "iam";
+  iamButton.setAttribute("aria-pressed", "false");
+  $("views").append(iamButton);
+  const iamView = el("section");
+  iamView.id = "inventory-iam-view";
+  iamView.hidden = true;
+  iamView.setAttribute("aria-label", "Global IAM inventory");
+  const iamLabel = el("label", "IAM collection ", "inventory-iam-selector");
+  const iamSelect = el("select");
+  iamSelect.id = "inventory-iam-collection";
+  iamCollections.forEach(([key, label]) => {
+    const option = el("option", label);
+    option.value = key;
+    iamSelect.append(option);
+  });
+  iamLabel.append(iamSelect);
+  const iamCoverage = el("div");
+  iamCoverage.id = "inventory-iam-coverage";
+  const iamTable = el("div");
+  iamTable.id = "inventory-iam-table";
+  iamView.append(iamLabel, iamCoverage, iamTable);
+  $("coverage-view").before(iamView);
+  iamSelect.addEventListener("change", render);
   $("filters").addEventListener("submit", (event) => {
     event.preventDefault();
     render();

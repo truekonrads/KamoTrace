@@ -887,6 +887,24 @@ class AutoInventoryContract(unittest.TestCase):
             self.assertEqual(argv[argv.index("--inventory-export") + 1], str(export))
         self.assertEqual(before, {p: digest(p) for p in export.rglob("*") if p.is_file()})
 
+    def test_downloaded_inventory_is_reused_offline_and_tampering_is_rejected(self):
+        self.collection()
+        folder = self.target / "download"
+        export = self.snapshot(folder / "inventory")
+        manifest = json.loads((folder / "manifest.json").read_text())
+        manifest["services"].append("inventory")
+        (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        before = {p: digest(p) for p in export.rglob("*") if p.is_file()}
+        with patch("kamotrace.inventory.boto3.Session", side_effect=AssertionError("no AWS")):
+            status, log = self.run_auto("--skip-download", "--no-serve")
+        self.assertEqual(status, 0, log)
+        self.assertIn("using downloaded network and IAM snapshot", log)
+        self.assertEqual(before, {p: digest(p) for p in export.rglob("*") if p.is_file()})
+        (export / "report.json").write_bytes(b"altered")
+        status, log = self.run_auto("--skip-download", "--no-serve")
+        self.assertEqual(status, 1)
+        self.assertIn("missing published exports", log)
+
     def test_online_default_collects_and_verified_snapshot_resumes_without_aws(self):
         from kamotrace import inventory
         self.collection()

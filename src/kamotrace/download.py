@@ -21,7 +21,8 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 import simplejson as json
 
-from . import trailcheck
+from . import inventory, trailcheck
+from .importer import write_lock
 
 
 LIMITATIONS = [
@@ -594,7 +595,8 @@ def main(argv=None):
     parser.add_argument("--regions", nargs="+", required=True, help="Region names, or all enabled regions (space separated)")
     parser.add_argument("--start", help="Inclusive ISO timestamp with offset, or YYYY-MM-DD at UTC midnight; default: all available history")
     parser.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date YYYY-MM-DD; default: collection start time")
-    parser.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm", "guardduty"), default=["cloudtrail", "ssm"])
+    parser.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm", "guardduty", "inventory"), default=["cloudtrail", "ssm"],
+                        help="Select exports; inventory includes global IAM users, roles, groups and customer policies")
     parser.add_argument("--cloudtrail-source", choices=("history", "auto"), default="history",
                         help="auto: with --start, prefer readable S3 locations, allowing empty days; omitted --end uses collection start time; otherwise Event History")
     parser.add_argument("--cloudtrail-s3", action="append", default=[], metavar="s3://BUCKET/ROOT/AWSLogs/ACCOUNT/CloudTrail/",
@@ -725,7 +727,8 @@ def main(argv=None):
                   "Only the last 90 days of management events are available.\n"
                   "S3 trail collection is usually much faster. The source is frozen on resume;\n"
                   "use a new destination to change it.\n", file=sys.stderr, flush=True)
-        progress.total = len(regions) * len(settings["services"])
+        regional_services = [service for service in settings["services"] if service != "inventory"]
+        progress.total = len(regions) * len(regional_services) + ("inventory" in settings["services"])
         progress.plan(regions, len(collector.windows()) if "cloudtrail" in args.services else 0, "ssm" in args.services)
         manifest = {**settings, "resolved_regions": regions, "complete": False, "limitations": LIMITATIONS,
                     "cloudtrail_plan": plan}
@@ -754,8 +757,19 @@ def main(argv=None):
             label = {"cloudtrail": "CloudTrail", "ssm": "SSM", "guardduty": "GuardDuty"}[service]
             progress.tick(f"{selected_region}: {label} complete", done=1)
         progress.idle()  # Setup messages give way to the workers' lines.
-        jobs = [(name, service) for name in regions for service in settings["services"]]
+        jobs = [(name, service) for name in regions for service in regional_services]
         collector.parallel(collect, jobs, len(jobs))
+        if "inventory" in settings["services"]:
+            snapshot = folder / "inventory"
+            with write_lock(snapshot):
+                if snapshot.exists():
+                    if not inventory.completed_export(snapshot, regions, args.profile):
+                        raise ValueError("Existing inventory is not a verified snapshot with matching scope; use a new destination")
+                else:
+                    inventory.build(snapshot, profile=args.profile, regions=regions, lock=False)
+                if inventory.read_export(snapshot)[0]["account"] != identity["Account"]:
+                    raise ValueError("Inventory account differs from the authenticated download account; use a new destination")
+            progress.tick("Global IAM and regional inventory complete", done=1)
         for selected_region in regions:  # Merge in region order so exports do not depend on timing.
             region_document, region_logs = parts[selected_region]
             for key, records in region_document.items():

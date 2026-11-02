@@ -91,6 +91,8 @@ def missing_exports(folder, manifest, ssm=True):
                and name in manifest.get("services", []) and not (folder / (name + suffix)).is_file()]
     if "guardduty" in manifest.get("services", []) and not (folder / "guardduty.json").is_file():
         missing.append("guardduty.json")
+    if "inventory" in manifest.get("services", []) and not inventory.completed_export(folder / "inventory"):
+        missing.append("inventory")
     for log in manifest.get("logs", []):
         path = folder / log["file"]
         if not path.is_file() or ("sha256" in log and sha256(path) != log["sha256"]):
@@ -133,7 +135,7 @@ def parser():
     aws.add_argument("--regions", nargs="+", default=["all"], help="Region names, or all enabled regions (default: all)")
     aws.add_argument("--start", help="Inclusive ISO timestamp with offset, or UTC date (default: all available history)")
     aws.add_argument("--end", help="Inclusive ISO timestamp with offset, or entire UTC date (default: first run's start time, kept on resume)")
-    aws.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm", "guardduty"), default=["cloudtrail", "ssm"])
+    aws.add_argument("--services", nargs="+", choices=("cloudtrail", "ssm", "guardduty", "inventory"), default=["cloudtrail", "ssm"])
     aws.add_argument("--cloudtrail-source", choices=("auto", "history"), default="auto",
                      help="With --start, prefer readable S3 locations, allowing empty days; omitted --end uses the first run's start time; history disables S3")
     aws.add_argument("--compress", action="store_true", help="Gzip generated CloudTrail/SSM/CloudWatch JSON")
@@ -146,8 +148,8 @@ def parser():
     inputs.add_argument("--source", action="extend", nargs="+", type=Path,
                         help="Existing CloudTrail JSON/gzip files or folder to import instead of downloading")
     inputs.add_argument("--ssm-export", type=Path, help="Existing SSM export to show in the UI (with --source/--skip-download)")
-    inputs.add_argument("--inventory-export", type=Path, help="Existing network inventory snapshot (read-only; no AWS calls)")
-    inputs.add_argument("--skip-inventory", action="store_true", help="Do not collect or show network inventory")
+    inputs.add_argument("--inventory-export", type=Path, help="Existing network and IAM inventory snapshot (read-only; no AWS calls)")
+    inputs.add_argument("--skip-inventory", action="store_true", help="Do not collect or show network/IAM inventory (also omit inventory from --services)")
     enrichment = parser.add_argument_group("IP enrichment (kamotrace get-dbip / enrich)")
     enrichment.add_argument("--skip-enrich", action="store_true", help="No IP enrichment")
     enrichment.add_argument("--geolite2", dest="sources", action=Source, metavar="FOLDER",
@@ -191,6 +193,8 @@ def main(argv=None):
         options.error("--ssm-export replaces the downloaded SSM export; use it with --source or --skip-download")
     if args.skip_inventory and args.inventory_export:
         options.error("--skip-inventory cannot be combined with --inventory-export")
+    if args.skip_inventory and "inventory" in args.services:
+        options.error("--skip-inventory cannot be combined with --services inventory")
     for path in (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules, args.guardduty_findings,
                  *(p for _, p in args.sources or [])):
         if path is not None and not path.exists():
@@ -219,6 +223,11 @@ def main(argv=None):
             options.error(f"{path} is an input but also a path this run writes; choose another --database or TARGET")
     if args.inventory_export and any(path.is_relative_to(args.inventory_export.resolve()) for path in outputs):
         options.error("The database and its sidecars/locks must be outside the original --inventory-export")
+    if not args.source and "inventory" in set(args.services + (collection(folder) or {}).get("services", [])):
+        snapshot = folder / "inventory"
+        for path in (*outputs, tools):
+            if path is not None and (path.resolve().is_relative_to(snapshot) or path.resolve() == lock_path(snapshot)):
+                options.error(f"{path} overlaps the downloaded inventory; choose another path")
     inventory_output = target / "inventory"
     if not (args.skip_inventory or args.inventory_export or args.source or args.skip_download):
         for path in (*inputs, *outputs, folder, tools):
@@ -420,6 +429,11 @@ def main(argv=None):
         elif inventory_export:
             inventory.read_export(inventory_export)
             say(stage, f"using existing snapshot {inventory_export}; no AWS calls")
+        elif not args.source and "inventory" in (collection(folder) or {}).get("services", []):
+            inventory_export = folder / "inventory"
+            if not inventory.completed_export(inventory_export):
+                raise StageError("Downloaded inventory is not a verified completed snapshot")
+            say(stage, f"using downloaded network and IAM snapshot {inventory_export}; no additional AWS calls")
         elif args.source or args.skip_download:
             say(stage, "skipped: offline inputs; pass --inventory-export to show an existing snapshot")
         else:

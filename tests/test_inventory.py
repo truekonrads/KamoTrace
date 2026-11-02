@@ -329,7 +329,7 @@ class InventoryExportTest(unittest.TestCase):
             "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeLoadBalancerAttributes",
             "elasticloadbalancing:DescribeTags", "elasticloadbalancing:DescribeTargetGroups",
             "elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroupAttributes",
-            "iam:GetInstanceProfile"})
+            "iam:GetInstanceProfile", "iam:GetAccountAuthorizationDetails", "iam:ListPolicies"})
         before = target.read_bytes()
         for args in (["--emit-policy", target], ["--output", self.root / "new", "--emit-policy", self.root / "new/policy.json"],
                      ["--from-export", self.source, "--emit-policy", self.source / "policy.json"]):
@@ -393,6 +393,59 @@ class InventoryExportTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "identity must match"):
                 inventory.build(self.root / "wrong-account", from_export=self.source, enrich_iam=True)
             self.assertFalse((self.root / "wrong-account").exists())
+
+    def test_iam_export_paginates_custom_documents_and_aws_metadata_and_retains_denials(self):
+        from boto3.session import Session
+        from botocore.stub import Stubber
+        from datetime import datetime, timezone
+        sdk = Session(aws_access_key_id="synthetic", aws_secret_access_key="synthetic", region_name="us-east-1")
+        stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        document = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+        user = {"UserName": "analyst", "UserId": "AIDASYNTHETICUSER", "Arn": "arn:aws:iam::123456789012:user/analyst", "CreateDate": stamp,
+                "GroupList": ["investigators"], "UserPolicyList": [{"PolicyName": "inline", "PolicyDocument": json.dumps(document)}]}
+        group = {"GroupName": "investigators", "GroupId": "AGPASYNTHETICGROUP", "Arn": "arn:aws:iam::123456789012:group/investigators", "CreateDate": stamp}
+        custom = {"PolicyName": "CaseRead", "Arn": "arn:aws:iam::123456789012:policy/CaseRead", "DefaultVersionId": "v1",
+                  "PolicyVersionList": [{"VersionId": "v1", "IsDefaultVersion": True, "Document": json.dumps(document)}]}
+        aws = {"PolicyName": "ReadOnlyAccess", "Arn": "arn:aws:iam::aws:policy/ReadOnlyAccess"}
+        for denied in (False, True):
+            with self.subTest(denied=denied):
+                client = sdk.client("iam")
+                session = Mock()
+                session.client.side_effect = lambda service, **kwargs: client if service == "iam" else Mock(
+                    get_caller_identity=Mock(return_value={"Account": "123456789012"}))
+                with Stubber(client) as stub:
+                    stub.add_response("get_account_authorization_details", {"UserDetailList": [copy.deepcopy(user)], "IsTruncated": True, "Marker": "second"},
+                                      {"Filter": ["User", "Role", "Group", "LocalManagedPolicy"]})
+                    if denied:
+                        stub.add_client_error("get_account_authorization_details", "AccessDenied", "synthetic denial",
+                                              expected_params={"Filter": ["User", "Role", "Group", "LocalManagedPolicy"], "Marker": "second"})
+                    else:
+                        stub.add_response("get_account_authorization_details", {"GroupDetailList": [group], "Policies": [custom], "IsTruncated": False},
+                                          {"Filter": ["User", "Role", "Group", "LocalManagedPolicy"], "Marker": "second"})
+                    stub.add_response("list_policies", {"Policies": [], "IsTruncated": True, "Marker": "aws-second"}, {"Scope": "AWS", "OnlyAttached": False})
+                    stub.add_response("list_policies", {"Policies": [aws], "IsTruncated": False}, {"Scope": "AWS", "OnlyAttached": False, "Marker": "aws-second"})
+                    out = self.root / f"iam-{denied}"
+                    source = self.root / "iam-False" if denied else self.source
+                    before = {p.relative_to(source): p.read_bytes() for p in (source / "raw").rglob("*") if p.is_file()}
+                    with patch.object(inventory.boto3, "Session", return_value=session):
+                        self.assertEqual(self.cli("--output", out, "--from-export", source, "--enrich-iam"), 0)
+                    stub.assert_no_pending_responses()
+                for path, contents in before.items():
+                    self.assertEqual((out / path).read_bytes(), contents)
+                    self.assertEqual((source / path).read_bytes(), contents)
+                report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+                iam = report["iam"]
+                self.assertEqual(iam["users"][0]["GroupList"], ["investigators"])
+                self.assertEqual(iam["aws_managed_policies"], [aws])
+                self.assertNotIn("PolicyVersionList", iam["aws_managed_policies"][0])
+                self.assertEqual(len(iam["errors"]), int(denied))
+                self.assertEqual(report["errors"], iam["errors"])
+                self.assertTrue((out / iam["raw_directory"] / "get_account_authorization_details" / "00001.json").is_file())
+                if not denied:
+                    self.assertEqual(iam["groups"][0]["GroupName"], "investigators")
+                    self.assertEqual(iam["policies"][0]["DefaultVersionId"], "v1")
+                    self.assertIn("s3:GetObject", str(iam["policies"][0]["PolicyVersionList"][0]["Document"]))
+                self.assertTrue(inventory.completed_export(out))
 
     def test_collector_keeps_partial_pages_and_denied_calls_as_errors(self):
         from botocore.exceptions import ClientError

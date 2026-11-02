@@ -116,6 +116,143 @@
     if (list.childElementCount) parent.append(list);
   }
 
+  function policyDetails(parent, label, value) {
+    const section = document.createElement("details");
+    line(section, "summary", label);
+    line(section, "pre", JSON.stringify(value ?? null, null, 2));
+    parent.append(section);
+  }
+
+  function iamDetails(parent, match) {
+    const iam = match.iam;
+    if (!iam || typeof iam !== "object") return;
+    const list = (value) => (Array.isArray(value) ? value : []);
+    line(parent, "h3", "IAM configuration");
+    details(parent, {
+      name: iam.UserName || iam.RoleName || iam.GroupName,
+      arn: iam.Arn,
+      principal_id: iam.UserId || iam.RoleId || iam.GroupId,
+    });
+    const dates = document.createElement("dl");
+    for (const [label, value] of [
+      ["Created", iam.CreateDate],
+      ["Password last used", iam.PasswordLastUsed],
+      ["Role last used", iam.RoleLastUsed],
+      ["Maximum session (seconds)", iam.MaxSessionDuration],
+    ]) {
+      if (value == null) continue;
+      line(dates, "dt", label);
+      line(
+        dates,
+        "dd",
+        typeof value === "object" ? JSON.stringify(value) : value,
+      );
+    }
+    parent.append(dates);
+    if (iam.AssumeRolePolicyDocument != null)
+      policyDetails(parent, "Trust policy", iam.AssumeRolePolicyDocument);
+
+    function policies(host, identity) {
+      const inline = [
+        ...list(identity.UserPolicyList),
+        ...list(identity.RolePolicyList),
+        ...list(identity.GroupPolicyList),
+      ];
+      line(
+        host,
+        "p",
+        `Inline policies: ${inline.length}`,
+        "reference-provenance",
+      );
+      inline.forEach((policy) =>
+        policyDetails(
+          host,
+          `Inline: ${policy.PolicyName || "Unnamed policy"}`,
+          policy.PolicyDocument,
+        ),
+      );
+      const attached = list(identity.AttachedManagedPolicies);
+      line(
+        host,
+        "p",
+        `Attached managed policies: ${attached.length}`,
+        "reference-provenance",
+      );
+      attached.forEach((ref) => {
+        const policy = list(match.iam_policies).find(
+          (p) => p.Arn === ref.PolicyArn,
+        );
+        const type = policy
+          ? policy.aws_managed
+            ? "AWS managed; metadata only"
+            : "Customer managed"
+          : "Type / document not collected";
+        policyDetails(
+          host,
+          `${ref.PolicyName || ref.PolicyArn} (${type})`,
+          policy || ref,
+        );
+        if (!policy || policy.aws_managed)
+          line(
+            host,
+            "p",
+            "Policy document unavailable in this snapshot; permissions are unknown.",
+            "reference-provenance",
+          );
+      });
+      if (identity.PermissionsBoundary) {
+        const boundary = identity.PermissionsBoundary;
+        const policy = list(match.iam_policies).find(
+          (p) => p.Arn === boundary.PermissionsBoundaryArn,
+        );
+        policyDetails(host, "Permissions boundary", {
+          ...boundary,
+          policy: policy || "Document not collected",
+        });
+      }
+    }
+    policies(parent, iam);
+    if (iam.GroupName) {
+      line(parent, "h3", "Collected group members");
+      list(match.iam_members).forEach((user) =>
+        line(parent, "p", `${user.UserName} · ${user.Arn}`),
+      );
+      if (!list(match.iam_members).length)
+        line(
+          parent,
+          "p",
+          "No members recorded; incomplete collection may omit members.",
+          "reference-provenance",
+        );
+    }
+    const groupNames = list(iam.GroupList);
+    if (groupNames.length || list(match.iam_groups).length) {
+      line(parent, "h3", "Group membership");
+      groupNames.forEach((name) => line(parent, "p", name));
+      list(match.iam_groups).forEach((group) => {
+        const section = document.createElement("section");
+        line(section, "h3", group.GroupName || group.Arn || "IAM group");
+        details(section, { arn: group.Arn });
+        policies(section, group);
+        parent.append(section);
+      });
+      if (groupNames.length > list(match.iam_groups).length)
+        line(
+          parent,
+          "p",
+          "Some group configuration was not collected.",
+          "reference-warning",
+        );
+    }
+    line(
+      parent,
+      "p",
+      "Current IAM snapshot, not incident-time state or an effective-permissions evaluation. Trust conditions, boundaries, session policies, resource policies and organization controls may restrict access. Missing or denied collection is unknown, not absence.",
+      "reference-warning",
+    );
+    policyDetails(parent, "Collected IAM identity details", iam);
+  }
+
   function reveal(data, message) {
     card.replaceChildren();
     const header = document.createElement("header");
@@ -182,6 +319,7 @@
         details(section, match.resource?.details);
         details(section, match.enrichment);
         details(section, match.identity);
+        iamDetails(section, match);
         card.append(section);
       }
       if (matches.some((match) => match.source === "inventory")) {
@@ -203,6 +341,21 @@
           `Snapshot collected: ${stamp || "not supplied"}`,
           "reference-provenance",
         );
+      }
+      if (data.kind === "identity" && data.iam_coverage?.started_at_utc) {
+        line(
+          card,
+          "p",
+          `IAM collected: ${data.iam_coverage.started_at_utc} to ${data.iam_coverage.completed_at_utc || "completion unknown"}`,
+          "reference-provenance",
+        );
+        for (const error of data.iam_coverage.errors || [])
+          line(
+            card,
+            "p",
+            `IAM coverage gap: ${error.operation} · ${error.error}`,
+            "reference-warning",
+          );
       }
       if (data.matches.some((match) => match.source === "enrichment"))
         line(

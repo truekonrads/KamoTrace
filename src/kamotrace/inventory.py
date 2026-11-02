@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 
 import boto3
 from botocore.config import Config
@@ -21,6 +22,7 @@ CONFIG = Config(retries={"mode": "standard", "max_attempts": 4},
                 connect_timeout=10, read_timeout=40)
 LIMITATIONS = [
     "Current configuration snapshot of one authenticated account, collected non-atomically across enabled regions; not historical incident-time state.",
+    "IAM users, roles, groups, attachments, boundaries and customer-managed policy versions are a separately timestamped global snapshot, not effective permissions. AWS-managed policies are enumerated as metadata only. Session/resource policies and organization controls are not evaluated; failed or partial reads are unknown, not absence.",
     "Allowed means a direct or validated load-balancer path is permitted by exported AWS configuration, NOT a successful connection or a listening service. No active probes are performed.",
     "Restricted means only specified public source ranges have a permitted path. Blocked refers only to modeled direct and forwarding paths, not every proxy, VPN, peering connection or other account.",
     "TCP and UDP paths intersect security-group ingress, longest-prefix subnet routes and ordered network ACL ingress/return rules. Return destination ports assume client ephemeral ports 1024–65535; at least one permitted combination is sufficient.",
@@ -116,6 +118,10 @@ def collect_region(region, profile, out):
 
 def collect_iam(session, regions, out):
     started = datetime.now(timezone.utc).isoformat()
+    raw_root = out / "raw" / "global"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    # A derivation may already contain an older IAM export: retain its raw bytes.
+    raw = Path(tempfile.mkdtemp(prefix="iam-", dir=raw_root))
     arns = sorted({instance["IamInstanceProfile"]["Arn"] for region in regions
                    for reservation in region["describe_instances"] for instance in reservation["Instances"]
                    if instance.get("IamInstanceProfile", {}).get("Arn")})
@@ -125,7 +131,7 @@ def collect_iam(session, regions, out):
         name = arn.rsplit("/", 1)[-1]
         try:
             response = client.get_instance_profile(InstanceProfileName=name)
-            write_json(out / "raw" / "global" / "iam_instance_profiles" / f"{name}.json", response)
+            write_json(raw / "instance_profiles" / f"{name}.json", response)
             profile = response["InstanceProfile"]
             if profile["Arn"] != arn:
                 raise ValueError(f"Returned profile ARN differs from EC2 assignment: {arn}")
@@ -134,9 +140,27 @@ def collect_iam(session, regions, out):
             profiles[arn] = {"status": "Unknown", "roles": []}
             errors.append({"region": "global", "operation": "iam.get_instance_profile", "error": f"{arn}: {exc}"})
     result = {"started_at_utc": started, "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-              "profiles": profiles, "errors": errors}
+              "profiles": profiles, "errors": errors, "raw_directory": raw.relative_to(out).as_posix()}
+    # Authorization details include inline documents, group memberships, trust policies,
+    # boundaries and every customer-managed version, without fetching AWS policy documents.
+    for operation, params, fields in [
+        ("get_account_authorization_details", {"Filter": ["User", "Role", "Group", "LocalManagedPolicy"]},
+         {"UserDetailList": "users", "RoleDetailList": "roles", "GroupDetailList": "groups", "Policies": "policies"}),
+        ("list_policies", {"Scope": "AWS", "OnlyAttached": False}, {"Policies": "aws_managed_policies"}),
+    ]:
+        for field in fields.values():
+            result[field] = []
+        try:
+            for number, page in enumerate(client.get_paginator(operation).paginate(**params), 1):
+                write_json(raw / operation / f"{number:05}.json", page)
+                for key, field in fields.items():
+                    result[field].extend(page.get(key, []))
+        except Exception as exc:
+            errors.append({"region": "global", "operation": f"iam.{operation}", "error": str(exc)})
+    result["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
     write_json(out / "iam.json", result)
-    print(f"IAM: {len(arns)} assigned profiles; {len(errors)} lookup errors", flush=True)
+    print(f"IAM: {len(result['users'])} users, {len(result['roles'])} roles, {len(result['policies'])} customer policies, "
+          f"{len(result['aws_managed_policies'])} AWS-managed policy metadata; {len(errors)} errors", flush=True)
     return result
 
 
@@ -549,7 +573,7 @@ def add_forwarding_paths(report, regions):
 
 def analyze(metadata, regions, iam=None):
     iam = iam or {"profiles": {}, "errors": []}
-    report = {"metadata": {**metadata, "limitations": LIMITATIONS}, "errors": list(iam["errors"]), "resources": [], "vpcs": [], "subnets": [], "security_groups": [], "relationships": []}
+    report = {"metadata": {**metadata, "limitations": LIMITATIONS}, "iam": iam, "errors": list(iam["errors"]), "resources": [], "vpcs": [], "subnets": [], "security_groups": [], "relationships": []}
     if iam.get("completed_at_utc"):
         report["metadata"]["iam_completed_at_utc"] = iam["completed_at_utc"]
     for region in regions:
@@ -831,7 +855,7 @@ def main(argv=None):
     parser.add_argument("--regions", nargs="+", default=["all"], help="Enabled regions (default: all)")
     parser.add_argument("--output", type=Path, help="New output folder; required unless only emitting policy; never overwritten")
     parser.add_argument("--from-export", type=Path, help="Reanalyze saved JSON, without AWS calls")
-    parser.add_argument("--enrich-iam", action="store_true", help="With --from-export, make read-only IAM calls to resolve assigned profiles")
+    parser.add_argument("--enrich-iam", action="store_true", help="With --from-export, collect current IAM identities and customer policy documents (AWS-managed metadata only)")
     parser.add_argument("--collect-only", action="store_true")
     aws_policy.arguments(parser)
     args = parser.parse_args(argv)

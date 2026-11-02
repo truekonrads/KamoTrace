@@ -49,7 +49,8 @@ The exact actions are in the
 [combined collection IAM policy](preparation.md#aws-collection-iam-policy):
 STS identity, EC2 Region/network describes and managed prefix list entry reads,
 RDS describes, ELB/ELBv2 describes (including listeners, rules, targets,
-attributes and tags), and `iam:GetInstanceProfile`. The inventory-only policy
+attributes and tags), `iam:GetInstanceProfile`, `iam:GetAccountAuthorizationDetails`
+and `iam:ListPolicies`. The inventory-only policy
 grants no S3 or KMS access and does not establish effective access. Unlike the
 trail/SSM checks, this policy needs no discovery audit.
 
@@ -58,6 +59,35 @@ configuration. Search and region/status filters apply to the snapshot, not the
 CloudTrail time range. Select a system to inspect its addresses, assigned IAM
 roles, security groups, and exposure assessment. Collection failures remain
 visible as coverage gaps; a denied read does not mean the resource is absent.
+
+The **IAM** view browses global users, roles, IAM groups and policies independently
+of the network filters. Users include group membership; users, roles and groups
+include inline policies and managed-policy attachments. Roles include trust
+policies; customer-managed policies include all collected version documents and
+the default version. Permission boundaries are retained. AWS-managed policies
+are enumerated as **metadata only**: their documents are not downloaded or modified.
+Group cards show collected members and policies; user cards include group policy
+context. This is not an effective-permissions evaluation: session/resource policies,
+SCPs and other controls may restrict access. No credentials or access-key secrets
+are collected. Errors and partial pagination remain visible as coverage gaps.
+
+`download` can collect the same snapshot alongside logs, or on its own:
+
+```powershell
+kamotrace download --dest C:\cases\acme\download --regions all --services cloudtrail ssm inventory
+kamotrace download --dest C:\cases\iam-snapshot --regions all --services inventory
+```
+
+The snapshot is published under `DEST/inventory`, including `iam.json`, raw
+responses, `report.json`, CSV network reports and a hash manifest. A verified
+snapshot is reused on resume, not refreshed; use a new destination for current
+configuration. Online `auto` includes IAM in its normal inventory stage. With
+`auto --services cloudtrail ssm inventory`, it reuses `TARGET/download/inventory`
+instead of collecting twice; `--skip-download` can reuse this saved inventory
+without AWS calls. `--skip-inventory` cannot be combined with the inventory service.
+Older snapshots remain readable but have no newly collected IAM details. Use a
+new output, or `inventory --from-export OLD --enrich-iam --output NEW` to collect
+current IAM explicitly (the authenticated account must match the original export).
 
 Choose **Explore full window** to keep the map, filters, tables and evidence
 inspector together in a full-window dialog. Close it or press Escape to return;
@@ -96,7 +126,11 @@ context describes the collected configuration, not incident-time state.
 Older reports without subnet ranges still provide their known VPC ranges; create
 a new snapshot (or analyze an existing raw export into a new folder) for subnet
 and IPv6 range context. No live AWS or DNS lookup occurs when opening a card.
-An assumed-role session is not silently matched to an IAM role by its name.
+An STS assumed-role ARN can show the corresponding collected IAM role using its
+exact partition, account and role name (STS omits the IAM path). This supplies
+current configuration only: it does not merge session history into the role or
+prove that the same role existed at incident time. Bare names remain potentially
+ambiguous, and a role known only from an EC2 profile is not used to resolve sessions.
 These lookups do not change your filters, evidence, findings, or tags.
 
 Inventory JSON, raw AWS responses, and CSV exports contain sensitive infrastructure

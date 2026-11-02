@@ -70,6 +70,34 @@ class DownloadContract(unittest.TestCase):
         self.assertEqual(result, status, stderr.getvalue())
         return stdout.getvalue(), stderr.getvalue()
 
+    def test_inventory_service_publishes_verified_snapshot_and_resumes_without_recollecting(self):
+        from kamotrace import inventory
+        from test_inventory import fixture
+        original = self.folder.parent / "inventory-source"
+        inventory.write_json(original / "collection.json", {"account": "123456789012", "regions": ["test-region"],
+                             "completed_at_utc": "2026-01-01T00:00:00Z"})
+        inventory.write_json(original / "regions" / "test-region.json", fixture())
+        inventory.write_json(original / "iam.json", {"profiles": {}, "errors": [], "users": [], "roles": [],
+                             "groups": [{"GroupName": "synthetic-investigators"}], "policies": [], "aws_managed_policies": []})
+        real_build = inventory.build
+        self.identity()
+        with patch.object(inventory, "build", side_effect=lambda output, **kwargs: real_build(output, from_export=original, **kwargs)):
+            self.run_cli("--services", "inventory", "--progress", "off")
+        snapshot = self.folder / "inventory"
+        self.assertTrue(inventory.completed_export(snapshot, ["us-east-1"]))
+        report = json.loads((snapshot / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["iam"]["groups"][0]["GroupName"], "synthetic-investigators")
+        before = (snapshot / "manifest.json").read_bytes()
+        self.identity()
+        with patch.object(inventory, "build", side_effect=AssertionError("must reuse completed snapshot")):
+            self.run_cli("--services", "inventory", "--progress", "off")
+        self.assertEqual((snapshot / "manifest.json").read_bytes(), before)
+        (snapshot / "iam.json").write_text("altered", encoding="utf-8")
+        self.identity()
+        self.run_cli("--services", "inventory", "--progress", "off", status=1)
+        self.assertEqual((snapshot / "iam.json").read_text(), "altered")
+        self.assertFalse(json.loads((self.folder / "manifest.json").read_text())["complete"])
+
     def test_progress_bar_uses_two_rows_and_replaces_previous_update(self):
         for emoji in (True, False):
             with self.subTest(emoji=emoji), patch.dict(os.environ, {"KAMOTRACE_NO_EMOJI": "" if emoji else "1"}), \

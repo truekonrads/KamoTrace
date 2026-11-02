@@ -442,6 +442,22 @@
   color: var(--muted);
   border: 1px dashed var(--line);
 }
+.inventory-iam-selector {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-block: 4px 14px;
+  font-size: 12px;
+}
+.inventory-iam-selector select {
+  min-height: 32px;
+  max-width: 100%;
+}
+#inventory-iam-coverage > .hint {
+  max-width: 78ch;
+  line-height: 1.5;
+}
 @media (min-width: 1600px) {
   .inventory-workspace {
     grid-template-columns: minmax(0, 1fr) 400px;

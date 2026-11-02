@@ -398,7 +398,9 @@ key owner's account and Region, not aliases or bare key IDs.
         "elasticloadbalancing:DescribeTargetGroups",
         "elasticloadbalancing:DescribeTargetHealth",
         "elasticloadbalancing:DescribeTargetGroupAttributes",
-        "iam:GetInstanceProfile"
+        "iam:GetInstanceProfile",
+        "iam:GetAccountAuthorizationDetails",
+        "iam:ListPolicies"
       ],
       "Resource": "*"
     },

@@ -3,6 +3,7 @@ import ipaddress
 import json
 import logging
 from pathlib import Path
+import re
 import time
 
 
@@ -27,6 +28,31 @@ class Inventory:
                 raise ValueError("Expected an AWS inventory report with metadata, resource lists and counts")
             self.report = {**report, "loaded": True}
             account = report["metadata"]["account"]
+            iam = report.get("iam", {})
+            policies = {p["Arn"]: {**p, "aws_managed": managed}
+                        for key, managed in (("policies", False), ("aws_managed_policies", True))
+                        for p in iam.get(key, [])}
+            groups = {g["GroupName"]: g for g in iam.get("groups", [])}
+            for collection, name_key in (("users", "UserName"), ("roles", "RoleName"), ("groups", "GroupName")):
+                for entity in iam.get(collection, []):
+                    memberships = [groups[g] for g in entity.get("GroupList", []) if g in groups]
+                    attached = {p["PolicyArn"] for owner in [entity, *memberships]
+                                for p in owner.get("AttachedManagedPolicies", [])}
+                    boundary = entity.get("PermissionsBoundary", {}).get("PermissionsBoundaryArn")
+                    if boundary:
+                        attached.add(boundary)
+                    match = {"kind": "identity", "id": entity["Arn"], "name": entity[name_key],
+                             "account": account, "region": "global", "source": "inventory", "iam": entity,
+                             "iam_groups": memberships,
+                             "iam_members": [{"UserName": u["UserName"], "Arn": u["Arn"]} for u in iam.get("users", [])
+                                             if collection == "groups" and entity[name_key] in u.get("GroupList", [])],
+                             "iam_policies": [policies[p] for p in sorted(attached) if p in policies]}
+                    for value in (entity["Arn"], entity[name_key], entity.get(name_key.replace("Name", "Id"))):
+                        self.add("identity", value, match)
+                    if collection == "roles":
+                        # STS omits the IAM role path. Role names are unique within an account.
+                        partition = entity["Arn"].split(":")[1]
+                        self.add("assumed-role", f"arn:{partition}:sts::{account}:assumed-role/{entity[name_key]}", match)
             # Subnets are optional so older snapshots still supply VPC range context.
             for collection, kind in (("vpcs", "VPC"), ("subnets", "Subnet")):
                 for network in report.get(collection, []):
@@ -64,8 +90,12 @@ class Inventory:
                 matches.append(match)
 
     def lookup(self, kind, value, account, region):
-        return [match for match in self.index.get((kind, value), [])
-                if (not account or match["account"] == account) and (not region or match["region"] == region)]
+        matches = self.index.get((kind, value), [])
+        if kind == "identity" and re.fullmatch(r"arn:[^:]+:sts::[^:]+:assumed-role/[^/]+/[^/]+", value):
+            matches = self.index.get(("assumed-role", value.rsplit("/", 1)[0]), [])
+        return [match for match in matches
+                if (not account or match["account"] == account)
+                and (not region or match["region"] in (region, "global"))]
 
 
 def reference(body, inventory, connection, commands, enrichment):
@@ -146,4 +176,5 @@ def reference(body, inventory, connection, commands, enrichment):
         entities = {(m["account"], "" if kind == "identity" else m["region"], m["id"]) for m in relevant}
         ambiguous = len(entities) > 1
     return {"kind": kind, "value": value, "matches": matches, "network_matches": network_matches, "ambiguous": ambiguous,
-            "snapshot": inventory.report["metadata"], "history_included": include_history}
+            "snapshot": inventory.report["metadata"], "history_included": include_history,
+            "iam_coverage": {key: inventory.report.get("iam", {}).get(key) for key in ("started_at_utc", "completed_at_utc", "errors")}}

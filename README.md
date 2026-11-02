@@ -66,7 +66,8 @@ kamotrace auto C:\cases\example --profile investigation
 
 **Auto handles the preparation:** collect CloudTrail and SSM across enabled
 regions, import the events, add Suzaku Sigma detections and offline DB-IP Lite
-enrichment, collect a current network inventory, then start the browser UI and MCP.
+enrichment, collect a current network and IAM inventory (users, roles, groups and
+customer policies; AWS-managed policy metadata only), then start the browser UI and MCP.
 Suzaku and DB-IP Lite are downloaded and verified if needed.
 
 Open **http://127.0.0.1:8765** on the computer running KamoTrace. Leave the command

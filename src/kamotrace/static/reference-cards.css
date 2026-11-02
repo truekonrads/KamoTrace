@@ -71,6 +71,27 @@
   margin: 0;
   white-space: pre-wrap;
 }
+.reference-card details {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.reference-card summary {
+  cursor: pointer;
+}
+.reference-card summary:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+.reference-card pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 300px;
+  overflow: auto;
+  padding: 10px;
+  background: var(--surface);
+  font: 11px/1.5 var(--font-mono);
+}
 .reference-fields {
   display: flex;
   flex-wrap: wrap;
