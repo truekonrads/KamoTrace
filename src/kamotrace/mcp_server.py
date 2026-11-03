@@ -163,6 +163,21 @@ def search_events(query: Query | None = None, sort: list[Sort] | None = None,
     return search(query, sort, page, size)
 
 
+@mcp.tool(annotations=WRITE)
+def create_export(dataset: Literal["events", "ssm"], query: Query | None = None,
+                  ssm_selection: dict[str, Any] | None = None, fields: list[str] | None = None) -> dict[str, Any]:
+    """Prepare an immutable NDJSON snapshot and return an opaque download URL, expiry, rows, bytes and SHA-256.
+    Events use query; SSM uses ssm_selection (search, search_scope, start, end only).
+    Fields are allowlisted; no SQL, paths, fetch URLs or query-selected writes.
+    Limits: 50,000 rows, 32 MiB, one preparation and four artifacts; expires after ten minutes.
+    Loopback links require a client on the server machine; bounded text tools remain available otherwise."""
+    if dataset == "events" and ssm_selection is not None or dataset == "ssm" and query is not None:
+        raise ToolError("Use query for events or ssm_selection for ssm, never both")
+    return call("/api/exports", {"dataset": dataset,
+        "selection": (query or Query()).body() if dataset == "events" else ssm_selection or {},
+        **({"fields": fields} if fields is not None else {})})
+
+
 @mcp.tool(annotations=READ)
 def summarize_field(field: str, query: Query | None = None) -> dict[str, Any]:
     """Prevalence of a field across the whole filtered result: the five most and least common values,

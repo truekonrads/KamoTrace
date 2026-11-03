@@ -180,6 +180,8 @@ class BrowserContract(unittest.TestCase):
         cls.thread.join()
         cls.server.server_close()
         cls.transports.close()
+        if cls.store.exports is not None:
+            cls.store.exports.close()
         cls.store.reviews.close()
         cls.store.connection.close()
         assert hashlib.sha256(cls.database.read_bytes()).hexdigest() == cls.before
@@ -899,6 +901,16 @@ class BrowserContract(unittest.TestCase):
                 self.assertFalse(scoped["ambiguous"])
                 self.assertEqual([r["id"] for r in scoped["matches"]], ["i-other"])
                 self.assertEqual(scoped["snapshot"]["completed_at_utc"], "2026-10-29T15:01:00Z")
+                for dataset, fields in (("events", ["id", "raw_json"]), ("ssm", ["entry_id", "stdout", "review", "events"])):
+                    exported = await tool("create_export", dataset=dataset, fields=fields)
+                    self.assertTrue(exported["ready"], exported)
+                    with urlopen(exported["download_url"]) as downloaded:
+                        data = downloaded.read()
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), exported["sha256"])
+                    self.assertEqual(len(data.splitlines()) - 1, exported["rows"])
+                    self.assertLess(len(json.dumps(exported).encode()), 2000)
+                self.store.exports.close()
+                self.store.exports = None
 
         for transport in (self.url + "/mcp", StdioServerParameters(
                 command=sys.executable, args=["-m", "kamotrace", "mcp", "--url", self.url])):
@@ -1621,6 +1633,85 @@ class BrowserContract(unittest.TestCase):
         finally:
             for note in notes:
                 self.call("/api/reviews", {"action": "delete", "id": note["id"], "updated": note["updated"]})
+
+    def test_immutable_exports_preserve_selection_raw_text_and_access_contract(self):
+        try:
+            selection = {"start": "2026-10-24T17:00:00Z", "end": "2026-10-25T17:00:00Z"}
+            status, info = self.call("/api/exports", {"dataset": "events", "selection": selection})
+            self.assertEqual(status, 200, info)
+            self.assertTrue(info["ready"])
+            self.assertEqual(info["rows"], 3)
+            self.assertTrue(info["download_url"].startswith(self.url + "/api/exports/"))
+            with urlopen(info["download_url"]) as response:
+                original = response.read()
+            self.assertEqual((len(original), hashlib.sha256(original).hexdigest()), (info["bytes"], info["sha256"]))
+            lines = [json.loads(line) for line in original.splitlines()]
+            self.assertEqual(lines[0]["selection"], selection)
+            self.assertEqual(lines[0]["evidence"]["records"], 5)
+            self.assertEqual({r["id"] for r in lines[1:]}, {2, 3, 4})
+            for row in lines[1:]:
+                self.assertEqual(row["raw_json"], self.call(f'/api/events/{row["id"]}')[1]["raw_json"])
+                self.assertIn("9007199254740993", row["raw_json"])
+            row = lines[1]
+            self.call("/api/reviews", {"action": "tag", "slug": "export-snapshot", "hashes": [row["record_sha256"]], "color": "#112233"})
+            try:
+                with urlopen(info["download_url"]) as response:
+                    self.assertEqual(response.read(), original)
+                self.assertNotEqual(lines[0]["annotation_revision"], self.store.annotation_revision)
+            finally:
+                self.call("/api/reviews", {"action": "untag", "slug": "export-snapshot", "hashes": [row["record_sha256"]]})
+            path = "/api/exports/" + info["id"]
+            for headers in ({"Host": "attacker.invalid"}, {"Origin": "https://attacker.invalid"}):
+                self.assertEqual(self.call(path, headers=headers)[0], 403)
+            for bad in ("../events.duckdb", "0" * 32, "invalid"):
+                self.assertEqual(self.call("/api/exports/" + bad)[0], 404)
+            self.assertEqual(self.call("/api/exports", {"dataset": "events", "selection": {"sql": "select 1"}})[0], 400)
+            self.assertEqual(self.call("/api/exports", {"dataset": "events", "fields": ["raw_event; DROP TABLE events"]})[0], 400)
+            with patch("kamotrace.exports.time.time", return_value=2000000000):
+                self.assertEqual(self.call(path)[0], 404)
+            self.assertFalse(list(self.store.exports.root.iterdir()))
+            with patch("kamotrace.exports.MAX_BYTES", 100):
+                self.assertEqual(self.call("/api/exports", {"dataset": "events"})[0], 400)
+            with patch("kamotrace.exports.MAX_ROWS", 2):
+                self.assertEqual(self.call("/api/exports", {"dataset": "events"})[0], 400)
+            self.assertFalse(list(self.store.exports.root.iterdir()))
+            with patch("kamotrace.exports.MAX_ARTIFACTS", 0):
+                self.assertEqual(self.call("/api/exports", {"dataset": "events"})[0], 400)
+            entered, release, written = threading.Event(), threading.Event(), threading.Event()
+            ordinary_query, prepared = self.store.query, []
+            def paused_query(body):
+                entered.set()
+                if not release.wait(10):
+                    raise ValueError("Test export barrier timed out")
+                return ordinary_query(body)
+            def edit():
+                self.call("/api/reviews", {"action": "tag", "slug": "export-snapshot",
+                    "hashes": [row["record_sha256"]], "color": "#112233"})
+                written.set()
+            with patch.object(self.store, "query", side_effect=paused_query):
+                exporting = threading.Thread(target=lambda: prepared.append(self.call("/api/exports",
+                    {"dataset": "events", "fields": ["id", "tags"]})))
+                exporting.start()
+                self.assertTrue(entered.wait(10))
+                editing = threading.Thread(target=edit)
+                editing.start()
+                try:
+                    self.assertFalse(written.wait(.1))
+                finally:
+                    release.set()
+                    exporting.join(10)
+                    editing.join(10)
+            self.assertTrue(written.is_set())
+            self.assertEqual(prepared[0][0], 200, prepared)
+            with urlopen(prepared[0][1]["download_url"]) as response:
+                snapshot = [json.loads(line) for line in response.read().splitlines()]
+            self.assertFalse(any(t["slug"] == "export-snapshot" for r in snapshot[1:] for t in r["tags"]))
+            self.call("/api/reviews", {"action": "untag", "slug": "export-snapshot", "hashes": [row["record_sha256"]]})
+            self.assertEqual(hashlib.sha256(self.database.read_bytes()).hexdigest(), self.before)
+        finally:
+            if self.store.exports is not None:
+                self.store.exports.close()
+                self.store.exports = None
 
     def test_ssm_batch_reviews_have_independent_results_and_safe_retries(self):
         rows = self.call("/api/ssm-log", {})[1]["data"]

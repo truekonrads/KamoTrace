@@ -1500,6 +1500,21 @@ changed the note since, the call fails without writing; re-read it and retry.
 | `reattach_ssm_review` | Explicit, audited reattachment from an orphan to a current entry with no review. Requires the orphan stamp and an analyst reason; unknown/ambiguous identities additionally require an explicit analyst mapping. Never overwrites destination work. |
 | `edit_ssm_log_entries` | 1–100 explicit edits within 1 MiB. Independent per-item commits, `ok/stale/missing/invalid` results; all duplicate-ID occurrences are invalid. Retry rejected items after rereading; replayed successful stamps are stale. |
 | `lookup_reference` | Scoped `identity/machine/ip` summaries with sources, snapshot times, ambiguity and pagination. History is not searched unless explicitly requested; current configuration is not incident-time identity. Missing inventory is labelled, and no online lookup is triggered. |
+| `create_export` | Immutable NDJSON snapshot of an event `query` or SSM `ssm_selection` with allowlisted fields. Returns readiness, row/byte counts, SHA-256, expiry and an opaque download URL, never a filesystem path. |
+
+Exports prepare synchronously, with one preparation at a time, at most 50,000
+rows / 32 MiB each and four artifacts / 128 MiB per server. Narrow the selection
+or fields after a limit error; no partial download becomes ready. The first NDJSON
+line is a manifest with selection, evidence identity, analyst revision and labelled
+derived provenance. Original `raw_json` is an exact stored **string**, not reparsed
+JSON; supplemental SSM JSON is reconstructed and labelled separately. Later analyst
+edits never alter a prepared export. Downloads do not hold the Store lock.
+Links expire after ten minutes; disposable files are reclaimed on the next export
+request/download or server shutdown. Restarting the server invalidates all links.
+The default trusted link base is loopback; `serve --export-base-url https://trusted-origin`
+can configure a trusted origin, without changing binding or access checks. Never
+derive links from incoming Host headers. Loopback links work only for clients on
+the server machine; consumers unable to download can still use bounded MCP reads.
 
 Review provenance is persisted separately from content-addressed IDs. Only exact
 current matches can backfill legacy metadata; unknown old hashes remain unresolved.

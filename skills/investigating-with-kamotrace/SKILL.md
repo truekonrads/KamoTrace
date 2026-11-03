@@ -363,6 +363,24 @@ Re-read it with `get_ssm_log_entry(entry_id)` to verify the saved review and
 unchanged raw output; `search_ssm_log(search="statically decoded",
 search_scope="enhanced")` now finds it, `search_scope="raw"` does not.
 
+## Immutable bulk exports
+
+Use `create_export(dataset="events", fields=["id", "raw_json"])` or
+`create_export(dataset="ssm", fields=["entry_id", "stdout", "review", "events"])`
+for a complete fixed selection, not a huge tool response. Event filters use `query`;
+SSM uses `ssm_selection` containing only `search`, `search_scope`, `start`, `end`.
+The returned object contains `ready`, `download_url`, `rows`, `bytes`, `sha256`
+and `expires_at`. Download the NDJSON and verify its SHA-256. The first line is a
+manifest recording selection, evidence identity, annotation revision and provenance.
+Original `raw_json` remains an exact string; never parse and reserialize it as a
+replacement for evidence. Supplemental raw JSON is reconstructed and labelled.
+Later edits do not alter an existing artifact. Links expire in ten minutes and
+do not survive a server restart. Limits are one preparation, four artifacts /
+128 MiB total, 50,000 rows / 32 MiB each; narrow fields or selection on a limit
+error. Links use the trusted configured server origin, not caller Host input.
+Loopback URLs work only on the server machine; if unreachable, keep using bounded
+SSM/note chunks and event pages. Never send an export to an online service.
+
 ## Detections and enrichment
 
 - `list_detections` lists Suzaku rules (most severe first) with ATT&CK tags and

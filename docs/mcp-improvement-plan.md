@@ -171,18 +171,26 @@ orphans when exact historical identity exists, with unresolved cases accessible.
   calls distinguish two owners of one private IP from an account/region-scoped
   unique result. Missing-inventory HTTP check remains explicitly not searched.
   Contract suite: 46 tests passed.
-- [ ] **S12: Prepare immutable NDJSON exports.** Accept the ordinary validated
+- [x] **S12: Prepare immutable NDJSON exports.** Accept the ordinary validated
   event/SSM selection and allowlisted fields, not SQL or paths. Generate a fixed
   snapshot with selection, evidence identity, analyst revision and labelled derived
   provenance. Preserve exact original evidence text when included. Use private
   staging, writer locking and safe publication for derived sidecars; never overwrite
   input evidence. Bound concurrent exports, rows/bytes and total disk consumption.
-- [ ] **S13: Expose generated export download links.** Add an explicit MCP
+  Added privately staged, locked, no-clobber snapshots, one preparation / four
+  artifacts, 50,000 rows / 32 MiB each, 128 MiB total. Manifests capture evidence,
+  selection and analyst revision; original raw JSON remains exact text. A concurrent
+  annotation write waits for preparation and does not leak into the snapshot.
+- [x] **S13: Expose generated export download links.** Add an explicit MCP
   `create_export` tool and opaque-ID download endpoint on the existing server.
   Return readiness, expiry and, once computed, row count, bytes and SHA-256.
   Stream the prepared artifact without holding the shared Store lock during slow
   downloads. Clean up expired disposable artifacts; test bad/expired IDs,
   interrupted preparation, exact hashes, repeat downloads and access checks.
+  Added thin create_export, trusted-origin opaque links and lock-free streaming.
+  Ten-minute expiry, request-time/shutdown cleanup, invalid-ID and Host/Origin
+  rejection verified. Failed byte/row/quota preparations leave no artifacts.
+  Contract suite: 47 passed; real HTTP/stdio clients download and hash both datasets.
 
 An export URL is not a server-local filesystem path. Construct links from a trusted
 configured server base, never arbitrary Host input. Keep existing Host/Origin

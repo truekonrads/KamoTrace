@@ -222,9 +222,12 @@ class Store:
             self.connection = duckdb.connect(str(database), read_only=True)
             startup.callback(self.connection.close)
             self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
-            self.lock = threading.Lock()
+            # Snapshot exports reuse public Store reads under one annotation snapshot.
+            self.lock = threading.RLock()
+            self.exports = None
             # Per-process prefix: a page-1 revision from before a restart never validates afterwards.
             self.log_revision = f"{secrets.token_hex(4)}-0"
+            self.annotation_revision = self.log_revision
             logger.info("Opening findings/tags sidecar: %s", annotations or database.with_suffix(".annotations.sqlite3"))
             self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
             startup.callback(self.reviews.close)
@@ -604,6 +607,8 @@ class Store:
     def bump_log_revision(self, hashes=None):
         """Advance the log selection revision after analyst content changed (entry reviews, or event
         tags/findings on evidence linked to log entries). Caller holds the lock."""
+        prefix, count = self.annotation_revision.rsplit("-", 1)
+        self.annotation_revision = f"{prefix}-{int(count) + 1}"
         if hashes is None or not self.commands.log_hashes.isdisjoint(hashes):
             prefix, count = self.log_revision.rsplit("-", 1)
             self.log_revision = f"{prefix}-{int(count) + 1}"
@@ -865,6 +870,54 @@ class Store:
             "interactive_response_budget_bytes": INTERACTIVE_BUDGET,
             **({"timezones": TIMEZONES} if body.get("include_timezones") is True else {})}
 
+    def create_export(self, body, base_url):
+        from .exports import Exports
+        from .suzaku import evidence_identity
+        dataset, selection = body.get("dataset"), body.get("selection", {})
+        if dataset not in ("events", "ssm") or not isinstance(selection, dict):
+            raise ValueError("dataset must be events or ssm; selection must be an ordinary query object")
+        selection_keys = ({"timezone", "search", "filters", "tags", "annotation_id", "command_key", "start", "end",
+                           "rules", "min_level", "sorters", "pipeline", "pipeline_version"} if dataset == "events"
+                          else {"search", "search_scope", "start", "end"})
+        if set(selection) - selection_keys:
+            raise ValueError("Unknown export selection fields: " + ", ".join(sorted(set(selection) - selection_keys)))
+        allowed = (["id", "record_sha256", *FIELDS, "tags", "annotations", "detections", "raw_json"] if dataset == "events"
+                   else ["entry_id", *SSM_SUMMARY_FIELDS, "review", "events", "event_raw_json"])
+        fields = body.get("fields", allowed)
+        if not isinstance(fields, list) or not fields or len(fields) > 40 or any(f not in allowed for f in fields):
+            raise ValueError("Choose 1–40 export fields from: " + ", ".join(allowed))
+        with self.locked("export.registry"):
+            if self.exports is None:
+                self.exports = Exports()
+
+        def write(emit):
+            with self.locked("export.snapshot"):
+                source_hash, records = evidence_identity(self.connection)
+                emit({"type": "manifest", "format": "kamotrace-ndjson-v1", "dataset": dataset,
+                      "selection": selection, "fields": fields, "created_at": datetime.now(timezone.utc).isoformat(),
+                      "evidence": {"source_sha256": source_hash, "records": records},
+                      "annotation_revision": self.annotation_revision,
+                      "provenance": {"raw_json": "Exact original stored JSON text, never reserialized",
+                          "supplemental": "Supplemental SSM export JSON is reconstructed, not original evidence",
+                          "derived": "Offline enrichment, detections and decoding are labelled leads, not evidence",
+                          "ssm": "JSON-backed in-memory supplied export; separate systems and plugins retained"}})
+                page, revision = 1, None
+                while True:
+                    result = (self.query({**selection, "page": page, "size": 100}) if dataset == "events" else
+                              self.ssm_log({**selection, "page": page, "revision": revision}))
+                    revision = result.get("revision")
+                    for row in result["data"]:
+                        if dataset == "events" and "raw_json" in fields:
+                            row["raw_json"] = self.detail(row["id"])["raw_json"]
+                        if dataset == "ssm" and "event_raw_json" in fields:
+                            row["event_raw_json"] = [{k: self.commands.events[e["key"]][k]
+                                for k in ("key", "source", "record_sha256", "raw_json")} for e in row["events"]]
+                        emit({"type": "event" if dataset == "events" else "ssm", **{f: row[f] for f in fields}})
+                    if dataset == "events" and page >= result["last_page"] or dataset == "ssm" and not result["next_page"]:
+                        break
+                    page += 1
+        return self.exports.prepare(write, base_url)
+
     def query(self, body):
         sql, params, count_sql, count_params, size = build_query(body)
         started = time.monotonic()
@@ -1011,6 +1064,8 @@ class Handler(SimpleHTTPRequestHandler):
                 route = self.path.split("?", 1)[0]
                 if route.startswith("/api/events/"):
                     route = "/api/events/:record"
+                elif route.startswith("/api/exports/"):
+                    route = "/api/exports/:id"
                 elif route not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values",
                                    "/api/reviews", "/api/detections", "/api/inventory", "/api/reference",
                                    "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event",
@@ -1111,6 +1166,24 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(self.store.detections_list())
         elif path == "/api/inventory":
             self.respond(self.store.inventory.report)
+        elif path.startswith("/api/exports/"):
+            artifact = self.store.exports and self.store.exports.open(path.removeprefix("/api/exports/"))
+            if not artifact:
+                self.respond({"error": "Unknown or expired export"}, 404)
+                return
+            stream, info = artifact
+            with stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="kamotrace-export.ndjson"')
+                self.send_header("Content-Length", str(info["bytes"]))
+                self.send_header("ETag", '"' + info["sha256"] + '"')
+                self.end_headers()
+                try:
+                    while chunk := stream.read(65536):
+                        self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # The prepared artifact remains immutable and can be downloaded again.
         elif path.startswith("/api/events/"):
             try:
                 record = int(path.rsplit("/", 1)[-1])
@@ -1133,7 +1206,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference"):
+        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1148,6 +1221,8 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
                          "/api/reference": self.store.reference,
+                         "/api/exports": partial(self.store.create_export, base_url=getattr(self.server, "export_base_url",
+                             f"http://127.0.0.1:{self.server.server_port}")),
                          "/api/ssm-log-orphans": self.store.ssm_log_orphans,
                          "/api/ssm-log-text": self.store.ssm_log_text,
                          "/api/ssm-log-reattach": self.store.ssm_log_reattach,
@@ -1174,6 +1249,7 @@ def main(argv=None):
     parser.add_argument("--enrichment", type=Path,
                         help="IP enrichment from `kamotrace enrich` (default: <database>.enrichment.duckdb if present)")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--export-base-url", help="Trusted public HTTP(S) origin for generated export links; default loopback")
     parser.add_argument("--mcp-transport", choices=("http", "stdio"), default="http",
                         help="MCP over HTTP at /mcp (default), or setup instructions for the local stdio adapter")
     # Containers must listen on all interfaces so Docker can publish the port; the image sets
@@ -1192,6 +1268,11 @@ def main(argv=None):
                         default=os.environ.get("KAMOTRACE_LOG_LEVEL", "info"),
                         help="Application log verbosity (default: info, or $KAMOTRACE_LOG_LEVEL)")
     args = parser.parse_args(argv)
+    if args.export_base_url:
+        base_parts = urlsplit(args.export_base_url)
+        if (base_parts.scheme not in ("http", "https") or not base_parts.hostname or base_parts.username
+                or base_parts.password or base_parts.path not in ("", "/") or base_parts.query or base_parts.fragment):
+            parser.error("--export-base-url must be a trusted HTTP(S) origin, without credentials, path, query or fragment")
     if args.log_level not in ("debug", "info", "warning", "error"):
         parser.error("KAMOTRACE_LOG_LEVEL must be debug, info, warning or error")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
@@ -1213,6 +1294,7 @@ def main(argv=None):
         parser.error(str(error))
     logger.info("Binding HTTP server to %s:%s", args.bind, args.port)
     server = ThreadingHTTPServer((args.bind, args.port), partial(Handler, store=store))
+    server.export_base_url = args.export_base_url or f"http://127.0.0.1:{server.server_port}"
     if args.bind != "127.0.0.1":
         print(f"Listening on {args.bind}:{args.port}: anyone who can reach this port gets unauthenticated "
               f"access. Publish it only as 127.0.0.1:{args.port}:{args.port}.", flush=True)
@@ -1240,6 +1322,8 @@ def main(argv=None):
         pass
     finally:
         server.server_close()
+        if store.exports is not None:
+            store.exports.close()
         store.reviews.close()
         store.connection.close()
 
