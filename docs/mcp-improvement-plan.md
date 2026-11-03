@@ -1,8 +1,7 @@
 # MCP improvements: implementation plan
 
-Status: S01–S16 and all three reproduced oracle fixes implemented and verified
-locally, 2026-11-03; not pushed or merged. Browser smoke has an unrelated
-intermittent response-matching assertion (details below).
+Status: S01–S16, all three reproduced oracle fixes and the confirmed browser-test
+matcher fix verified locally, 2026-11-03; not pushed or merged.
 
 ## Goal and authority
 
@@ -321,15 +320,54 @@ explicitly accepted; it remains installed. All three reproduced findings are fix
   preparation 400, while an independent event query took 0.011 seconds. Disconnect
   released quota; replacement preparation/download succeeded with the exact hash.
 
-Combined verification: 117 unittest tests passed (53 contract tests), JavaScript
+Oracle-fix verification: 117 unittest tests passed (53 contract tests), JavaScript
 syntax, wheel/sdist build and diff whitespace checks passed. Browser smoke with
 Playwright 1.64.1 and installed Chrome passed without JavaScript errors on a
 diagnostic rerun after two runs failed at the existing hybrid-query assertion
 (`tests/browser_smoke.py:132`, missing `search`). That test matches any event
 response; a linked-Finding request uses the same route without `search`, so a
-response-matcher race is suspected, not conclusively captured. No browser code or
-test was changed for these fixes; a separate follow-up was suggested. No remaining
+response-matcher race was initially suspected, not conclusively captured. No browser
+code or test had changed at that point; the uncertainty is resolved below. No remaining
 oracle fixes or S01–S16 stories. Intentional limits: oversized interactive raw
 results require a narrower query or export; active downloads can block new export
 preparations until readers close. All changes remain local, with no publishing
 authorization.
+
+### Browser uncertainty resolved
+
+The fifth unchanged full-smoke diagnostic run reproduced the actual failure
+(four earlier runs passed). The broad `/api/events` expectation selected a POST
+with `annotation_id: 1`, `size: 25`, ascending time sort and no `search` or grid
+pagination. Its real HTTP 200 response contained one `UpdateInstanceInformation`
+event (`event-4`): a Finding's linked-event list, not the hybrid query. The selected
+request and full response were captured as synthetic review evidence. This confirms
+the matcher race for the reproduced failure rather than a lost-search application
+regression; the two earlier uncaptured failures cannot independently be reconstructed.
+
+Only `tests/browser_smoke.py` changed: match the exact events route, POST method
+and grid `page: 1`, without matching on the search/pipeline values under test.
+Check both saved-query reopen and Run for the external search, pipeline/version,
+timezone, time bounds, no Finding-only scope, exact event IDs and rendered operations.
+Five targeted reopen/Run repetitions captured ten correct main-query responses
+and excluded 15 actual Finding responses. Each returned precisely `event-0`,
+`event-2`, `event-3`; the DOM showed three SendCommand rows and the retained scope.
+The full smoke then passed without JavaScript errors. Request/response captures
+were retained outside Git; temporary diagnostic scripts were removed.
+
+Oracle's requested scope check found the three fixes proportionate, with no new
+blocker, and recommended ending narrowly rather than adding more infrastructure or
+backend verification. No application code changed for this test fix. Combined
+verification is now complete: prior 117 tests/build/syntax checks plus the fixed
+full browser smoke and repeated targeted flow. No remaining browser uncertainty
+for the reproduced case; no push/merge authorization.
+
+### Authorized shipping verification
+
+The owner subsequently authorized shipping. Rebased the completed implementation
+onto `origin/main` at `f8958b0`, retaining both sides of two user-guide-only
+conflicts; no application conflicts occurred. Post-rebase verification passed:
+118 unittest tests, JavaScript syntax, wheel/sdist build, whitespace checks and
+the full browser smoke (including saved/reopened hybrid queries), with no
+JavaScript errors. All S01–S16 stories and reproduced oracle findings are complete.
+The earlier local-only delivery notes above describe their historical checkpoint;
+the shipping outcome and CI follow-up are recorded in the implementation thread.

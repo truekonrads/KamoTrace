@@ -7,6 +7,14 @@ from playwright.sync_api import expect, sync_playwright
 from test_contract import BrowserContract, MFAContract
 
 
+def event_grid_response(response):
+    # Finding cards share this route but do not send grid pagination. Do not match
+    # on search/pipeline values: losing either must fail the assertions below.
+    return (response.url == BrowserContract.url + "/api/events"
+            and response.request.method == "POST"
+            and response.request.post_data_json.get("page") == 1)
+
+
 def main():
     results = Path("test-results")
     results.mkdir(exist_ok=True)
@@ -124,13 +132,28 @@ def main():
                 expect(rows).to_have_count(5)
                 page.locator("#expand-sidebar").click()
                 page.locator(".note-head").filter(has_text="Hybrid query regression").click()
-                page.get_by_role("button", name="Reopen query", exact=True).click()
+                with page.expect_response(event_grid_response) as reopened:
+                    page.get_by_role("button", name="Reopen query", exact=True).click()
                 expect(page.locator("#load-status")).to_have_text("3 loaded · all")
                 expect(page.locator("#query-state")).to_have_text("Applied")
-                with page.expect_response(lambda response: "/api/events" in response.url) as rerun:
+                with page.expect_response(event_grid_response) as rerun:
                     page.locator("#run").click()
-                assert rerun.value.request.post_data_json["search"] == "SendCommand"
+                for response in (reopened.value, rerun.value):
+                    selection = response.request.post_data_json
+                    assert selection["search"] == "SendCommand"
+                    assert selection["pipeline"] == hybrid["pipeline"]
+                    assert selection["pipeline_version"] == 1
+                    assert selection["timezone"] == "Asia/Singapore"
+                    assert selection["start"] == "2026-10-24T16:59:59.000Z"
+                    assert selection["end"] == "2026-10-25T17:00:01.000Z"
+                    assert selection["annotation_id"] is None
+                    assert response.status == 200
+                    result = response.json()
+                    assert result["last_row"] == 3
+                    assert {r["event_id"] for r in result["data"]} == {"event-0", "event-2", "event-3"}
                 expect(rows).to_have_count(3)
+                for row in rows.all():
+                    expect(row.locator('[tabulator-field="event_name"] .cell-text')).to_have_text("SendCommand")
                 expect(page.locator("#scopes")).to_contain_text("SendCommand")
                 page.screenshot(path=str(results / "pipeline-hybrid-preserved.png"))
                 # A single pipeline search plus an external search is not one plain-text query.
