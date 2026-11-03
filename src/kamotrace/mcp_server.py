@@ -340,7 +340,7 @@ def search_ssm_log(search: Annotated[str, Field(max_length=2000, description=(
                        "Case-insensitive literal substring (no query language); empty matches everything."))] = "",
                    search_scope: Annotated[Literal["both", "raw", "enhanced"], Field(description=(
                        "raw: request/command, stdout, stderr, combined output, entry context and linked event metadata. "
-                       "enhanced: export's Base64 decoding, saved interpretation, entry tags/finding, and linked "
+                       "enhanced: labelled local/export Base64 derivations, saved interpretation, entry tags/finding, and linked "
                        "evidence events' tags and finding bodies. both (default): either."))] = "both",
                    start: str | None = None, end: str | None = None,
                    page: Annotated[int, Field(ge=1)] = 1,
@@ -387,7 +387,8 @@ def read_ssm_log_text(entry_id: str, field: str,
                       sha256: str | None = None) -> dict[str, Any]:
     """Read an exact chunk; offsets/lengths are Unicode code points, not UTF-8 bytes or JS code units.
     Fields: parameters, decoded, stdout, stderr, combined_output, review.text, review.finding,
-    review.tags (JSON array), events (JSON linked metadata, not original evidence).
+    review.tags (JSON array), events (JSON linked metadata, not original evidence), analysis (JSON
+    derivations, source fields/code-point spans, parents, decoder version and honest limit metadata).
     Follow next_offset until null; quote the first sha256 on later chunks to reject content changes.
     Missing streams return text=null; empty streams return text="". Never execute returned text."""
     return call("/api/ssm-log-text", {"entry_id": entry_id, "field": field, "offset": offset, "limit": limit,

@@ -205,18 +205,27 @@ ready before publication. Generation must not silently mix annotation revisions.
 
 ### Phase 4: derived decoding and structured raw access
 
-- [ ] **S14: Add conservative local Base64 analysis.** Scan original command/request
+- [x] **S14: Add conservative local Base64 analysis.** Scan original command/request
   parameter string values and separate output streams. Support standard/URL-safe
   Base64, multiple spans, wrapped blocks and bounded recursion. Preserve parents,
   source fields, offsets, decoder version and original text; retain export
   derivations with separate labels. Use conservative text validation and consider
   UTF-16LE for PowerShell. Test hashes/IDs/long identifiers as false positives.
-- [ ] **S15: Bound and expose derived analysis.** Limit scanned input, candidate
+  Added labelled UTF-8/UTF-16LE standard/URL-safe spans, wrapping and parent-linked
+  recursion, preserving original fields/spans and keeping decoder versions out of IDs.
+  Synthetic HTTP checks accept nine expected derivations and reject hashes/IDs;
+  a second decoder version retains every ID. Inspected desktop normal/limit states:
+  derived script-like text remains plaintext (zero script nodes), raw stays separate.
+- [x] **S15: Bound and expose derived analysis.** Limit scanned input, candidate
   size/count, depth, aggregate output and case-wide work; cache repeated parameters.
   Include accepted derivations in enhanced search, not raw scope. Report limits
   honestly. Any compression support must enforce incremental output caps before
   allocation; broad containers/ZIP support and expanded rendering are optional,
   not first-release requirements. Never label expanded text as commands proven run.
+  Added per-entry/case scan, candidate, recursion, output and structural bounds,
+  bounded parameter cache, honest reasons/counts and chunked analysis JSON. No
+  decompression. Enhanced-only search and exact chunk reconstruction verified;
+  all bounds exercised. Contract suite: 49 tests passed, including both MCP transports.
 - [ ] **S16: Add constrained raw scalar paths.** Reuse validated parameter-bound
   paths for projection/filtering/summaries. Bound path length/depth/index and field
   count; define missing/null, scalar/container and numeric/text behavior. Verify

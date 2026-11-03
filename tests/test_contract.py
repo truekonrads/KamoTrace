@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from contextlib import ExitStack
 from functools import partial
 import gc
+import base64
 import gzip
 import hashlib
 from http.server import ThreadingHTTPServer
@@ -883,6 +884,8 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual([e["entry_id"] for e in found["data"]], [entry["entry_id"]])
                 self.assertEqual((await tool("search_ssm_log", search="statically decoded", search_scope="raw"))["total"], 0)
                 self.assertEqual((await tool("get_ssm_log_entry", entry_id=entry["entry_id"]))["review"], review)
+                analysis = await tool("read_ssm_log_text", entry_id=entry["entry_id"], field="analysis")
+                self.assertIn("decoder_version", json.loads(analysis["text"]))
                 self.assertEqual((await tool("get_ssm_log_entry", entry_id="0" * 64))[0], "error")
                 continued = await tool("search_ssm_log", search="stdout", page=2)
                 self.assertEqual(continued[0], "error")
@@ -1712,6 +1715,99 @@ class BrowserContract(unittest.TestCase):
             if self.store.exports is not None:
                 self.store.exports.close()
                 self.store.exports = None
+
+    def test_local_base64_derivations_are_bounded_labelled_and_not_raw(self):
+        def encoded(text, encoding="utf-8", urlsafe=False):
+            return (base64.urlsafe_b64encode if urlsafe else base64.b64encode)(text.encode(encoding)).decode()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ssm.json"
+            document = json.loads(self.ssm_export.read_text())
+            wrapped = encoded("wrapped synthetic payload with exact spans")
+            nested = encoded("echo " + encoded("nested synthetic payload"))
+            document["commands"][0]["record"]["Parameters"] = {"commands": [
+                "prefix " + encoded("first synthetic payload") + "; " + encoded("second synthetic payload"),
+                wrapped[:20] + "\n" + wrapped[20:], nested,
+                encoded("Write-Output 'powershell synthetic'", "utf-16-le"),
+                encoded("urlsafe synthetic 😀 >>>", urlsafe=True),
+                "a" * 64, "AKIAABCDEFGHIJKLMNOP", "i-0123456789abcdef0", "a-long-ordinary-identifier-1234567890"]}
+            document["invocation_details"][0]["record"]["StandardOutputContent"] = encoded("stdout synthetic plaintext")
+            document["invocation_details"][0]["record"]["StandardErrorContent"] = encoded("stderr synthetic plaintext")
+            path.write_text(json.dumps(document))
+            annotations = Path(folder) / "reviews.sqlite3"
+            previous = None
+            for version in ("local-base64-v1", "synthetic-decoder-v2"):
+                with patch("kamotrace.base64_analysis.VERSION", version):
+                    store = Store(self.database, annotations=annotations, ssm_export=path)
+                server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                def post(route, body):
+                    with urlopen(Request(f"http://127.0.0.1:{server.server_port}" + route,
+                        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})) as response:
+                        return json.load(response)
+                try:
+                    rows = post("/api/ssm-log", {})["data"]
+                    ids = {e["entry_id"] for e in rows}
+                    if previous is not None:
+                        self.assertEqual(ids, previous)
+                    previous = ids
+                    alpha = next(e for e in rows if e["instance_id"] == "i-alpha" and e["plugin"] == "shell")
+                    derived = alpha["analysis"]["derivations"]
+                    texts = {d["text"] for d in derived}
+                    self.assertLessEqual({"first synthetic payload", "second synthetic payload", "nested synthetic payload",
+                        "wrapped synthetic payload with exact spans", "Write-Output 'powershell synthetic'",
+                        "stdout synthetic plaintext", "stderr synthetic plaintext"}, texts)
+                    self.assertTrue(any(d["parent"] is not None for d in derived))
+                    self.assertTrue(any(d["encoding"] == "utf-16-le" for d in derived))
+                    self.assertIn("urlsafe synthetic 😀 >>>", texts)
+                    self.assertTrue(any(d["alphabet"] == "urlsafe" for d in derived))
+                    self.assertEqual(len(derived), 9)  # Hashes, AWS IDs and ordinary identifiers are not derivations.
+                    self.assertEqual(len([d for d in derived if d["source_field"] in ("stdout", "stderr")]), 2)
+                    for d in derived:
+                        self.assertEqual(d["decoder_version"], version)
+                        if d["parent"] is not None:
+                            self.assertEqual(derived[d["parent"]]["text"][d["start"]:d["end"]], d["original_text"])
+                    for scope, expected in (("raw", 0), ("enhanced", 1)):
+                        self.assertEqual(post("/api/ssm-log", {"search": "stdout synthetic plaintext", "search_scope": scope})["total"], expected)
+                    self.assertIn("Export derivations", alpha["decoded"])
+                    self.assertIn("Local Base64 derivation", alpha["decoded"])
+                    content, offset, digest = "", 0, None
+                    while offset is not None:
+                        chunk = post("/api/ssm-log-text", {"entry_id": alpha["entry_id"], "field": "analysis",
+                            "offset": offset, **({"sha256": digest} if digest else {})})
+                        content += chunk["text"]
+                        offset, digest = chunk["next_offset"], chunk["sha256"]
+                    self.assertEqual(json.loads(content), alpha["analysis"])
+                    self.assertFalse(alpha["analysis"]["truncated"])
+                finally:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+                    store.connection.close()
+                    store.reviews.close()
+
+    def test_base64_analysis_reports_limits_without_unbounded_expansion(self):
+        from kamotrace.base64_analysis import Analysis, LIMITS
+        def encoded(text):
+            return base64.b64encode(text.encode()).decode()
+        payload = encoded("bounded synthetic payload")
+        cases = [("a" * 65536 + payload, "input_limit"), ("A" * 16385, "candidate_size_limit"),
+                 (";".join([payload] * 33), "candidate_limit"),
+                 (";".join([encoded("synthetic " * 1100)] * 2), "output_limit"),
+                 (encoded("echo " + encoded("echo " + payload)), "depth_limit")]
+        for source, reason in cases:
+            result = Analysis().analyze([("parameters", source)])
+            self.assertTrue(result["truncated"], reason)
+            self.assertIn(reason, result["reasons"])
+            self.assertLessEqual(result["output_bytes"], 16384)
+            self.assertLessEqual(result["candidates"], 32)
+        for key, value, reason in (("case_input_code_points", 8, "case_input_limit"),
+                ("case_candidates", 0, "case_candidate_limit"), ("case_output_bytes", 0, "case_output_limit"),
+                ("case_entries", 0, "case_entry_limit")):
+            with patch.dict(LIMITS, {key: value}):
+                self.assertIn(reason, Analysis().analyze([("parameters", payload)])["reasons"])
+        result = Analysis().analyze([("parameters", [payload] * 513)])
+        self.assertIn("source_structure_limit", result["reasons"])
 
     def test_ssm_batch_reviews_have_independent_results_and_safe_retries(self):
         rows = self.call("/api/ssm-log", {})[1]["data"]

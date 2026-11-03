@@ -60,6 +60,7 @@ class Commands:
             FROM events WHERE event_source='ssm.amazonaws.com'""").fetchall()
         sources = [(None, json.dumps(e, ensure_ascii=False), None) for e in document.get("cloudtrail_records", [])]
         sources.extend(local)  # Prefer original evidence JSON when both exports contain the event.
+        request_values = {}
         for source_record, raw, record_hash in sources:
             event = json.loads(raw)
             if event.get("eventSource") != "ssm.amazonaws.com":
@@ -72,6 +73,7 @@ class Commands:
             event_key = hashlib.sha256(json.dumps([event.get("recipientAccountId"), event.get("awsRegion"),
                 event.get("eventID"), hashlib.sha256(json.dumps(event, sort_keys=True,
                     ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()]).encode()).hexdigest()
+            request_values[event_key] = request
             self.events[event_key] = {"key": event_key, "event_id": event.get("eventID"),
                 "id": source_record, "raw_json": raw, "record_sha256": record_hash,
                 "event_time": event.get("eventTime"), "operation": event.get("eventName"),
@@ -134,6 +136,8 @@ class Commands:
         self.log_entries = {}
         self.log_sources = {}
         self.source_entries = {}
+        from .base64_analysis import Analysis
+        analysis = Analysis()
 
         def log_time(value):
             # CloudTrail imports retain records with invalid timestamps as evidence too.
@@ -142,7 +146,7 @@ class Commands:
             except ValueError:
                 return None
 
-        def add(row, raw, semantic):
+        def add(row, raw, semantic, inputs=()):
             identity = json.dumps([row, raw], sort_keys=True, ensure_ascii=False, separators=(",", ":"))
             entry_id = hashlib.sha256(identity.encode()).hexdigest()
             # Keep repeated identical invocations/session rows individually visible too.
@@ -159,6 +163,13 @@ class Commands:
                 "source_sha256": hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()}
             if semantic:
                 self.source_entries.setdefault(semantic, []).append(entry_id)
+            derived = analysis.analyze(inputs)
+            self.log_entries[entry_id]["analysis"] = derived
+            # Derivation versions/output are not evidence identity or implicit review migrations.
+            exported = "Export derivations (supplied enrichment):\n" + row["decoded"] if row["decoded"] else ""
+            local = [f"Local Base64 derivation ({r['source_field']}, {r['encoding']}; not proof of execution):\n{r['text']}"
+                     for r in derived["derivations"]]
+            self.log_entries[entry_id]["decoded"] = "\n\n".join(([exported] if exported else []) + local)
             return self.log_entries[entry_id]
 
         for row, source in zip(self.sheet_rows, self.sheet_sources):
@@ -173,7 +184,14 @@ class Commands:
                 item["time_basis"] = "Execution start" if source["output"].get("ExecutionStartDateTime") else "Response start"
             # Bind reviews to the actual source records, not just rendered output or row order.
             semantic = ["command_output", row["account"], row["region"], row["command_id"], row["instance_id"], row["plugin"]]
-            add(item, source, semantic if all(semantic[1:5]) else None)["events"] = command["events"]
+            inputs = [("parameters", (source["command"] or {}).get("Parameters")),
+                      *[(f"requests[{e['key']}]", request_values[e["key"]]) for e in command["events"][:32] if e["request"] is not None],
+                      *[(f, row[f]) for f in ("stdout", "stderr", "combined_output")]]
+            entry = add(item, source, semantic if all(semantic[1:5]) else None, inputs)
+            entry["events"] = command["events"]
+            if len(command["events"]) > 32:
+                entry["analysis"]["truncated"] = True
+                entry["analysis"]["reasons"].append("linked_request_limit")
         for event in self.events.values():
             # A request linked by exact account, region and command ID is part of that command's
             # activity: it is already a linked event of each of the command's system/plugin entries.
@@ -194,7 +212,8 @@ class Commands:
             metadata["time"] = event["event_time"]
             semantic = ["original_request" if event["id"] is not None else "supplemental_request",
                         event["account"], event["region"], event["event_id"]]
-            add(item, event["raw_json"], semantic if all(semantic[1:]) else None)["events"] = [metadata]
+            add(item, event["raw_json"], semantic if all(semantic[1:]) else None,
+                [("parameters", request)])["events"] = [metadata]
         # describe_sessions reports metadata, not a terminal transcript. Keep these independent
         # from CloudTrail requests: a target or nearby timestamp is not a session identity join.
         for session in document.get("sessions", []):

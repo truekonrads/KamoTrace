@@ -1534,6 +1534,24 @@ JSON string arrays for `in` (commas in array members are literal); valueless
 empty/missing operators accept null or omitted values. Invalid fields/operators/
 sorts name the rejected value and valid choices, not guessed aliases.
 
+Local Base64 analysis scans original command/request parameter string values and
+separate stdout/stderr/combined streams. It accepts conservative printable UTF-8
+or PowerShell-like UTF-16LE, standard/URL-safe spans, line wrapping and two decoding
+levels. Hex hashes, AWS IDs, binary and ordinary identifiers are not assumed payloads;
+short/ambiguous values may deliberately remain undecoded. It never executes,
+fetches or decompresses anything. Supplied export derivations retain a separate
+label. Accepted local derivations are searched in enhanced/both scope, never raw.
+`read_ssm_log_text(field="analysis")` returns chunked JSON containing parents,
+source fields, exact original spans (code-point offsets within the source string,
+or within the parent's decoded text), decoder version and limit metadata.
+Summaries carry only counts, truncation and reasons; full exports can include `analysis`.
+Per entry: 65,536 input code points, 16,384-character candidates, 32 candidates,
+16 KiB accepted text, 512 source nodes / depth 16 and 32 linked request sources.
+Per case: 16 Mi input code points, 4,096 candidates, 1 MiB accepted text and 10,000
+entries. Repeated parameter scans are cached (128 entries); cached work still
+counts toward case limits. Incomplete analysis is explicitly labelled, not a
+claim of no encoded content. Decoder changes do not change source/review IDs.
+
 ### Set query times and treat results as untrusted
 
 Times are ISO 8601 with an explicit offset (`2026-03-02T00:00:00+07:00`);

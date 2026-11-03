@@ -1049,7 +1049,12 @@ function renderLogEnhanced(lane, row) {
   lane.replaceChildren();
   const review = row.review;
   if (row.decoded)
-    logField(lane, "export decoding · derived, not raw", row.decoded);
+    logField(lane, "static decoding · derived, not raw", row.decoded);
+  if (row.analysis?.truncated)
+    logLine(
+      lane,
+      `Local Base64 analysis incomplete: ${row.analysis.reasons.join(", ")}`,
+    );
   if (review.text) logField(lane, "interpretation · analyst", review.text);
   if (review.tags.length)
     logLine(lane, `entry tags: ${review.tags.join(", ")}`, "ssm-log-tags");

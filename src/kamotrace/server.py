@@ -42,7 +42,7 @@ SSM_SUMMARY_FIELDS = ("time_ms", "time_basis", "account", "region", "command_key
                       "instance_id", "plugin", "operation", "status", "response_code", "output_state",
                       "parameters", "decoded", "stdout", "stderr", "combined_output")
 SSM_TEXT_FIELDS = tuple(f for f in SSM_SUMMARY_FIELDS if f not in ("time_ms", "response_code")) + (
-    "review.text", "review.finding", "review.tags", "review.source", "review.history", "events")
+    "review.text", "review.finding", "review.tags", "review.source", "review.history", "events", "analysis")
 
 
 def text_preview(value, limit=96):
@@ -53,6 +53,9 @@ def text_preview(value, limit=96):
 def log_summary(entry, fields, preview_bytes=96):
     row = {"entry_id": entry["entry_id"], "event_count": len(entry["events"]),
            "review": {**entry["review"], "tags": entry["review"]["tags"][:5]}, "truncated": {}}
+    analysis = entry.get("analysis", {})
+    row["analysis"] = {"derivations": len(analysis.get("derivations", [])),
+                       **{k: analysis[k] for k in ("decoder_version", "truncated", "reasons") if k in analysis}}
     for key, value in [(k, entry[k]) for k in fields] + [
             ("review.text", entry["review"]["text"]), ("review.finding", entry["review"]["finding"])]:
         shown = text_preview(value, preview_bytes) if isinstance(value, str) else value
@@ -500,9 +503,12 @@ class Store:
                 value = entry[field]
                 if field == "events":
                     value = json.dumps(self.log_review_data([entry])[0]["events"], ensure_ascii=False)
+                elif field == "analysis":
+                    value = json.dumps(value, ensure_ascii=False)
                 stamp = None
             return {"entry_id": entry_id, "field": field, **text_chunk(value, body), "updated": stamp,
-                    "serialization": "json_metadata" if field in ("events", "review.tags") else "original_string"}
+                    "serialization": "json_metadata" if field in ("events", "review.tags", "analysis") else
+                        "labelled_derivations" if field == "decoded" else "original_string"}
 
     def ssm_log_orphans(self, body):
         """Explicit, bounded discovery of preserved reviews with no current content match."""
@@ -882,7 +888,7 @@ class Store:
         if set(selection) - selection_keys:
             raise ValueError("Unknown export selection fields: " + ", ".join(sorted(set(selection) - selection_keys)))
         allowed = (["id", "record_sha256", *FIELDS, "tags", "annotations", "detections", "raw_json"] if dataset == "events"
-                   else ["entry_id", *SSM_SUMMARY_FIELDS, "review", "events", "event_raw_json"])
+                   else ["entry_id", *SSM_SUMMARY_FIELDS, "review", "events", "event_raw_json", "analysis"])
         fields = body.get("fields", allowed)
         if not isinstance(fields, list) or not fields or len(fields) > 40 or any(f not in allowed for f in fields):
             raise ValueError("Choose 1–40 export fields from: " + ", ".join(allowed))
