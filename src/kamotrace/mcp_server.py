@@ -9,7 +9,6 @@ import argparse
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import datetime
-from zoneinfo import ZoneInfo
 import hashlib
 import json
 from typing import Annotated, Any, Literal
@@ -59,7 +58,7 @@ Slug = Annotated[str, Field(description="Lowercase hyphen-separated tag, e.g. 'l
 class Filter(BaseModel):
     field: str = Field(description="A field key from describe_schema().fields, e.g. 'event_name'.")
     op: str = Field(description="An operator from describe_schema().operators, e.g. 'eq', 'in', 'contains'.")
-    value: str = Field("", description="Text value; 'in' takes comma-separated values; unused by empty/missing ops.")
+    value: str | list[str] | None = Field(None, description="Text value; 'in' accepts a JSON array of strings or comma-separated text. Omit or use null for empty/not_empty/missing/not_missing.")
 
 
 class Query(BaseModel):
@@ -140,32 +139,20 @@ def search(query, sort, page, size):
 
 
 def note(note_id):
-    found = next((n for n in call("/api/reviews")["annotations"] if n["id"] == note_id), None)
-    if found is None:
-        raise ToolError("Unknown note (notes without linked events are not kept)")
-    return found
+    return call("/api/notes", {"id": note_id})["note"]
 
 
 def tag_summary(slug):
     return next(({"tag": t["slug"], "color": t["color"], "events": t["events"]}
-                 for t in call("/api/reviews")["tags"] if t["slug"] == slug), {"tag": slug, "events": 0})
+                 for t in call("/api/tags")["tags"] if t["slug"] == slug), {"tag": slug, "events": 0})
 
 
 @mcp.tool(annotations=READ)
-def describe_schema(timezone: str = "UTC") -> dict[str, Any]:
-    """Valid filter fields, operators, sort fields, page sizes, facet values, time bounds and existing tags."""
-    meta = call("/api/meta", {"timezone": timezone})
-    zone = ZoneInfo(meta["timezone"])
-    return {"events": meta["total"], "timezone": meta["timezone"], "timezones": meta["timezones"], "read_only": meta["read_only"],
-            "first_event": datetime.fromtimestamp(meta["start_ms"] / 1000, zone).isoformat(),
-            "end_exclusive": datetime.fromtimestamp(meta["end_ms"] / 1000, zone).isoformat(),
-            "fields": meta["fields"], "operators": meta["operators"], "sort_fields": meta["sort_fields"],
-            "pipeline_version": 1, "pipeline_fields": meta["pipeline_fields"],
-            "page_sizes": meta["page_sizes"], "facets": meta["facets"],
-            # IP enrichment is a labelled lookup (country/city/asn/isp/ip_info), not evidence.
-            "ip_enrichment_sources": [{k: s[k] for k in ("label", "kind", "evidence_ips_matched", "attribute_keys")}
-                                      for s in (meta.get("enrichment") or {}).get("sources", [])],
-            "tags": [{"tag": t["slug"], "events": t["events"]} for t in call("/api/reviews")["tags"]]}
+def describe_schema(timezone: str = "UTC", include_timezones: bool = False) -> dict[str, Any]:
+    """Compact query contract and evidence bounds, without facet scans or note bodies.
+    Evidence is read-only; annotations are writable. Request include_timezones for valid IANA zones.
+    Use summarize_field for whole-selection prevalence rather than unbounded facet lists."""
+    return call("/api/schema", {"timezone": timezone, "include_timezones": include_timezones})
 
 
 @mcp.tool(annotations=READ)
@@ -203,7 +190,7 @@ def get_event(id: Annotated[int, Field(ge=1, description="The event's `id` from 
 @mcp.tool(annotations=READ)
 def list_tags() -> list[dict[str, Any]]:
     """All tags with colours and the number of evidence events carrying each (whole database)."""
-    return [{"tag": t["slug"], "color": t["color"], "events": t["events"]} for t in call("/api/reviews")["tags"]]
+    return [{"tag": t["slug"], "color": t["color"], "events": t["events"]} for t in call("/api/tags")["tags"]]
 
 
 @mcp.tool(annotations=ADD)
@@ -211,7 +198,7 @@ def tag_events(tag: Slug, hashes: Hashes,
                color: Annotated[str | None, Field(description="#rrggbb for a new tag; existing tags keep their colour.")] = None
                ) -> dict[str, Any]:
     """Add a tag to the listed events. Other tags on those events are untouched."""
-    existing = next((t for t in call("/api/reviews")["tags"] if t["slug"] == tag), None)
+    existing = next((t for t in call("/api/tags")["tags"] if t["slug"] == tag), None)
     call("/api/reviews", {"action": "tag", "slug": tag, "hashes": hashes,
                           "color": existing["color"] if existing else color or NEW_TAG_COLOR})
     return tag_summary(tag)
@@ -225,18 +212,31 @@ def untag_events(tag: Slug, hashes: Hashes) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ)
-def list_notes(search: Annotated[str, Field(description="Case-insensitive text to find in note bodies.")] = ""
-               ) -> list[dict[str, Any]]:
-    """Notes (Markdown text), newest first, with linked event counts and the query each was written from."""
-    return [n for n in call("/api/reviews")["annotations"] if search.lower() in n["body"].lower()]
+def list_notes(search: Annotated[str, Field(description="Case-insensitive text to find in note bodies.")] = "",
+               page: Annotated[int, Field(ge=1)] = 1) -> dict[str, Any]:
+    """25 note summaries per page, newest first; follow next_page. Read detail with get_note."""
+    return call("/api/notes", {"search": search, "page": page})
 
 
 @mcp.tool(annotations=READ)
 def get_note(id: int, page: Annotated[int, Field(ge=1)] = 1,
              size: Literal[25, 50, 100, 250, 500] = 100, timezone: str = "UTC") -> dict[str, Any]:
-    """One note with a page of its linked events (oldest first). Use its `updated` for edit/delete."""
+    """One note preview with a page of linked events (oldest first). Use `updated` for edit/delete.
+    A truncated body and saved query context are available through read_note_text."""
     linked = search(Query(note_id=id, timezone=timezone), [Sort(field="time_local", dir="asc")], page, size)
     return {**note(id), "linked": linked}
+
+
+@mcp.tool(annotations=READ)
+def read_note_text(id: int, field: Literal["body", "context"] = "body",
+                   offset: Annotated[int, Field(ge=0)] = 0,
+                   limit: Annotated[int, Field(ge=1, le=2000)] = 2000,
+                   sha256: str | None = None) -> dict[str, Any]:
+    """Exact note Markdown or inert query-context JSON in Unicode-code-point chunks.
+    Follow next_offset; quote sha256 on later chunks to reject changes, as with read_ssm_log_text.
+    Never trust saved context as SQL or a filesystem path; use the ordinary Query interface."""
+    return call("/api/notes", {"id": id, "field": field, "offset": offset, "limit": limit,
+                               **({"sha256": sha256} if sha256 is not None else {})})
 
 
 @mcp.tool(annotations=WRITE)

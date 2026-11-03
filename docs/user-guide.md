@@ -1483,20 +1483,30 @@ changed the note since, the call fails without writing; re-read it and retry.
 
 | Tool | What it does |
 | --- | --- |
-| `describe_schema` | Filter fields, operators, `pipeline_fields` and version, sort fields, page sizes, facet values, supported IANA timezones, time bounds and tags. Takes `timezone` (default `UTC`). Call first. |
+| `describe_schema` | Compact fields, operators, `pipeline_fields` and version, sorts, page sizes, time bounds and explicit evidence-read-only/annotations-writable flags. Takes `timezone` (default `UTC`); set `include_timezones=true` for supported IANA zones. Use summaries for prevalence. Call first. |
 | `search_events` | `query` (search, filters, `pipeline`/`pipeline_version`, all-of tags/rules, minimum level, note, SSM command, start/end and timezone) plus sort, page and size. Returns the full filtered total and one page with hashes, tags and note IDs. External query properties AND with the whole pipeline. |
 | `summarize_field` | Top/bottom five values, distinct count and total for a field across the whole filtered result. |
 | `event_histogram` | Counts per `query.timezone`-aligned bucket (empty buckets included, at most 2,000), with epoch-millisecond boundaries. |
 | `get_event` | Exact stored raw JSON by `id`, its `record_sha256`, a recomputed hash check, linked SSM commands and separate linked GuardDuty finding JSON. |
 | `list_tags` / `tag_events` / `untag_events` | Tags with event counts; add or remove one tag on explicit hashes. Adding is additive and keeps an existing tag's colour (new tags default to the browser's colour). |
-| `list_notes` / `get_note` | Notes (searchable), with linked event counts and the query they were written from; one note plus a page of its linked events. `get_note` takes `timezone` (default `UTC`) for those events. |
+| `list_notes` / `get_note` / `read_note_text` | Searchable, paginated note summaries (25/page, follow `next_page`), direct note preview with linked-event page, and exact body/context chunks. `get_note` takes `timezone` (default `UTC`) for linked events. Read truncated bodies fully before editing. |
 | `create_note` / `edit_note` / `delete_note` | Markdown notes (sanitised when the browser renders them). `create_note` can record the agent's query so **Reopen query** works in the browser. |
 | `link_note_events` / `unlink_note_events` | Add or remove linked events; a note keeps at least one. |
 | `list_detections` | Suzaku rules and labelled GuardDuty contextual leads, with linked event counts and separate provenance. `run` is null without Suzaku; `guardduty` is null without GuardDuty. Takes no arguments; filter events using `query.rules` (all must match) or `query.min_level` in `search_events`, `summarize_field` or `event_histogram`. GuardDuty context is not an exact event match. |
 | `search_ssm_commands` / `get_ssm_command` / `get_ssm_event` | SSM commands from the JSON-backed export, each system/plugin output kept separate, linked CloudTrail events by exact account/region/command ID. |
-| `search_ssm_log` | Oldest-first activity entries, 100 per page, with literal search, raw/enhanced/both scope and start/end bounds. Pass page 1's `revision` for later pages of non-empty both/enhanced searches; restart at page 1 if stale. |
-| `get_ssm_log_entry` | One current entry and its saved analyst review by exact `entry_id`, independent of the current search. Use to re-read after an edit conflict. |
+| `search_ssm_log` / `get_ssm_log_entry` / `read_ssm_log_text` | Fixed 5-row summary pages with optional allowlisted `fields`, exact summary lookup and full text in chunks. Previews carry truncation metadata; linked-event metadata is retrieved as `field="events"`. Follow `next_page`, passing the search revision for non-empty enhanced/both continuations. |
+| `list_ssm_orphan_reviews` / `get_ssm_orphan_review` | Preserved, unattached reviews: 25 summaries/page and exact preview lookup. Ordinary searches return only a count. Complete review text remains available in chunks. |
 | `edit_ssm_log_entry` | Save an explicit entry's interpretation text, entry tags and entry finding using its current `updated` stamp (null for a new review). Stale writes fail; raw evidence and event tags/findings are not changed. |
+
+SSM summary and text reads target a serialized UTF-8 response budget of 80,000
+bytes including MCP envelopes. Text chunks allow 1–2,000 Unicode code points,
+not UTF-8 bytes or JavaScript UTF-16 units; follow `next_offset` to null, quoting
+the first `sha256` on later chunks to reject changes. Length, UTF-8 byte length
+and digest describe the full string; missing and empty remain distinct. Browser
+activity lanes retain their full projection separately. Event filters accept
+JSON string arrays for `in` (commas in array members are literal); valueless
+empty/missing operators accept null or omitted values. Invalid fields/operators/
+sorts name the rejected value and valid choices, not guessed aliases.
 
 ### Set query times and treat results as untrusted
 

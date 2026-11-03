@@ -755,6 +755,10 @@ class BrowserContract(unittest.TestCase):
                 schema = await tool("describe_schema")
                 self.assertIn("not_missing", schema["operators"])
                 self.assertEqual(schema["timezone"], "UTC")
+                self.assertTrue(schema["evidence_read_only"])
+                self.assertTrue(schema["annotations_writable"])
+                self.assertNotIn("facets", schema)
+                self.assertNotIn("timezones", schema)
                 self.assertEqual(schema["first_event"], "2026-10-24T16:59:59+00:00")
                 self.assertEqual(schema["pipeline_fields"], rest("/api/meta")["pipeline_fields"])
                 # The end-user skill's pipeline example, through both real MCP transports.
@@ -788,7 +792,7 @@ class BrowserContract(unittest.TestCase):
                         error = await tool(name, query=invalid, **arguments)
                         self.assertEqual(error[0], "error", (name, error))
                         self.assertIn(message, error[1])
-                singapore = await tool("describe_schema", timezone="Asia/Singapore")
+                singapore = await tool("describe_schema", timezone="Asia/Singapore", include_timezones=True)
                 self.assertEqual(singapore["first_event"], "2026-10-25T00:59:59+08:00")
                 self.assertIn("America/New_York", singapore["timezones"])
                 local_query = {"timezone": "Asia/Singapore", "filters": [
@@ -830,6 +834,14 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual((await tool("unlink_note_events", id=created["id"], hashes=hashes[:1]))[0], "error")
                 note = await tool("get_note", id=created["id"])
                 self.assertEqual((note["body"], note["linked"]["total"], note["updated"]), ("Edited", 1, unlinked["updated"]))
+                self.assertIn(created["id"], [n["id"] for n in (await tool("list_notes", search="Edited"))["data"]])
+                self.assertEqual((await tool("read_note_text", id=created["id"]))["text"], "Edited")
+                context = json.loads((await tool("read_note_text", id=created["id"], field="context"))["text"])
+                self.assertEqual(context["timezone"], "Asia/Jakarta")
+                self.assertEqual((await tool("search_events", query={"filters": [{"field": "event_name", "op": "in",
+                    "value": ["StartSession", "UpdateInstanceInformation"]}]}))["total"], 2)
+                self.assertEqual((await tool("search_events", query={"filters": [{"field": "document_name", "op": "missing",
+                    "value": None}]}))["total"], 5)
                 singapore_note = await tool("get_note", id=created["id"], timezone="Asia/Singapore")
                 self.assertEqual(singapore_note["linked"]["events"][0]["time_local"], "2026-10-25 09:02:03")
                 self.assertGreater(unlinked["updated"], edited["updated"])
@@ -1560,6 +1572,41 @@ class BrowserContract(unittest.TestCase):
                 store.reviews.close()
                 store.connection.close()
 
+    def test_compact_notes_preserve_full_bodies_and_stale_edit_protection(self):
+        hash_ = self.call("/api/events", {})[1]["data"][0]["record_sha256"]
+        body = "🦆 synthetic note\n" * 1200 + "ÉVIDENCE needle beyond preview"
+        notes = []
+        try:
+            for i in range(27):
+                status, note = self.call("/api/reviews", {"action": "annotate", "body": body + str(i), "hashes": [hash_]})
+                self.assertEqual(status, 200)
+                notes.append(note)
+            seen, page = [], 1
+            while page:
+                result = self.call("/api/notes", {"search": "évidence", "page": page})[1]
+                self.assertLess(len(json.dumps(result).encode()), 30000)
+                seen.extend(n["id"] for n in result["data"])
+                page = result["next_page"]
+            self.assertEqual(seen, [n["id"] for n in reversed(notes)])
+            note = notes[0]
+            detail = self.call("/api/notes", {"id": note["id"]})[1]["note"]
+            self.assertTrue(detail["body_truncated"])
+            self.assertEqual(detail["events"], 1)
+            first = self.call("/api/notes", {"id": note["id"], "field": "body"})[1]
+            self.assertEqual(first["text"], (body + "0")[:2000])
+            status, edit = self.call("/api/reviews", {"action": "edit", "id": note["id"],
+                "body": "Replacement", "updated": note["updated"]})
+            self.assertEqual(status, 200)
+            self.assertEqual(self.call("/api/notes", {"id": note["id"], "field": "body", "offset": 1,
+                "sha256": first["sha256"]})[0], 409)
+            self.assertEqual(self.call("/api/reviews", {"action": "edit", "id": note["id"],
+                "body": "Lost update", "updated": note["updated"]})[0], 400)
+            self.assertEqual(self.call("/api/events", {"annotation_id": note["id"]})[1]["last_row"], 1)
+            notes[0] = {**note, "updated": edit["updated"]}
+        finally:
+            for note in notes:
+                self.call("/api/reviews", {"action": "delete", "id": note["id"], "updated": note["updated"]})
+
     def test_ssm_orphan_reviews_are_explicit_bounded_and_complete(self):
         # Large Unicode reviews must not leak into even a zero-match ordinary search.
         ids = [f"orphan-{i:05}" for i in range(2003)]
@@ -1742,6 +1789,20 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(found["data"][0]["user_agent"], 'powershell -c "& C:\\Temp\\a.ps1"')
 
     def test_validation_and_same_origin_boundary(self):
+        self.assertEqual(self.call("/api/events", {"filters": [{"field": "event_name", "op": "in",
+            "value": ["SendCommand", "StartSession"]}]})[1]["last_row"], 4)
+        self.assertEqual(self.call("/api/events", {"filters": [{"field": "event_name", "op": "in",
+            "value": ["SendCommand,StartSession"]}]})[1]["last_row"], 0)
+        for value in ({}, {"value": None}):
+            self.assertEqual(self.call("/api/events", {"filters": [{"field": "document_name", "op": "missing", **value}]})[1]["last_row"], 5)
+        for body, message in [
+                ({"filters": [{"field": "eventName", "op": "eq"}]}, "eventName"),
+                ({"filters": [{"field": "event_name", "op": "regex"}]}, "valid operators"),
+                ({"sorters": [{"field": "eventName", "dir": "asc"}]}, "valid sort fields"),
+                ({"sorters": [{"field": "event_name", "dir": "up"}]}, "asc, desc")]:
+            status, error = self.call("/api/events", body)
+            self.assertEqual(status, 400)
+            self.assertIn(message, error["error"])
         for body in [{"sorters": [{"field": "time_local;DROP TABLE events", "dir": "asc"}]},
                      {"filters": [{"field": "raw_event", "op": "eq", "value": "x"}]},
                      {"start": "2026-10-25T00:00:00"},

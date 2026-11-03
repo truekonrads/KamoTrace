@@ -155,10 +155,13 @@ such as Operation are not keys (`event_name` is).
   | `op` | Matches |
   | --- | --- |
   | `eq` / `neq` | Exact, case-sensitive value (`neq` keeps nulls) |
-  | `in` | Any of up to 100 comma-separated exact values |
+  | `in` | JSON array of 1–100 exact strings (preserves commas), or comma-separated text |
   | `contains` / `not_contains` | Case-insensitive substring of the field |
   | `missing` / `not_missing` | Field is null / not null |
   | `empty` / `not_empty` | Null or `""` / has a value |
+
+  For empty/missing operators, omit `value` or pass null. Invalid fields,
+  operators and sorts name the rejected value and valid choices; no aliases are inferred.
 
 - `tags`: the event must carry **every** listed tag. Combine tags only when you
   mean all of them.
@@ -169,7 +172,7 @@ such as Operation are not keys (`event_name` is).
 - **Time:** ISO 8601 **with an offset**. `start` is inclusive and `end` is
   exclusive. Set `query.timezone` to an IANA zone (default `UTC`), such as
   `{"timezone":"Asia/Singapore"}`. It controls `time_local` results/filters,
-  prevalence and histogram boundaries. Call `describe_schema(timezone="Asia/Singapore")`
+  prevalence and histogram boundaries. Call `describe_schema(timezone="Asia/Singapore", include_timezones=true)`
   for bounds in that zone and supported `timezones`; this does not set a global
   preference. Pass the zone on each query. The browser chooses independently.
   A Singapore day is `[D T00:00:00+08:00, D+1 T00:00:00+08:00)`.
@@ -227,8 +230,13 @@ such as Operation are not keys (`event_name` is).
   `**Agent note**` so the analyst can tell who wrote them.
 - `create_note(body, hashes, query?)`: pass the `query` you used, so the
   analyst can reopen exactly that result from the note in the browser.
-- `list_notes(search)` finds notes. `get_note(id)` returns the note, its
-  current `updated` stamp and a page of its linked events. Set
+- `list_notes(search, page=1)` returns 25 compact summaries, newest first;
+  follow `next_page` until null. `get_note(id)` directly reads that note's preview,
+  current `updated` stamp and a page of its linked events. `body_truncated` and
+  `body_length` describe the preview. Use `read_note_text(id, field="body")`
+  or `field="context"` for exact chunks with `next_offset`, code-point offsets
+  and digest-checked continuation, just like SSM text. Read the whole body before editing.
+  Saved context is inert JSON; reopen only through a validated ordinary query. Set
   `get_note(id, timezone="Asia/Singapore")` to display those events in that zone
   (default `UTC`).
 - `edit_note` and `delete_note` need the current `updated` value. If someone
@@ -352,9 +360,9 @@ search_scope="enhanced")` now finds it, `search_scope="raw"` does not.
 | Message contains | Do this |
 | --- | --- |
 | `Cannot reach the CloudTrail browser` | Ask the analyst to start `kamotrace serve` (and check the port) |
-| `Unknown filter field or operator` | Re-check `describe_schema().fields` / `operators` |
+| `Unknown filter field`, `Unknown operator` or `Unknown sort` | Use the valid choices in the error or `describe_schema` |
 | `Time must include a timezone` | Add an offset, e.g. `+07:00` |
-| `Unknown timezone` | Choose an IANA name from `describe_schema().timezones`, e.g. `UTC` or `Asia/Singapore` |
+| `Unknown timezone` | Choose an IANA name from `describe_schema(include_timezones=true).timezones`, e.g. `UTC` or `Asia/Singapore` |
 | `Tags must be lowercase hyphen-separated slugs` | Fix the slug, e.g. `Lateral Movement` → `lateral-movement` |
 | `Unknown event hash` | Use `record_sha256` from results, not `id` or `event_id` |
 | `This note changed since it was loaded` | `get_note`, merge your change into the current text, retry with the new `updated` |

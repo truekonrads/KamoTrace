@@ -89,17 +89,30 @@ directly, retaining progress across context windows.
   Large mixed Unicode/control-character output and reviews reconstruct exactly;
   stale digests reject with 409. Contract suite: 44 tests passed, including real
   HTTP/stdio chunk reconstruction and existing search-revision rejection.
-- [ ] **S04: Streamline discovery and note reads.** Return compact schema metadata,
+- [x] **S04: Streamline discovery and note reads.** Return compact schema metadata,
   note summaries and direct note detail without first loading all note bodies.
   Clarify evidence_read_only and annotations_writable. Use consistent object
   envelopes where changed; do not conflate distinct timestamp meanings.
-- [ ] **S05: Optimize body-only note edits.** Avoid rebuilding unchanged review-link
+  Added compact `/api/schema`, paginated `/api/notes`, direct note preview and
+  body/context chunks; MCP no longer loads every note for note or tag reads.
+  Verified 27 large Unicode notes, search beyond previews, explicit flags and
+  HTTP/stdio skill examples. Browser's findings rendering remains unchanged.
+- [x] **S05: Optimize body-only note edits.** Avoid rebuilding unchanged review-link
   temp tables. Still invalidate enhanced searches affected by body edits. Verify
   stale edits fail, links remain unchanged, and record before/after timings on
   synthetic notes linked to thousands of events before claiming a speedup.
-- [ ] **S06: Improve query validation.** Name invalid fields/operators/sorts and
+  Body edits skip unchanged DuckDB link-table refresh, retaining log-revision
+  invalidation. Synthetic 5,000-link note, three edits each: baseline medians
+  2,368.21 ms vs 5.69 ms after. All 5,000 links persisted, stale edits rejected,
+  search revision advanced and evidence file SHA-256 unchanged in both runs.
+  These local measurements are not a general performance guarantee.
+- [x] **S06: Improve query validation.** Name invalid fields/operators/sorts and
   valid choices. Accept JSON arrays for `in`, and null/omitted values for valueless
   operators in both REST and MCP. Normalize only useful, documented aliases.
+  Added actionable errors, literal JSON-array membership and null/omitted
+  valueless inputs; no speculative aliases. Tests distinguish a comma inside
+  an array member from comma-separated legacy text. Phase checks: 45 contract
+  tests passed, including both real MCP transports.
 
 Define an explicit serialized UTF-8 response budget, initially 80,000 bytes with
 headroom for MCP envelopes, rather than claiming a universal character-to-token

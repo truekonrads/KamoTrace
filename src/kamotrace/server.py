@@ -72,6 +72,23 @@ class StaleSelection(ValueError):
     """A continuation page was requested for a selection whose membership may have changed."""
 
 
+def text_chunk(value, body):
+    offset, limit = body.get("offset", 0), body.get("limit", 2000)
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 2000:
+        raise ValueError("offset must be nonnegative; limit must be 1 to 2000 Unicode code points")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest() if value is not None else None
+    if "sha256" in body and body["sha256"] != digest:
+        raise StaleSelection("Text changed between chunks; restart at offset 0")
+    length = len(value) if value is not None else 0
+    if offset > length:
+        raise ValueError("offset exceeds text length")
+    end = min(length, offset + limit)
+    return {"text": value[offset:end] if value is not None else None,
+            "offset": offset, "next_offset": end if end < length else None,
+            "offset_unit": "unicode_code_points", "length": length,
+            "utf8_bytes": len(value.encode("utf-8")) if value is not None else 0, "sha256": digest}
+
+
 def query_timezone(body):
     zone = body.get("timezone", "UTC")
     if not isinstance(zone, str) or zone not in TIMEZONES:
@@ -124,10 +141,12 @@ def build_query(body):
         raise ValueError("Use at most 20 filters")
     for item in filters:
         field, op, value = item.get("field"), item.get("op"), item.get("value", "")
-        if field not in FIELDS or op not in OPERATORS:
-            raise ValueError("Unknown filter field or operator")
-        if not isinstance(value, str) or len(value) > 2000:
-            raise ValueError("Filter values must be text, up to 2,000 characters")
+        if not isinstance(field, str) or field not in FIELDS:
+            raise ValueError(f"Unknown filter field {field!r}; valid fields: " + ", ".join(FIELDS))
+        if not isinstance(op, str) or op not in OPERATORS:
+            raise ValueError(f"Unknown operator {op!r} for {field}; valid operators: " + ", ".join(sorted(OPERATORS)))
+        if op not in ("empty", "not_empty", "missing", "not_missing", "in") and (not isinstance(value, str) or len(value) > 2000):
+            raise ValueError(f"{field} {op} needs text up to 2,000 characters")
         if op in ("missing", "not_missing"):
             conditions.append(f"{field} IS {'NOT ' if op == 'not_missing' else ''}NULL")
         elif op in ("empty", "not_empty"):
@@ -136,9 +155,10 @@ def build_query(body):
             conditions.append(f"{field} IS {'NOT ' if op == 'eq' else ''}DISTINCT FROM ?")
             params.append(value)
         elif op == "in":
-            values = [v.strip() for v in value.split(",") if v.strip()]
-            if not values or len(values) > 100:
-                raise ValueError("One-of filters need 1 to 100 comma-separated values")
+            values = [v.strip() for v in value.split(",") if v.strip()] if isinstance(value, str) else value
+            if (not isinstance(values, list) or not 1 <= len(values) <= 100
+                    or any(not isinstance(v, str) or len(v) > 2000 for v in values)):
+                raise ValueError(f"{field} in needs a JSON array of 1 to 100 strings (each up to 2,000 characters), or comma-separated text")
             conditions.append(f"{field} IN ({', '.join('?' for _ in values)})")
             params.extend(values)
         else:
@@ -176,8 +196,10 @@ def build_query(body):
     ordering = []
     for sorter in sorters:
         field, direction = sorter.get("field"), sorter.get("dir")
-        if field not in SORT_FIELDS or direction not in ("asc", "desc"):
-            raise ValueError("Unknown sort field or direction")
+        if not isinstance(field, str) or field not in SORT_FIELDS:
+            raise ValueError(f"Unknown sort field {field!r}; valid sort fields: " + ", ".join(sorted(SORT_FIELDS)))
+        if direction not in ("asc", "desc"):
+            raise ValueError(f"Unknown sort direction {direction!r}; valid directions: asc, desc")
         ordering.append(f"{'event_time' if field == 'time_local' else field} {direction.upper()} NULLS LAST")
     ordering.append("id ASC")
     try:
@@ -207,6 +229,7 @@ class Store:
             self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
             startup.callback(self.reviews.close)
             self.reviews.row_factory = sqlite3.Row
+            self.reviews.create_function("unicode_lower", 1, lambda value: value.lower(), deterministic=True)
             self.reviews.executescript("""
                 PRAGMA foreign_keys=ON;
                 CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL,
@@ -407,9 +430,6 @@ class Store:
             entry_id, field = body.get("entry_id"), body.get("field")
             if field not in SSM_TEXT_FIELDS:
                 raise ValueError("field must be one of: " + ", ".join(SSM_TEXT_FIELDS))
-            offset, limit = body.get("offset", 0), body.get("limit", 2000)
-            if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 2000:
-                raise ValueError("offset must be nonnegative; limit must be 1 to 2000 Unicode code points")
             if not isinstance(entry_id, str):
                 raise ValueError("entry_id must be text")
             if field.startswith("review."):
@@ -428,18 +448,7 @@ class Store:
                 if field == "events":
                     value = json.dumps(self.log_review_data([entry])[0]["events"], ensure_ascii=False)
                 stamp = None
-            digest = hashlib.sha256(value.encode("utf-8")).hexdigest() if value is not None else None
-            if "sha256" in body and body["sha256"] != digest:
-                raise StaleSelection("Text changed between chunks; restart at offset 0")
-            length = len(value) if value is not None else 0
-            if offset > length:
-                raise ValueError("offset exceeds text length")
-            end = min(length, offset + limit)
-            return {"entry_id": entry_id, "field": field, "text": value[offset:end] if value is not None else None,
-                    "offset": offset, "next_offset": end if end < length else None,
-                    "offset_unit": "unicode_code_points", "length": length,
-                    "utf8_bytes": len(value.encode("utf-8")) if value is not None else 0,
-                    "sha256": digest, "updated": stamp,
+            return {"entry_id": entry_id, "field": field, **text_chunk(value, body), "updated": stamp,
                     "serialization": "json_metadata" if field in ("events", "review.tags") else "original_string"}
 
     def ssm_log_orphans(self, body):
@@ -525,11 +534,14 @@ class Store:
             if rows:
                 self.connection.executemany(f"INSERT INTO {table} VALUES (?,?)", rows)
 
-    def reviews_list(self):
+    def reviews_list(self, include_notes=True):
         with self.locked("reviews.list"):
             # Counts are evidence events (rows), across the whole database, independent of the current query.
             tag_counts = dict(self.connection.execute("""SELECT r.slug, count(*) FROM review_tags r
                 JOIN events e ON e.record_sha256 = r.hash GROUP BY 1""").fetchall())
+            if not include_notes:
+                return {"tags": [{**dict(r), "events": tag_counts.get(r["slug"], 0)}
+                                 for r in self.reviews.execute("SELECT * FROM tags ORDER BY slug")]}
             note_counts = dict(self.connection.execute("""SELECT r.annotation_id, count(*) FROM review_notes r
                 JOIN events e ON e.record_sha256 = r.hash GROUP BY 1""").fetchall())
             notes = []
@@ -542,6 +554,39 @@ class Store:
                 notes.append(note)
             return {"annotations": notes, "tags": [{**dict(r), "events": tag_counts.get(r["slug"], 0)}
                                                    for r in self.reviews.execute("SELECT * FROM tags ORDER BY slug")]}
+
+    def notes_read(self, body):
+        """Bounded note summaries, exact single-note lookup and optional full-text chunks."""
+        with self.locked("notes.read"):
+            note_id = body.get("id")
+            if note_id is not None:
+                if type(note_id) is not int or note_id < 1:
+                    raise ValueError("id must be a positive integer")
+                row = self.reviews.execute("SELECT * FROM annotations WHERE id=?", (note_id,)).fetchone()
+                if row is None:
+                    raise ValueError("Unknown note")
+                field = body.get("field")
+                if field is not None:
+                    if field not in ("body", "context"):
+                        raise ValueError("field must be body or context (inert JSON)")
+                    return {"id": note_id, "field": field, "updated": row["updated"], **text_chunk(row[field], body)}
+                hashes = [r[0] for r in self.reviews.execute("SELECT hash FROM annotation_events WHERE annotation_id=?", (note_id,))]
+                events = self.connection.execute("SELECT count(*) FROM events WHERE record_sha256 IN (SELECT unnest(?))", [hashes]).fetchone()[0]
+                return {"note": {"id": note_id, "body": text_preview(row["body"]), "body_length": len(row["body"]),
+                    "body_truncated": len(row["body"].encode()) > 96, "updated": row["updated"],
+                    "events": events, "has_context": row["context"] is not None}}
+            search, page = body.get("search", ""), body.get("page", 1)
+            if not isinstance(search, str) or len(search) > 2000:
+                raise ValueError("search must be text up to 2000 characters")
+            if type(page) is not int or page < 1:
+                raise ValueError("page must be a positive integer")
+            # Bound transfer from SQLite too; don't load every body to filter it in Python.
+            where = "instr(unicode_lower(body),?) > 0"
+            total = self.reviews.execute("SELECT count(*) FROM annotations WHERE " + where, (search.lower(),)).fetchone()[0]
+            rows = [dict(r) for r in self.reviews.execute("SELECT id, substr(body,1,64) AS body_preview, "
+                "length(body) AS body_length, updated, context IS NOT NULL AS has_context FROM annotations WHERE " + where +
+                " ORDER BY updated DESC,id DESC LIMIT 25 OFFSET ?", (search.lower(), (page-1)*25))]
+            return {"data": rows, "total": total, "page": page, "next_page": page+1 if page*25 < total else None}
 
     def review_write(self, body):
         action = body.get("action")
@@ -619,7 +664,8 @@ class Store:
                         self.reviews.executemany("DELETE FROM event_tags WHERE hash=? AND slug=?", [(h, slug) for h in hashes])
                 else:
                     raise ValueError("Unknown review action")
-            self.refresh_reviews()
+            if action != "edit":
+                self.refresh_reviews()
             self.bump_log_revision(changed)
             revision = self.log_revision
         return {"ok": True, "log_revision": revision, **({"id": cursor.lastrowid} if action == "annotate" else {}),
@@ -660,6 +706,19 @@ class Store:
     def timezone_metadata(self, body):
         with self.locked("metadata"):
             return self.metadata(body)
+
+    def schema(self, body):
+        zone = query_timezone(body)
+        def instant(ms):
+            return datetime.fromtimestamp(ms / 1000, ZoneInfo(zone)).isoformat() if ms is not None else None
+        return {"events": self.meta["total"], "timezone": zone,
+            "first_event": instant(self.meta["start_ms"]), "end_exclusive": instant(self.meta["end_ms"]),
+            "evidence_read_only": True, "annotations_writable": True,
+            "fields": FIELDS, "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS),
+            "pipeline_version": 1, "pipeline_fields": PIPELINE_FIELDS, "page_sizes": PAGE_SIZES,
+            "ssm_summary_fields": SSM_SUMMARY_FIELDS, "ssm_text_fields": SSM_TEXT_FIELDS,
+            "interactive_response_budget_bytes": INTERACTIVE_BUDGET,
+            **({"timezones": TIMEZONES} if body.get("include_timezones") is True else {})}
 
     def query(self, body):
         sql, params, count_sql, count_params, size = build_query(body)
@@ -901,6 +960,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond(self.store.meta)
         elif path == "/api/reviews":
             self.respond(self.store.reviews_list())
+        elif path == "/api/tags":
+            self.respond(self.store.reviews_list(include_notes=False))
         elif path == "/api/detections":
             self.respond(self.store.detections_list())
         elif path == "/api/inventory":
@@ -927,7 +988,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/reference"):
+        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/reference"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -938,6 +999,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object")
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
+                         "/api/schema": self.store.schema, "/api/notes": self.store.notes_read,
                          "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
                          "/api/reference": self.store.reference,
