@@ -40,7 +40,11 @@ class Commands:
                 system = entry["systems"].setdefault(record["InstanceId"], {
                     "instance_id": record["InstanceId"], "invocation": None, "details": []})
                 if kind == "invocations":
-                    system["invocation"] = record
+                    if system["invocation"] is not None:
+                        entry.setdefault("duplicate_systems", []).append({"instance_id": record["InstanceId"],
+                            "invocation": record, "details": []})
+                    else:
+                        system["invocation"] = record
                 else:
                     system["details"].append(record)
         for entry in self.commands.values():
@@ -50,7 +54,7 @@ class Commands:
             stamp = record.get("RequestedDateTime")
             entry.update(requested=stamp, requested_ms=int(parse_time(stamp).timestamp() * 1000) if stamp else None,
                 document=record.get("DocumentName", ""), status=record.get("Status", "Unknown"),
-                target_count=record.get("TargetCount"), systems=list(entry["systems"].values()))
+                target_count=record.get("TargetCount"), systems=list(entry["systems"].values()) + entry.pop("duplicate_systems", []))
 
         local = connection.execute("""SELECT source_record, raw_event::VARCHAR, record_sha256
             FROM events WHERE event_source='ssm.amazonaws.com'""").fetchall()
@@ -66,7 +70,8 @@ class Commands:
             if key not in self.commands and event.get("eventName") not in REQUESTS:
                 continue
             event_key = hashlib.sha256(json.dumps([event.get("recipientAccountId"), event.get("awsRegion"),
-                event.get("eventID") or hashlib.sha256(raw.encode()).hexdigest()]).encode()).hexdigest()
+                event.get("eventID"), hashlib.sha256(json.dumps(event, sort_keys=True,
+                    ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()]).encode()).hexdigest()
             self.events[event_key] = {"key": event_key, "event_id": event.get("eventID"),
                 "id": source_record, "raw_json": raw, "record_sha256": record_hash,
                 "event_time": event.get("eventTime"), "operation": event.get("eventName"),
@@ -112,10 +117,10 @@ class Commands:
                         decoded="\n\n".join(decoded), events=len(entry["events"]))
             for system in entry["systems"] or [{"instance_id": None, "invocation": None, "details": []}]:
                 invocation = system["invocation"] or {}
-                plugins = {p["Name"]: p for p in invocation.get("CommandPlugins", [])}
+                plugins = invocation.get("CommandPlugins", [])
                 outputs = [(d["PluginName"], d, False) for d in system["details"]]
                 detailed = {name for name, _, _ in outputs}
-                outputs.extend((name, plugin, True) for name, plugin in plugins.items() if name not in detailed)
+                outputs.extend((plugin["Name"], plugin, True) for plugin in plugins if plugin["Name"] not in detailed)
                 for name, output, combined in outputs or [(None, {}, False)]:
                     self.sheet_rows.append({**base, "row_id": len(self.sheet_rows), "instance_id": system["instance_id"],
                         "plugin": name, "status": output.get("Status", invocation.get("Status", "Unknown")),
@@ -127,6 +132,8 @@ class Commands:
                         "output": output, "base64_enrichment": entry["base64_enrichment"]})
 
         self.log_entries = {}
+        self.log_sources = {}
+        self.source_entries = {}
 
         def log_time(value):
             # CloudTrail imports retain records with invalid timestamps as evidence too.
@@ -135,10 +142,23 @@ class Commands:
             except ValueError:
                 return None
 
-        def add(row, raw):
+        def add(row, raw, semantic):
             identity = json.dumps([row, raw], sort_keys=True, ensure_ascii=False, separators=(",", ":"))
             entry_id = hashlib.sha256(identity.encode()).hexdigest()
+            # Keep repeated identical invocations/session rows individually visible too.
+            occurrence = 1
+            original_id = entry_id
+            while entry_id in self.log_entries:
+                occurrence += 1
+                entry_id = hashlib.sha256(f"{original_id}:{occurrence}".encode()).hexdigest()
             self.log_entries[entry_id] = {**row, "entry_id": entry_id}
+            semantic = json.dumps([1, *semantic], ensure_ascii=False, separators=(",", ":")) if semantic else None
+            self.log_sources[entry_id] = {"version": 1, "semantic_identity": semantic,
+                "reviewed_content_sha256": entry_id,
+                "source_digest_basis": "normalized_source_json",
+                "source_sha256": hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()}
+            if semantic:
+                self.source_entries.setdefault(semantic, []).append(entry_id)
             return self.log_entries[entry_id]
 
         for row, source in zip(self.sheet_rows, self.sheet_sources):
@@ -152,7 +172,8 @@ class Commands:
                 item["time_ms"] = log_time(stamp)
                 item["time_basis"] = "Execution start" if source["output"].get("ExecutionStartDateTime") else "Response start"
             # Bind reviews to the actual source records, not just rendered output or row order.
-            add(item, source)["events"] = command["events"]
+            semantic = ["command_output", row["account"], row["region"], row["command_id"], row["instance_id"], row["plugin"]]
+            add(item, source, semantic if all(semantic[1:5]) else None)["events"] = command["events"]
         for event in self.events.values():
             # A request linked by exact account, region and command ID is part of that command's
             # activity: it is already a linked event of each of the command's system/plugin entries.
@@ -171,7 +192,9 @@ class Commands:
                 "output_state": "No output collected"}
             metadata = {k: v for k, v in event.items() if k != "raw_json"}
             metadata["time"] = event["event_time"]
-            add(item, event["raw_json"])["events"] = [metadata]
+            semantic = ["original_request" if event["id"] is not None else "supplemental_request",
+                        event["account"], event["region"], event["event_id"]]
+            add(item, event["raw_json"], semantic if all(semantic[1:]) else None)["events"] = [metadata]
         # describe_sessions reports metadata, not a terminal transcript. Keep these independent
         # from CloudTrail requests: a target or nearby timestamp is not a session identity join.
         for session in document.get("sessions", []):
@@ -183,7 +206,10 @@ class Commands:
                 "status": record.get("Status", "Unknown"), "response_code": None,
                 "parameters": json.dumps(record, ensure_ascii=False), "decoded": "", "stdout": None,
                 "stderr": None, "combined_output": None, "output_state": "Session metadata only"}
-            add(item, record)["events"] = []
+            semantic = ["session_metadata", account, session["region"], record.get("SessionId")]
+            add(item, record, semantic if all(semantic[1:]) else None)["events"] = []
+        for entry_id, source in self.log_sources.items():
+            source["ambiguous"] = bool(source["semantic_identity"] and len(self.source_entries[source["semantic_identity"]]) != 1)
         # Entries are immutable: order them and lowercase their searchable values once. Search matches
         # explicit field values (not serialized JSON keys/escapes); "\0" keeps fields from joining.
         self.log_order = sorted(self.log_entries.values(), key=lambda e: (e["time_ms"] is None, e["time_ms"] or 0, e["entry_id"]))

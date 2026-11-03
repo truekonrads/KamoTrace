@@ -42,7 +42,7 @@ SSM_SUMMARY_FIELDS = ("time_ms", "time_basis", "account", "region", "command_key
                       "instance_id", "plugin", "operation", "status", "response_code", "output_state",
                       "parameters", "decoded", "stdout", "stderr", "combined_output")
 SSM_TEXT_FIELDS = tuple(f for f in SSM_SUMMARY_FIELDS if f not in ("time_ms", "response_code")) + (
-    "review.text", "review.finding", "review.tags", "events")
+    "review.text", "review.finding", "review.tags", "review.source", "review.history", "events")
 
 
 def text_preview(value, limit=96):
@@ -241,6 +241,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS sidecar_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS ssm_log_reviews(entry_id TEXT PRIMARY KEY, text TEXT NOT NULL,
                     tags TEXT NOT NULL, finding TEXT NOT NULL, updated TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS ssm_review_sources(entry_id TEXT PRIMARY KEY,
+                    metadata TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS ssm_review_reattachments(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    old_entry_id TEXT NOT NULL, new_entry_id TEXT NOT NULL, old_updated TEXT NOT NULL,
+                    new_updated TEXT NOT NULL, basis TEXT NOT NULL, reason TEXT NOT NULL,
+                    old_review TEXT NOT NULL, old_source TEXT);
             """)
             # Bind the sidecar to its evidence on first use (older sidecars too), so another case's notes
             # can't be mixed in silently, as detections and enrichment sidecars already refuse.
@@ -292,6 +298,13 @@ class Store:
             logger.info("Loading and linking SSM commands: %s", ssm_export or "none (no export supplied)")
             stage_started = time.monotonic()
             self.commands = Commands(ssm_export, self.connection)
+            # Only exact current content can backfill an existing review. Hash-only legacy
+            # orphans are retained without invented source identities. Migration is idempotent.
+            with self.reviews:
+                for row in self.reviews.execute("SELECT entry_id FROM ssm_log_reviews").fetchall():
+                    if row[0] in self.commands.log_sources:
+                        self.reviews.execute("INSERT OR IGNORE INTO ssm_review_sources VALUES (?,?)",
+                            (row[0], json.dumps(self.commands.log_sources[row[0]], ensure_ascii=False)))
             self.startup_timing("ssm", stage_started)
             from .inventory_store import Inventory
             logger.info("Loading current-configuration inventory: %s", inventory_export or "none (no export supplied)")
@@ -433,6 +446,21 @@ class Store:
             if not isinstance(entry_id, str):
                 raise ValueError("entry_id must be text")
             if field.startswith("review."):
+                if field == "review.history":
+                    if entry_id not in self.commands.log_entries and not self.reviews.execute(
+                            "SELECT 1 FROM ssm_log_reviews WHERE entry_id=?", (entry_id,)).fetchone():
+                        raise ValueError("Unknown entry or preserved review")
+                    history = [dict(r) for r in self.reviews.execute("""SELECT * FROM ssm_review_reattachments
+                        WHERE old_entry_id=? OR new_entry_id=? ORDER BY id""", (entry_id, entry_id))]
+                    return {"entry_id": entry_id, "field": field,
+                        **text_chunk(json.dumps(history, ensure_ascii=False), body), "serialization": "json_metadata"}
+                if field == "review.source":
+                    source = self.reviews.execute("SELECT metadata FROM ssm_review_sources WHERE entry_id=?", (entry_id,)).fetchone()
+                    if source is None and entry_id not in self.commands.log_entries:
+                        raise ValueError("No historical source metadata; hash-only orphans cannot be recovered automatically")
+                    return {"entry_id": entry_id, "field": field,
+                            **text_chunk(source[0] if source else json.dumps(self.commands.log_sources[entry_id]), body),
+                            "serialization": "json_metadata"}
                 row = self.reviews.execute("SELECT text, finding, tags, updated FROM ssm_log_reviews WHERE entry_id=?",
                                            (entry_id,)).fetchone()
                 if row is None and entry_id not in self.commands.log_entries:
@@ -466,7 +494,7 @@ class Store:
                     review = {"entry_id": entry_id, **log_summary(
                         {"entry_id": entry_id, "events": [], "review": review}, [])["review"],
                         "text_length": len(row["text"]), "finding_length": len(row["finding"])}
-                return {"review": review}
+                return {"review": review, **self.review_association(entry_id)}
             page = body.get("page", 1)
             if type(page) is not int or page < 1:
                 raise ValueError("page must be a positive integer")
@@ -474,8 +502,62 @@ class Store:
                 substr(text,1,64) AS text_preview, length(text) AS text_length,
                 substr(finding,1,64) AS finding_preview, length(finding) AS finding_length
                 FROM ssm_log_reviews ORDER BY updated, entry_id""") if r["entry_id"] not in self.commands.log_entries]
-            return {"data": rows[(page-1)*25:page*25], "total": len(rows), "page": page,
+            return {"data": [{**r, **self.review_association(r["entry_id"])} for r in rows[(page-1)*25:page*25]], "total": len(rows), "page": page,
                     "next_page": page+1 if page*25 < len(rows) else None}
+
+    def review_association(self, entry_id):
+        """Exact current content and related changed content are deliberately different states."""
+        source = self.reviews.execute("SELECT metadata FROM ssm_review_sources WHERE entry_id=?", (entry_id,)).fetchone()
+        metadata = json.loads(source[0]) if source else None
+        candidates = self.commands.source_entries.get(metadata["semantic_identity"], []) if metadata else []
+        if entry_id in self.commands.log_entries:
+            status = "current"
+        elif (metadata and metadata.get("ambiguous")) or len(candidates) > 1:
+            status = "ambiguous"
+        elif len(candidates) == 1:
+            status = "related_changed_content"
+        else:
+            status = "unresolved"
+        return {"association": status, "related_entry_id": candidates[0] if status == "related_changed_content" else None,
+                "source_metadata": {**{k: v for k, v in metadata.items() if k != "semantic_identity"},
+                    "semantic_identity_sha256": hashlib.sha256(metadata["semantic_identity"].encode()).hexdigest()
+                        if metadata["semantic_identity"] else None} if metadata else None}
+
+    def ssm_log_reattach(self, body):
+        with self.locked("ssm.log_reattach"), self.reviews:
+            old_id, new_id = body.get("entry_id"), body.get("destination_entry_id")
+            if not isinstance(old_id, str) or old_id in self.commands.log_entries:
+                raise ValueError("Select a preserved orphan review by explicit entry_id")
+            if not isinstance(new_id, str) or new_id not in self.commands.log_entries:
+                raise ValueError("Unknown current destination entry")
+            old = self.reviews.execute("SELECT * FROM ssm_log_reviews WHERE entry_id=?", (old_id,)).fetchone()
+            if old is None:
+                raise ValueError("Unknown orphan review")
+            if body.get("updated") != old["updated"]:
+                raise StaleSelection("Review changed since it was loaded; reread before reattachment")
+            if self.reviews.execute("SELECT 1 FROM ssm_log_reviews WHERE entry_id=?", (new_id,)).fetchone():
+                raise ValueError("Destination already has a review; no investigator work was replaced")
+            related = self.review_association(old_id)
+            exact = related["association"] == "related_changed_content" and related["related_entry_id"] == new_id
+            if not exact and body.get("analyst_mapping") is not True:
+                raise ValueError("No unique historical source match; require explicit analyst_mapping=true and reason")
+            reason = body.get("reason")
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+                raise ValueError("Reattachment needs an analyst reason of 1 to 2000 characters")
+            stamp = datetime.now(timezone.utc).isoformat()
+            self.reviews.execute("INSERT INTO ssm_log_reviews VALUES (?,?,?,?,?)",
+                (new_id, old["text"], old["tags"], old["finding"], stamp))
+            self.reviews.execute("INSERT INTO ssm_review_sources VALUES (?,?)",
+                (new_id, json.dumps(self.commands.log_sources[new_id], ensure_ascii=False)))
+            self.reviews.execute("""INSERT INTO ssm_review_reattachments(old_entry_id,new_entry_id,old_updated,
+                new_updated,basis,reason,old_review,old_source) VALUES (?,?,?,?,?,?,?,?)""",
+                (old_id, new_id, old["updated"], stamp, "exact_semantic_identity" if exact else "explicit_analyst_mapping",
+                 reason, json.dumps(dict(old), ensure_ascii=False),
+                 (self.reviews.execute("SELECT metadata FROM ssm_review_sources WHERE entry_id=?", (old_id,)).fetchone() or [None])[0]))
+            self.reviews.execute("UPDATE ssm_log_reviews SET updated=? WHERE entry_id=?", (stamp, old_id))
+            self.bump_log_revision()
+            return {"entry_id": new_id, "updated": stamp, "old_entry_id": old_id,
+                    "audit_id": self.reviews.execute("SELECT last_insert_rowid()").fetchone()[0]}
 
     def log_review_data(self, entries, include_events=True):
         """Attach each entry's saved review and its linked events' tags/findings (read-only here). Caller holds the lock."""
@@ -523,6 +605,8 @@ class Store:
             self.reviews.execute("""INSERT INTO ssm_log_reviews VALUES (?,?,?,?,?) ON CONFLICT(entry_id)
                 DO UPDATE SET text=excluded.text,tags=excluded.tags,finding=excluded.finding,updated=excluded.updated""",
                 (entry_id, text, json.dumps(review["tags"]), finding, review["updated"]))
+            self.reviews.execute("INSERT OR IGNORE INTO ssm_review_sources VALUES (?,?)",
+                (entry_id, json.dumps(self.commands.log_sources[entry_id], ensure_ascii=False)))
             self.bump_log_revision()
             return review
 
@@ -988,7 +1072,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/reference"):
+        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/reference"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1005,6 +1089,7 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/reference": self.store.reference,
                          "/api/ssm-log-orphans": self.store.ssm_log_orphans,
                          "/api/ssm-log-text": self.store.ssm_log_text,
+                         "/api/ssm-log-reattach": self.store.ssm_log_reattach,
                          "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]

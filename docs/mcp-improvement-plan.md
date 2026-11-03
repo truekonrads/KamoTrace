@@ -121,19 +121,32 @@ explicit and never prevent forward progress. Test both HTTP and stdio envelopes.
 
 ### Phase 2: preserve review provenance before changing derived content
 
-- [ ] **S07: Persist review source metadata.** Add versioned semantic source identity
+- [x] **S07: Persist review source metadata.** Add versioned semantic source identity
   and reviewed-content identity/snapshot metadata. Backfill matched existing
   reviews only. Retain current content-addressed entry IDs unless a simpler safe
   design is established. Derived decoder versions must not become source identity.
-- [ ] **S08: Surface related and unresolved reviews.** Distinguish reviews of current
+  Added additive source/audit tables, semantic identities and reviewed-content/
+  normalized-source digests. Exact matched legacy reviews backfill idempotently;
+  unknown old hashes remain unresolved. Existing content IDs remain unchanged.
+- [x] **S08: Surface related and unresolved reviews.** Distinguish reviews of current
   content from uniquely related reviews of changed content. Preserve unknown
   legacy orphans. Duplicate invocation/plugin identities, missing identities and
   supplemental requests must not collapse. Session requests remain individually
   identifiable, not merged under a session ID.
-- [ ] **S09: Add explicit audited reattachment.** Require current review stamp and
+  Orphan tools report related-changed, ambiguous or unresolved without inheritance.
+  Duplicate invocation/plugin rows remain distinct, including identical rows;
+  same-event-ID requests with different content no longer overwrite one another.
+  Source metadata is chunk-readable, with decoder versions excluded from identity.
+- [x] **S09: Add explicit audited reattachment.** Require current review stamp and
   destination conflict checks; retain old association provenance. Recover historical
   orphans only from exact historical metadata or explicit analyst mappings. Test
   repeated migration, ambiguous mappings and destinations already reviewed.
+  Added explicit reattachment with stamps, empty-destination checks, reason and
+  analyst-mapping opt-in where exact metadata cannot identify one source. Old
+  association/text/source retained; audit is chunk-readable. Verified four load/
+  migration stages, changed output, duplicate ambiguity, stale and destination
+  conflicts; real HTTP/stdio sessions exercise explicit legacy mappings.
+  Contract suite: 45 tests passed; evidence hash checks remain unchanged.
 
 Never promise automatic recovery from hashes alone. Acceptance is zero unexpected
 orphans when exact historical identity exists, with unresolved cases accessible.

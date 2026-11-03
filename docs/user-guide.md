@@ -1497,6 +1497,15 @@ changed the note since, the call fails without writing; re-read it and retry.
 | `search_ssm_log` / `get_ssm_log_entry` / `read_ssm_log_text` | Fixed 5-row summary pages with optional allowlisted `fields`, exact summary lookup and full text in chunks. Previews carry truncation metadata; linked-event metadata is retrieved as `field="events"`. Follow `next_page`, passing the search revision for non-empty enhanced/both continuations. |
 | `list_ssm_orphan_reviews` / `get_ssm_orphan_review` | Preserved, unattached reviews: 25 summaries/page and exact preview lookup. Ordinary searches return only a count. Complete review text remains available in chunks. |
 | `edit_ssm_log_entry` | Save an explicit entry's interpretation text, entry tags and entry finding using its current `updated` stamp (null for a new review). Stale writes fail; raw evidence and event tags/findings are not changed. |
+| `reattach_ssm_review` | Explicit, audited reattachment from an orphan to a current entry with no review. Requires the orphan stamp and an analyst reason; unknown/ambiguous identities additionally require an explicit analyst mapping. Never overwrites destination work. |
+
+Review provenance is persisted separately from content-addressed IDs. Only exact
+current matches can backfill legacy metadata; unknown old hashes remain unresolved.
+Orphan retrieval distinguishes uniquely related changed content from ambiguous or
+unresolved sources, without inheriting the interpretation. Machine/plugin duplicates
+remain distinct, and original/supplemental requests are not merged under session IDs.
+Use chunk fields `review.source` and `review.history` for exact metadata and the
+reattachment audit. A semantic match is not evidence that old analysis fits new content.
 
 SSM summary and text reads target a serialized UTF-8 response budget of 80,000
 bytes including MCP envelopes. Text chunks allow 1–2,000 Unicode code points,

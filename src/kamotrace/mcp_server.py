@@ -380,6 +380,18 @@ def read_ssm_log_text(entry_id: str, field: str,
 
 
 @mcp.tool(annotations=WRITE)
+def reattach_ssm_review(entry_id: str, destination_entry_id: str, updated: str,
+                         reason: str, analyst_mapping: bool = False) -> dict[str, Any]:
+    """Explicitly copy an orphan review onto current content, preserving old association and audit.
+    Requires the orphan's current stamp, an empty destination and an analyst reason. Unique exact
+    semantic source matches still require this explicit action: changed content is not reviewed.
+    Without exact historical identity, set analyst_mapping only after verifying your own mapping.
+    Hashes alone cannot recover unknown sources. Conflicts never overwrite destination work."""
+    return call("/api/ssm-log-reattach", {"entry_id": entry_id, "destination_entry_id": destination_entry_id,
+        "updated": updated, "reason": reason, "analyst_mapping": analyst_mapping})
+
+
+@mcp.tool(annotations=WRITE)
 def edit_ssm_log_entry(entry_id: str, text: str, tags: list[str], finding: str,
                        updated: str | None) -> dict[str, Any]:
     """Replace an explicit content-addressed log entry's analyst review, never raw output.

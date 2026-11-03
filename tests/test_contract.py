@@ -1611,6 +1611,7 @@ class BrowserContract(unittest.TestCase):
         # Large Unicode reviews must not leak into even a zero-match ordinary search.
         ids = [f"orphan-{i:05}" for i in range(2003)]
         text = "synthetic 🦆\n" * 2500
+        destinations = []
         with self.store.lock, self.store.reviews:
             self.store.reviews.executemany("INSERT INTO ssm_log_reviews VALUES (?,?,?,?,?)",
                 [(id_, text, '["preserved"]', text, "synthetic-stamp") for id_ in ids])
@@ -1638,7 +1639,7 @@ class BrowserContract(unittest.TestCase):
                     async with Client(transport) as client:
                         summary = await client.call_tool("list_ssm_orphan_reviews", {"page": 81})
                         self.assertFalse(summary.is_error)
-                        self.assertEqual(summary.structured_content["data"][-1]["entry_id"], ids[-1])
+                        self.assertEqual(len(summary.structured_content["data"]), 3)
                         full = await client.call_tool("get_ssm_orphan_review", {"entry_id": ids[-1]})
                         self.assertFalse(full.is_error)
                         self.assertEqual(full.structured_content["review"]["text_length"], len(text))
@@ -1655,10 +1656,25 @@ class BrowserContract(unittest.TestCase):
                             offset, digest = data["next_offset"], data["sha256"]
                         self.assertEqual("".join(pieces), text)
                         self.assertEqual(digest, hashlib.sha256(text.encode()).hexdigest())
+                        orphan = (await client.call_tool("get_ssm_orphan_review", {"entry_id": ids[-1]})).structured_content
+                        self.assertEqual(orphan["association"], "unresolved")
+                        current = self.call("/api/ssm-log", {})[1]["data"]
+                        target = next(e["entry_id"] for e in current if e["review"]["updated"] is None)
+                        arguments = {"entry_id": ids[-1], "destination_entry_id": target,
+                            "updated": orphan["review"]["updated"], "reason": "Synthetic explicit analyst mapping"}
+                        rejected = await client.call_tool("reattach_ssm_review", arguments)
+                        self.assertTrue(rejected.is_error)
+                        attached = await client.call_tool("reattach_ssm_review", {**arguments, "analyst_mapping": True})
+                        self.assertFalse(attached.is_error)
+                        destinations.append(target)
             anyio.run(sessions)
         finally:
             with self.store.lock, self.store.reviews:
                 self.store.reviews.executemany("DELETE FROM ssm_log_reviews WHERE entry_id=?", [(id_,) for id_ in ids])
+                for id_ in destinations:
+                    self.store.reviews.execute("DELETE FROM ssm_log_reviews WHERE entry_id=?", (id_,))
+                    self.store.reviews.execute("DELETE FROM ssm_review_sources WHERE entry_id=?", (id_,))
+                    self.store.reviews.execute("DELETE FROM ssm_review_reattachments WHERE new_entry_id=?", (id_,))
 
     def test_ssm_log_review_persistence_and_changed_export_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1680,9 +1696,12 @@ class BrowserContract(unittest.TestCase):
             export.write_text(json.dumps(document))
             old_id = None
             saved = None
-            for stage in range(3):
+            for stage in range(4):
                 if stage == 2:
                     document["invocation_details"][0]["record"]["StandardOutputContent"] += " changed\n" + "🦆é\u0001\"\\\n" * 3001
+                    export.write_text(json.dumps(document))
+                if stage == 3:
+                    document["invocation_details"].append(document["invocation_details"][0])
                     export.write_text(json.dumps(document))
                 store = Store(self.database, annotations=annotations, ssm_export=export)
                 server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
@@ -1719,11 +1738,21 @@ class BrowserContract(unittest.TestCase):
                             "finding": "Source-specific finding", "updated": None})
                         post("/api/ssm-log-review", {"entry_id": supplemental["entry_id"], "text": "Supplemental request", "tags": [],
                             "finding": "Failed request without command ID", "updated": None})
+                        # Reproduce a legacy sidecar without inventing metadata for its old hashes.
+                        with store.reviews:
+                            store.reviews.execute("DELETE FROM ssm_review_sources WHERE entry_id=?", (old_id,))
                     elif stage == 1:
                         self.assertEqual(post("/api/ssm-log", {})["unmatched_review_count"], 0)
                         self.assertEqual(output["entry_id"], old_id)
                         self.assertEqual(output["review"], saved)
                         self.assertEqual(supplemental["review"]["text"], "Supplemental request")
+                        metadata = json.loads(post("/api/ssm-log-text", {"entry_id": old_id, "field": "review.source"})["text"])
+                        self.assertEqual(metadata["reviewed_content_sha256"], old_id)
+                    elif stage == 3:
+                        duplicates = [e for e in rows if e["instance_id"] == "i-alpha" and e["plugin"] == "shell"]
+                        self.assertEqual(len({e["entry_id"] for e in duplicates}), 2)
+                        self.assertEqual([e["review"]["text"] for e in duplicates if e["review"]["updated"]], [saved["text"]])
+                        self.assertEqual(post("/api/ssm-log-orphans", {"entry_id": old_id})["association"], "ambiguous")
                     else:
                         self.assertNotEqual(output["entry_id"], old_id)
                         self.assertIsNone(output["review"]["updated"])
@@ -1746,6 +1775,22 @@ class BrowserContract(unittest.TestCase):
                         self.assertEqual(post("/api/ssm-log-orphans", {})["data"][0]["entry_id"], old_id)
                         self.assertEqual(post("/api/ssm-log-orphans", {"entry_id": old_id})["review"],
                                          {"entry_id": old_id, **saved})
+                        relation = post("/api/ssm-log-orphans", {"entry_id": old_id})
+                        self.assertEqual((relation["association"], relation["related_entry_id"]),
+                                         ("related_changed_content", output["entry_id"]))
+                        reattach = {"entry_id": old_id, "destination_entry_id": output["entry_id"],
+                            "updated": saved["updated"], "reason": "Analyst verified changed output"}
+                        with self.assertRaises(HTTPError) as error:
+                            post("/api/ssm-log-reattach", {**reattach, "updated": "stale"})
+                        self.assertEqual(error.exception.code, 409)
+                        attached = post("/api/ssm-log-reattach", reattach)
+                        self.assertEqual(post("/api/ssm-log", {"entry_id": output["entry_id"]})["data"][0]["review"]["text"], saved["text"])
+                        history = json.loads(post("/api/ssm-log-text", {"entry_id": old_id, "field": "review.history"})["text"])
+                        self.assertEqual(history[0]["basis"], "exact_semantic_identity")
+                        self.assertEqual(json.loads(history[0]["old_review"])["updated"], saved["updated"])
+                        with self.assertRaises(HTTPError) as error:
+                            post("/api/ssm-log-reattach", {**reattach, "updated": attached["updated"]})
+                        self.assertIn("already has a review", json.load(error.exception)["error"])
                         with self.assertRaises(HTTPError) as error:
                             post("/api/ssm-log-review", {"entry_id": old_id})
                         self.assertEqual(error.exception.code, 400)

@@ -319,8 +319,23 @@ Available only when the analyst loaded an SSM export.
   `search_ssm_log` returns only `unmatched_review_count`. Use
   `list_ssm_orphan_reviews(page=1)` and follow `next_page` for bounded summaries,
   then `get_ssm_orphan_review(entry_id=...)` for a saved review preview whose
-  `entry_id` is no longer a current entry. They are read-only history; do not
-  copy them onto another entry without checking it is the same source content.
+  `entry_id` is no longer a current entry. `association` distinguishes
+  `related_changed_content` (one exact semantic source, but content changed),
+  `ambiguous` and `unresolved`. Related content does **not** inherit a review.
+  Source identity is versioned and excludes decoder versions; original requests,
+  supplemental requests, sessions and machine/plugin outputs stay distinct.
+  Read exact source metadata with `read_ssm_log_text(field="review.source")`.
+  Legacy hash-only orphans have no recoverable source metadata; hashes alone
+  cannot identify their original sources.
+- `reattach_ssm_review(entry_id, destination_entry_id, updated, reason,
+  analyst_mapping=false)` explicitly copies a preserved review onto current
+  content. Inspect both first, quote the orphan's current stamp and give your
+  reason. The destination must have no review, even an empty one. If there is
+  no unique exact semantic match, `analyst_mapping=true` records your explicit
+  mapping, not an automatic recovery. Old text/association and source metadata
+  are retained with an audit; use `read_ssm_log_text(field="review.history")`
+  for its chunked JSON. The orphan stamp advances; stale retries cannot overwrite
+  other work. Reattachment is not proof the interpretation fits changed content.
 
 Example: read `search_ssm_log(search="i-alpha")`, inspect the original streams
 and linked events, then call `edit_ssm_log_entry` with that entry's exact
