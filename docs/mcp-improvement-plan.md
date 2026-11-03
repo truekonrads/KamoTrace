@@ -1,0 +1,199 @@
+# MCP improvements: implementation plan
+
+Status: approved direction for implementation, 2026-11-03.
+
+## Goal and authority
+
+Make large-case investigation practical through MCP: bounded interactive reads,
+explicit batch annotation, trustworthy review provenance, and full-data exports
+through generated download links rather than enormous tool responses.
+
+This plan incorporates an oracle review of the local `mcp-improvement-spec.md`.
+That draft's private session counts, timings and historical incidents were not
+independently reproduced. Implementation decisions below come from source review.
+This plan supersedes the draft where they differ and is self-contained.
+
+**Backward compatibility is not required.** Update server, MCP, browser, tests and
+investigation skill together. Do not add deprecated aliases or duplicate response
+formats merely to preserve old clients. However, preserve evidence and existing
+investigator work: incompatible APIs do not justify losing annotations or guessing
+which new content an old review describes.
+
+## Confirmed findings
+
+- `server.py` returns all unmatched reviews on every ordinary SSM log search,
+  including zero-match results. Full outputs and repeated linked finding bodies
+  further amplify responses.
+- `ssm.py` hashes rendered entry rows and source data into entry IDs. Changes to
+  grouping or derived decoding can detach reviews. Content-change protection is
+  intentional; silently inheriting reviews on changed content is not a fix.
+- SQLite reviews currently contain only entry ID, text, tags, finding and updated
+  stamp. Already orphaned IDs cannot reveal their original source identities.
+- Decoding currently comes from export enrichment. That decoding is already
+  searchable in enhanced/both scope; automatic local decoding is absent.
+- SSM reads already paginate across the selection. Explicit event writes already
+  support up to 5,000 hashes. Batch SSM review editing is missing.
+- Schema and note reads transfer unnecessary data. Body-only note editing leaves
+  SQLite links alone but still rebuilds DuckDB review-link temp tables.
+- Inventory/reference capabilities exist in the server but have no MCP wrapper.
+- No current server download endpoint provides the proposed bulk export path.
+
+## Invariants
+
+Keep the server the sole Store owner and the MCP adapter thin. Preserve loopback
+defaults, Host/Origin checks, parameter binding and allowlists. No arbitrary SQL,
+filesystem paths, caller-provided fetch URLs or query-selected writes. Mutations
+name explicit hashes or entry IDs and retain optimistic concurrency.
+
+Preserve exact original evidence JSON and hashes, separate systems/plugins,
+missing versus empty output, combined versus separate streams, and supplemental
+versus original provenance. Derived decoding is inert plaintext, never execution.
+Inventory is current configuration, not proof of incident-time identity.
+
+## Execution model
+
+Use the following Ralph-sized stories in dependency order. Each should fit one
+focused implementation/verification iteration; split a story further if necessary.
+Record actual checks and blockers alongside completed stories. Do not mark a story
+complete merely because its code exists. There is no need to install a Ralph loop
+runner or introduce a Node runtime dependency. The orb can execute this checklist
+directly, retaining progress across context windows.
+
+### Phase 1: bounded interactive reads and efficient edits
+
+- [ ] **S01: Separate orphan review retrieval.** Replace the unbounded search
+  payload with a count and paginated orphan summaries/detail. Update the browser
+  consumer directly. Verify zero-match searches with thousands of large orphan
+  reviews remain small and every orphan is still retrievable.
+- [ ] **S02: Bound SSM search summaries.** Add allowed projections, smaller default
+  pages, and bounded output/review/finding previews. Keep IDs, current review
+  stamps, total, continuation and truncation metadata. Do not embed repeated full
+  findings or event arrays. Verify a single huge row and Unicode-heavy results.
+- [ ] **S03: Retrieve full text in chunks.** Add validated field/offset/limit reads
+  for large SSM text, with explicit offset units and length/digest metadata.
+  Reconstruct original strings exactly across chunks. Keep pagination complete:
+  fixed page sizes or cursors based on actual next positions, never dynamic page
+  shrinking with old page-number arithmetic. Preserve search revision checks.
+- [ ] **S04: Streamline discovery and note reads.** Return compact schema metadata,
+  note summaries and direct note detail without first loading all note bodies.
+  Clarify evidence_read_only and annotations_writable. Use consistent object
+  envelopes where changed; do not conflate distinct timestamp meanings.
+- [ ] **S05: Optimize body-only note edits.** Avoid rebuilding unchanged review-link
+  temp tables. Still invalidate enhanced searches affected by body edits. Verify
+  stale edits fail, links remain unchanged, and record before/after timings on
+  synthetic notes linked to thousands of events before claiming a speedup.
+- [ ] **S06: Improve query validation.** Name invalid fields/operators/sorts and
+  valid choices. Accept JSON arrays for `in`, and null/omitted values for valueless
+  operators in both REST and MCP. Normalize only useful, documented aliases.
+
+Define an explicit serialized UTF-8 response budget, initially 80,000 bytes with
+headroom for MCP envelopes, rather than claiming a universal character-to-token
+ratio. Budgets must include metadata and large single values; truncation must be
+explicit and never prevent forward progress. Test both HTTP and stdio envelopes.
+
+### Phase 2: preserve review provenance before changing derived content
+
+- [ ] **S07: Persist review source metadata.** Add versioned semantic source identity
+  and reviewed-content identity/snapshot metadata. Backfill matched existing
+  reviews only. Retain current content-addressed entry IDs unless a simpler safe
+  design is established. Derived decoder versions must not become source identity.
+- [ ] **S08: Surface related and unresolved reviews.** Distinguish reviews of current
+  content from uniquely related reviews of changed content. Preserve unknown
+  legacy orphans. Duplicate invocation/plugin identities, missing identities and
+  supplemental requests must not collapse. Session requests remain individually
+  identifiable, not merged under a session ID.
+- [ ] **S09: Add explicit audited reattachment.** Require current review stamp and
+  destination conflict checks; retain old association provenance. Recover historical
+  orphans only from exact historical metadata or explicit analyst mappings. Test
+  repeated migration, ambiguous mappings and destinations already reviewed.
+
+Never promise automatic recovery from hashes alone. Acceptance is zero unexpected
+orphans when exact historical identity exists, with unresolved cases accessible.
+
+### Phase 3: bulk workflows, reference lookup and download links
+
+- [ ] **S10: Batch explicit SSM review edits.** Add a server endpoint and thin MCP
+  mapping with per-item ok/stale/missing/invalid results. Bound item count and total
+  request bytes within the existing 1 MiB limit. Define duplicate-ID behavior,
+  transaction behavior and retry semantics; update selection revision after writes.
+  Test mixed-result batches without echoing large review bodies.
+- [ ] **S11: Expose scoped inventory references.** Reuse `/api/reference`, with
+  bounded summaries, account/region scope, ambiguous matches, snapshot times and
+  sources. Do not invent absent hostnames or attach a singular asset to ambiguous
+  IPs. Verify missing inventory and cross-scope duplicate addresses/names.
+- [ ] **S12: Prepare immutable NDJSON exports.** Accept the ordinary validated
+  event/SSM selection and allowlisted fields, not SQL or paths. Generate a fixed
+  snapshot with selection, evidence identity, analyst revision and labelled derived
+  provenance. Preserve exact original evidence text when included. Use private
+  staging, writer locking and safe publication for derived sidecars; never overwrite
+  input evidence. Bound concurrent exports, rows/bytes and total disk consumption.
+- [ ] **S13: Expose generated export download links.** Add an explicit MCP
+  `create_export` tool and opaque-ID download endpoint on the existing server.
+  Return readiness, expiry and, once computed, row count, bytes and SHA-256.
+  Stream the prepared artifact without holding the shared Store lock during slow
+  downloads. Clean up expired disposable artifacts; test bad/expired IDs,
+  interrupted preparation, exact hashes, repeat downloads and access checks.
+
+An export URL is not a server-local filesystem path. Construct links from a trusted
+configured server base, never arbitrary Host input. Keep existing Host/Origin
+checks and redact opaque IDs/query contents from logs. Do not expose ports or add
+authentication changes as a side effect. Explain reachability: localhost URLs work
+only for clients on that machine; keep bounded MCP reads for consumers unable to
+download. A UI query link is optional inspection convenience, not a stable export.
+
+Prefer synchronous bounded export preparation initially. Add background export
+status only if measured generation times require it; never claim a download is
+ready before publication. Generation must not silently mix annotation revisions.
+
+### Phase 4: derived decoding and structured raw access
+
+- [ ] **S14: Add conservative local Base64 analysis.** Scan original command/request
+  parameter string values and separate output streams. Support standard/URL-safe
+  Base64, multiple spans, wrapped blocks and bounded recursion. Preserve parents,
+  source fields, offsets, decoder version and original text; retain export
+  derivations with separate labels. Use conservative text validation and consider
+  UTF-16LE for PowerShell. Test hashes/IDs/long identifiers as false positives.
+- [ ] **S15: Bound and expose derived analysis.** Limit scanned input, candidate
+  size/count, depth, aggregate output and case-wide work; cache repeated parameters.
+  Include accepted derivations in enhanced search, not raw scope. Report limits
+  honestly. Any compression support must enforce incremental output caps before
+  allocation; broad containers/ZIP support and expanded rendering are optional,
+  not first-release requirements. Never label expanded text as commands proven run.
+- [ ] **S16: Add constrained raw scalar paths.** Reuse validated parameter-bound
+  paths for projection/filtering/summaries. Bound path length/depth/index and field
+  count; define missing/null, scalar/container and numeric/text behavior. Verify
+  `requestParameters.name` extraction and failure classification in one query,
+  injection rejection, numeric precision and both sides of time boundaries.
+
+## Deferred or rejected scope
+
+Do not add universal tag mutation, merge distinct SSM tools, rename all time fields,
+or build generic asynchronous jobs without demonstrated need. Note tags can be a
+later explicit relationship, not a substitute for event tags. Standard Python
+`re` has no match timeout; pattern-length caps do not prevent pathological runtime.
+Do not add regex search without a genuinely bounded execution strategy.
+
+An MCP-only write token would leave REST writes accessible. Client permission
+prompts are not a server security boundary, and stdio proxies the same REST API.
+Keep the current local trust contract unless a separate authentication design is
+explicitly requested.
+
+## Verification and completion
+
+For each story, add public contract coverage for plausible regressions rather than
+private implementation details. Use synthetic asymmetric system/plugin fixtures,
+large orphans/outputs, Unicode, concurrency and continuation completeness. A
+retrieval budget test must also prove every expected item remains reachable exactly
+once. Test annotation snapshots during export and evidence immutability.
+
+Run real HTTP and stdio MCP sessions. Update
+`skills/investigating-with-kamotrace/SKILL.md` for changed tools, arguments, errors
+and identity rules, then exercise its examples through MCP. That skill file requires
+the building-skills guidance before editing. Browser changes require rendered
+synthetic desktop interaction checks and inspected captures, not syntax alone.
+
+Run repository checks: `uv run python -m unittest discover -s tests`,
+`node --check src/kamotrace/static/app.js`, `uv build`, and `git diff --check`.
+There is no configured static Python typecheck gate; do not invent one solely for
+Ralph terminology. Report actual checks, limitations, remaining stories and delivery
+state. Keep real exports, annotations and evidence screenshots out of commits.
