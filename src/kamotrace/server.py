@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo, available_timezones
 import duckdb
 
 from .pipeline import FIELDS as PIPELINE_FIELDS, PipelineError, compile_pipeline, describe as describe_pipeline
+from .raw_paths import CONTRACT as RAW_PATH_CONTRACT, fields as raw_fields, scalar as raw_scalar
 
 
 logger = logging.getLogger(__name__)
@@ -109,16 +110,22 @@ def parse_time(value):
     return parsed
 
 
-def build_query(body):
+def build_query(body, scalar_function):
     """Only allowlisted SQL fragments; all user values remain bound parameters."""
+    raw = raw_fields(body)
     conditions, params = [], [query_timezone(body)]
+    extracts = []
+    for field, alias in raw.items():
+        extracts.append(f"{scalar_function}(raw_event::VARCHAR, ?) AS {alias}")
+        params.append(field)
     if "pipeline" in body:
         predicate, values = compile_pipeline(body)
         conditions.append(predicate)
         params.extend(values)
     elif "pipeline_version" in body and (type(body["pipeline_version"]) is not int or body["pipeline_version"] != 1):
         raise PipelineError("Unsupported pipeline_version; expected 1")
-    source = "(SELECT * REPLACE (strftime(event_time AT TIME ZONE ?, '%Y-%m-%d %H:%M:%S') AS time_local) FROM browse_events)"
+    source = ("(SELECT * REPLACE (strftime(event_time AT TIME ZONE ?, '%Y-%m-%d %H:%M:%S') AS time_local)"
+              + (", " + ", ".join(extracts) if extracts else "") + " FROM browse_events)")
     start, end = body.get("start"), body.get("end")
     if start:
         parse_time(start)
@@ -144,12 +151,13 @@ def build_query(body):
         raise ValueError("Use at most 20 filters")
     for item in filters:
         field, op, value = item.get("field"), item.get("op"), item.get("value", "")
-        if not isinstance(field, str) or field not in FIELDS:
-            raise ValueError(f"Unknown filter field {field!r}; valid fields: " + ", ".join(FIELDS))
+        if not isinstance(field, str) or field not in {*FIELDS, *raw}:
+            raise ValueError(f"Unknown filter field {field!r}; valid fields: " + ", ".join(FIELDS) + ", constrained raw.key paths")
         if not isinstance(op, str) or op not in OPERATORS:
             raise ValueError(f"Unknown operator {op!r} for {field}; valid operators: " + ", ".join(sorted(OPERATORS)))
         if op not in ("empty", "not_empty", "missing", "not_missing", "in") and (not isinstance(value, str) or len(value) > 2000):
             raise ValueError(f"{field} {op} needs text up to 2,000 characters")
+        field = raw[field] + ".value" if field in raw else field
         if op in ("missing", "not_missing"):
             conditions.append(f"{field} IS {'NOT ' if op == 'not_missing' else ''}NULL")
         elif op in ("empty", "not_empty"):
@@ -199,11 +207,12 @@ def build_query(body):
     ordering = []
     for sorter in sorters:
         field, direction = sorter.get("field"), sorter.get("dir")
-        if not isinstance(field, str) or field not in SORT_FIELDS:
+        if not isinstance(field, str) or field not in SORT_FIELDS | raw.keys():
             raise ValueError(f"Unknown sort field {field!r}; valid sort fields: " + ", ".join(sorted(SORT_FIELDS)))
         if direction not in ("asc", "desc"):
             raise ValueError(f"Unknown sort direction {direction!r}; valid directions: asc, desc")
-        ordering.append(f"{'event_time' if field == 'time_local' else field} {direction.upper()} NULLS LAST")
+        column = "event_time" if field == "time_local" else raw[field] + ".value" if field in raw else field
+        ordering.append(f"{column} {direction.upper()} NULLS LAST")
     ordering.append("id ASC")
     try:
         page, size = int(body.get("page", 1)), int(body.get("size", 100))
@@ -214,6 +223,8 @@ def build_query(body):
     where = "\nWHERE " + "\n  AND ".join(conditions) if conditions else ""
     sql = ("SELECT id, record_sha256, time_local, event_name, event_source, identity, source_ip, country,\n"
            "       identity_type, key_id, target, document_name, error_code, region, isp, city, asn, ip_info, user_agent, event_id\n"
+           + "".join(f", {raw[f]}.value AS {raw[f]}, {raw[f]}.json_type AS {raw[f]}_type\n"
+                     for f in dict.fromkeys(body.get("raw_fields", []))) +
            "FROM " + source + where + "\nORDER BY " + ", ".join(ordering) + "\nLIMIT ? OFFSET ?")
     return sql, params + [size, (page - 1) * size], "SELECT count(*) FROM " + source + where, params, size
 
@@ -225,6 +236,12 @@ class Store:
             self.connection = duckdb.connect(str(database), read_only=True)
             startup.callback(self.connection.close)
             self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
+            # DuckDB's JSON numbers use doubles. This scalar accessor keeps exact numeric
+            # lexemes; SQL still owns selection/grouping. Function catalogs are shared by
+            # connections, so each Store owns a distinct application-generated function name.
+            self.raw_function = "kamotrace_scalar_" + secrets.token_hex(8)
+            self.connection.create_function(self.raw_function, raw_scalar, ["VARCHAR", "VARCHAR"],
+                duckdb.struct_type({"value": "VARCHAR", "json_type": "VARCHAR"}))
             # Snapshot exports reuse public Store reads under one annotation snapshot.
             self.lock = threading.RLock()
             self.exports = None
@@ -873,6 +890,7 @@ class Store:
             "fields": FIELDS, "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS),
             "pipeline_version": 1, "pipeline_fields": PIPELINE_FIELDS, "page_sizes": PAGE_SIZES,
             "ssm_summary_fields": SSM_SUMMARY_FIELDS, "ssm_text_fields": SSM_TEXT_FIELDS,
+            "raw_scalar_paths": RAW_PATH_CONTRACT,
             "interactive_response_budget_bytes": INTERACTIVE_BUDGET,
             **({"timezones": TIMEZONES} if body.get("include_timezones") is True else {})}
 
@@ -883,11 +901,11 @@ class Store:
         if dataset not in ("events", "ssm") or not isinstance(selection, dict):
             raise ValueError("dataset must be events or ssm; selection must be an ordinary query object")
         selection_keys = ({"timezone", "search", "filters", "tags", "annotation_id", "command_key", "start", "end",
-                           "rules", "min_level", "sorters", "pipeline", "pipeline_version"} if dataset == "events"
+                           "rules", "min_level", "sorters", "pipeline", "pipeline_version", "raw_fields"} if dataset == "events"
                           else {"search", "search_scope", "start", "end"})
         if set(selection) - selection_keys:
             raise ValueError("Unknown export selection fields: " + ", ".join(sorted(set(selection) - selection_keys)))
-        allowed = (["id", "record_sha256", *FIELDS, "tags", "annotations", "detections", "raw_json"] if dataset == "events"
+        allowed = (["id", "record_sha256", *FIELDS, "tags", "annotations", "detections", "raw_json", "raw_fields"] if dataset == "events"
                    else ["entry_id", *SSM_SUMMARY_FIELDS, "review", "events", "event_raw_json", "analysis"])
         fields = body.get("fields", allowed)
         if not isinstance(fields, list) or not fields or len(fields) > 40 or any(f not in allowed for f in fields):
@@ -925,7 +943,8 @@ class Store:
         return self.exports.prepare(write, base_url)
 
     def query(self, body):
-        sql, params, count_sql, count_params, size = build_query(body)
+        sql, params, count_sql, count_params, size = build_query(body, self.raw_function)
+        paths = raw_fields(body)
         started = time.monotonic()
         with self.locked("events"):
             counted = time.monotonic()
@@ -935,6 +954,8 @@ class Store:
             rows = self.rows(sql, params, operation="events.page")
             found = self.row_detections([row["id"] for row in rows])
             for row in rows:
+                row["raw_fields"] = {field: {"value": row.pop(paths[field]), "json_type": row.pop(paths[field] + "_type")}
+                                     for field in dict.fromkeys(body.get("raw_fields", []))}
                 row["tags"] = [dict(r) for r in self.reviews.execute("SELECT t.* FROM tags t JOIN event_tags e USING(slug) WHERE e.hash=? ORDER BY slug", (row["record_sha256"],))]
                 row["annotations"] = [r[0] for r in self.reviews.execute("SELECT annotation_id FROM annotation_events WHERE hash=?", (row["record_sha256"],))]
                 row["detections"] = found.get(row["id"], [])
@@ -949,7 +970,7 @@ class Store:
         minutes = int(width)
         start = body.get("start") or datetime.fromtimestamp(self.meta["start_ms"] / 1000, timezone.utc).isoformat()
         end = body.get("end") or datetime.fromtimestamp(self.meta["end_ms"] / 1000, timezone.utc).isoformat()
-        _, _, count_sql, params, _ = build_query({**body, "start": start, "end": end})
+        _, _, count_sql, params, _ = build_query({**body, "start": start, "end": end}, self.raw_function)
         if (parse_time(end) - parse_time(start)).total_seconds() / (minutes * 60) > 2000:
             raise ValueError("More than 2,000 buckets: choose a larger bucket or a shorter time range")
         # Enumerate wall-clock boundaries, retaining both folds and skipping nonexistent times.
@@ -990,9 +1011,11 @@ class Store:
 
     def column_values(self, body):
         field = body.get("field")
-        if field not in {*FIELDS, "time_local"}:
+        paths = raw_fields(body)
+        if field not in {*FIELDS, "time_local", *paths}:
             raise ValueError("Unknown summary column")
-        _, _, count_sql, params, _ = build_query(body)
+        field = paths[field] + ".value" if field in paths else field
+        _, _, count_sql, params, _ = build_query(body, self.raw_function)
         if "value" in body:
             value = body["value"]
             if value is not None and not isinstance(value, str):

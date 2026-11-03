@@ -175,6 +175,34 @@ def main():
                 page.request.post(BrowserContract.url + "/api/reviews", data={
                     "action": "delete", "id": note["id"], "updated": note["updated"]})
 
+                # Agent-saved raw filters/projections and array members must survive reopening/editing.
+                raw_query = {"start": bounds["start_ms"], "end": bounds["end_ms"], "search": "SendCommand",
+                    "raw_fields": ["raw.requestParameters.number"],
+                    "filters": [{"field": "raw.sourceIPAddress", "op": "in", "value": ["8.8.8.8", "comma,value"]}]}
+                raw_note = page.request.post(BrowserContract.url + "/api/reviews", data={"action": "annotate",
+                    "body": "Raw scalar saved query", "hashes": [event["record_sha256"]], "context": raw_query}).json()
+                page.reload()
+                expect(rows).to_have_count(5)
+                page.locator("#expand-sidebar").click()
+                page.locator(".note-head").filter(has_text="Raw scalar saved query").click()
+                page.get_by_role("button", name="Reopen query", exact=True).click()
+                expect(rows).to_have_count(1)
+                expect(page.locator("#scopes")).to_contain_text("raw.sourceIPAddress")
+                page.locator("#scopes .scope-label").filter(has_text="raw.sourceIPAddress").click()
+                expect(page.locator("#filter-field")).to_have_value("raw.sourceIPAddress")
+                expect(page.locator("#filter-value")).to_have_value('["8.8.8.8","comma,value"]')
+                with page.expect_response(lambda response: "/api/events" in response.url) as raw_response:
+                    page.locator("#filter-save").click()
+                assert raw_response.value.request.post_data_json["filters"] == raw_query["filters"]
+                assert raw_response.value.request.post_data_json["raw_fields"] == raw_query["raw_fields"]
+                expect(rows).to_have_count(1)
+                page.screenshot(path=str(results / "raw-scalar-query-preserved.png"))
+                page.locator("#clear").click()
+                expect(rows).to_have_count(5)
+                page.locator("#collapse-sidebar").click()
+                page.request.post(BrowserContract.url + "/api/reviews", data={
+                    "action": "delete", "id": raw_note["id"], "updated": raw_note["updated"]})
+
                 # Context is read-only; focus/click must not open the event row or alter its query.
                 identity = rows.first.locator('[tabulator-field="identity"] .cell-text')
                 identity.focus()

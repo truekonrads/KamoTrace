@@ -150,7 +150,7 @@ const noteEvents = new Map();
 const OPS = {
   eq: ["is", "="],
   neq: ["is not", "≠"],
-  in: ["is one of (comma-separated)", "∈"],
+  in: ["is one of", "∈"],
   contains: ["contains", "contains"],
   not_contains: ["does not contain", "excludes"],
   empty: ["is empty", "is empty"],
@@ -171,9 +171,14 @@ function normalize(state) {
     search: typeof s.search === "string" ? s.search : "",
     pipeline: typeof s.pipeline === "string" ? s.pipeline : null,
     pipeline_version: s.pipeline_version ?? 1,
+    raw_fields: Array.isArray(s.raw_fields) ? [...s.raw_fields] : [],
     filters: (Array.isArray(s.filters) ? s.filters : [])
-      .filter((f) => f && meta.fields[f.field] && OPS[f.op])
-      .map((f) => ({ field: f.field, op: f.op, value: String(f.value ?? "") })),
+      .filter((f) => f && typeof f.field === "string" && OPS[f.op])
+      .map((f) => ({
+        field: f.field,
+        op: f.op,
+        value: Array.isArray(f.value) ? [...f.value] : (f.value ?? ""),
+      })),
     tags: (Array.isArray(s.tags) ? s.tags : []).filter(
       (t) => typeof t === "string",
     ),
@@ -278,6 +283,7 @@ function query() {
     min_level: applied.min_level,
     command_key: applied.command_key,
     filters: applied.filters,
+    raw_fields: applied.raw_fields,
     ...(applied.pipeline !== null
       ? {
           pipeline: applied.pipeline,
@@ -441,7 +447,7 @@ function renderScopes() {
   s.filters.forEach((f, i) =>
     out.push(
       chip(
-        `${meta.fields[f.field]} ${OPS[f.op][1]}${VALUELESS.includes(f.op) ? "" : " " + (f.value === "" ? "(empty string)" : f.value)}`,
+        `${meta.fields[f.field] || f.field} ${OPS[f.op][1]}${VALUELESS.includes(f.op) ? "" : " " + (f.value === "" ? "(empty string)" : Array.isArray(f.value) ? JSON.stringify(f.value) : f.value)}`,
         {
           title: "Click to edit this filter",
           onClick: () => openFilterEditor(i),
@@ -527,10 +533,18 @@ function filterEditorValue() {
   const value = $("filter-value").value;
   if (!VALUELESS.includes(op) && value === "" && editingFilter === null)
     return null;
+  let selected = value;
+  if (op === "in" && value.trim().startsWith("[")) {
+    try {
+      selected = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
   return {
     field: $("filter-field").value,
     op,
-    value: VALUELESS.includes(op) ? "" : value,
+    value: VALUELESS.includes(op) ? "" : selected,
   };
 }
 
@@ -549,9 +563,13 @@ function openFilterEditor(index = null) {
     index === null
       ? { field: "event_name", op: "eq", value: "" }
       : applied.filters[index];
+  if (![...$("filter-field").options].some((o) => o.value === f.field))
+    $("filter-field").add(new Option(f.field, f.field));
   $("filter-field").value = f.field;
   $("filter-op").value = f.op;
-  $("filter-value").value = f.value;
+  $("filter-value").value = Array.isArray(f.value)
+    ? JSON.stringify(f.value)
+    : f.value;
   $("filter-save").textContent = index === null ? "Add" : "Update";
   $("filter-editor").hidden = false;
   $("add-filter").hidden = true;
@@ -3107,7 +3125,9 @@ function scopeSummary(s) {
     parts.push(`pipeline v${s.pipeline_version}: ${s.pipeline}`);
   if (s.search) parts.push(`search “${s.search}”`);
   for (const f of s.filters)
-    parts.push(`${meta.fields[f.field]} ${OPS[f.op][1]} ${f.value}`);
+    parts.push(
+      `${meta.fields[f.field] || f.field} ${OPS[f.op][1]} ${Array.isArray(f.value) ? JSON.stringify(f.value) : f.value}`,
+    );
   for (const t of s.tags) parts.push(`tag ${t}`);
   if (s.annotation_id !== null) parts.push(`finding #${s.annotation_id}`);
   for (const r of s.rules || [])

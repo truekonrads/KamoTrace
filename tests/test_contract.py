@@ -759,6 +759,13 @@ class BrowserContract(unittest.TestCase):
                 self.assertIn("not_missing", schema["operators"])
                 self.assertEqual(schema["timezone"], "UTC")
                 self.assertTrue(schema["evidence_read_only"])
+                projected = await tool("search_events", query={"raw_fields": ["raw.requestParameters.number"],
+                    "filters": [{"field": "raw.requestParameters.number", "op": "eq", "value": "9007199254740993"}]})
+                self.assertEqual(projected["total"], 5)
+                self.assertTrue(all(r["raw_fields"]["raw.requestParameters.number"]["value"] == "9007199254740993"
+                    for r in projected["events"]))
+                self.assertEqual((await tool("summarize_field", field="raw.requestParameters.number"))["top"],
+                    [{"value": "9007199254740993", "events": 5}])
                 self.assertTrue(schema["annotations_writable"])
                 self.assertNotIn("facets", schema)
                 self.assertNotIn("timezones", schema)
@@ -1809,6 +1816,95 @@ class BrowserContract(unittest.TestCase):
         result = Analysis().analyze([("parameters", [payload] * 513)])
         self.assertIn("source_structure_limit", result["reasons"])
 
+    def test_raw_scalar_paths_share_selection_and_preserve_numeric_text(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            database, source = root / "events.duckdb", root / "events.json"
+            stamps = ["00:59:59", "01:00:00", "01:00:01", "01:59:59", "02:00:00", "02:00:01"]
+            events = [{"eventID": f"raw-{i}", "eventTime": "2026-01-02T" + stamp + "Z",
+                "eventSource": "ssm.amazonaws.com", "eventName": "GetParameter" if i % 2 else "PutParameter",
+                "requestParameters": {"name": "/doc", "number": 2 if i == 1 else 10 if i == 3 else 9007199254740993,
+                    "fraction": "DECIMAL", "null": None, "array": ["first", "second"], "empty": "", "flag": i % 2 == 0},
+                **({"errorCode": "AccessDenied"} if i in (0, 2, 4) else {})} for i, stamp in enumerate(stamps)]
+            source.write_text(json.dumps({"Records": events}).replace('"DECIMAL"', '0.123456789012345678901234567890'))
+            build(source, database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            store = Store(database)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            def post(route, body, status=200):
+                try:
+                    with urlopen(Request(f"http://127.0.0.1:{server.server_port}" + route,
+                        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})) as response:
+                        self.assertEqual(response.status, status)
+                        return json.load(response)
+                except HTTPError as error:
+                    self.assertEqual(error.code, status)
+                    return json.load(error)
+            try:
+                fields = ["raw.requestParameters." + k for k in ("name", "number", "fraction", "null", "array", "array[1]", "absent", "empty", "flag")]
+                body = {"raw_fields": fields, "filters": [{"field": fields[0], "op": "eq", "value": "/doc"}],
+                    "pipeline": 'event_name = "GetParameter" OR event_name = "PutParameter"', "pipeline_version": 1,
+                    "start": "2026-01-02T01:00:00Z", "end": "2026-01-02T02:00:00Z"}
+                result = post("/api/events", body)
+                self.assertEqual({r["id"] for r in result["data"]}, {2, 3, 4})
+                self.assertEqual([r["error_code"] for r in result["data"]], [None, "AccessDenied", None])
+                for row in result["data"]:
+                    values = row["raw_fields"]
+                    self.assertEqual(values[fields[1]]["value"], {2: "2", 3: "9007199254740993", 4: "10"}[row["id"]])
+                    self.assertEqual(values[fields[2]]["value"], "0.123456789012345678901234567890")
+                    self.assertEqual(values[fields[3]], {"value": None, "json_type": "NULL"})
+                    self.assertEqual(values[fields[4]], {"value": None, "json_type": "ARRAY"})
+                    self.assertEqual(values[fields[5]], {"value": "second", "json_type": "STRING"})
+                    self.assertEqual(values[fields[6]], {"value": None, "json_type": None})
+                    self.assertEqual(values[fields[7]], {"value": "", "json_type": "STRING"})
+                    self.assertEqual(values[fields[8]], {"value": "true" if row["id"] == 3 else "false", "json_type": "BOOLEAN"})
+                self.assertNotIn("requestParameters.name", result["sql"])
+                self.assertIn("raw.requestParameters.name", result["params"])
+                self.assertEqual(post("/api/histogram", body)["total"], 3)
+                self.assertEqual([r["id"] for r in post("/api/events", {**body,
+                    "sorters": [{"field": fields[1], "dir": "asc"}]})["data"]], [4, 2, 3])
+                for field in fields[3:5] + [fields[6]]:
+                    self.assertEqual(post("/api/events", {**body, "filters": [{"field": field, "op": "missing"}]})["last_row"], 3)
+                self.assertEqual(post("/api/events", {**body, "filters": [{"field": fields[7], "op": "missing"}]})["last_row"], 0)
+                self.assertEqual(post("/api/events", {**body, "filters": [{"field": fields[7], "op": "empty"}]})["last_row"], 3)
+                summary = post("/api/column-values", {**body, "field": "error_code"})
+                self.assertEqual(summary["top"], [{"value": None, "events": 2}, {"value": "AccessDenied", "events": 1}])
+                self.assertEqual(post("/api/column-values", {**body, "field": fields[0], "value": "/doc"}), {"total": 3, "events": 3})
+                self.assertEqual(post("/api/column-values", {**body, "field": fields[1]})["top"],
+                    [{"value": v, "events": 1} for v in ("10", "2", "9007199254740993")])
+                failed = {**body, "filters": [*body["filters"], {"field": "raw.errorCode", "op": "not_missing"}]}
+                self.assertEqual([r["id"] for r in post("/api/events", failed)["data"]], [3])
+                self.assertEqual(post("/api/histogram", failed)["total"], 1)
+                exported = post("/api/exports", {"dataset": "events", "selection": failed, "fields": ["id", "raw_fields"]})
+                with urlopen(exported["download_url"]) as response:
+                    exported_rows = [json.loads(line) for line in response.read().splitlines()]
+                self.assertEqual([r["id"] for r in exported_rows[1:]], [3])
+                self.assertEqual(exported_rows[1]["raw_fields"][fields[1]]["value"], "9007199254740993")
+                post("/api/events", {"raw_fields": ["raw." + "x" * 252, "raw." + ".".join(["a"] * 8), "raw.x[1000]"]})
+                post("/api/events", {"raw_fields": ["raw.x" + str(i) for i in range(10)]})
+                bad_paths = ["raw.requestParameters.*", "raw.requestParameters.name'); DROP TABLE events;--",
+                    "raw.x[-1]", "raw.x[1001]", "raw.x[01]", "raw." + "a." * 8 + "b", "raw." + "x" * 253,
+                    'raw["requestParameters"]', "$.requestParameters.name"]
+                for path in bad_paths:
+                    for route, query in (("/api/events", {"raw_fields": [path]}),
+                        ("/api/events", {"filters": [{"field": path, "op": "eq", "value": "x"}]}),
+                        ("/api/column-values", {"field": path})):
+                        post(route, query, 400)
+                post("/api/events", {"raw_fields": ["raw.x" + str(i) for i in range(11)]}, 400)
+                post("/api/events", {"raw_fields": ["raw.x" + str(i) for i in range(10)],
+                    "filters": [{"field": "raw.y", "op": "missing"}]}, 400)
+                self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                if store.exports is not None:
+                    store.exports.close()
+                store.connection.close()
+                store.reviews.close()
+
     def test_ssm_batch_reviews_have_independent_results_and_safe_retries(self):
         rows = self.call("/api/ssm-log", {})[1]["data"]
         ids = [e["entry_id"] for e in rows if e["review"]["updated"] is None][:5]
@@ -1833,7 +1929,8 @@ class BrowserContract(unittest.TestCase):
                 self.assertIsNone(self.call("/api/ssm-log", {"entry_id": id_})[1]["data"][0]["review"]["updated"])
             replay = self.call("/api/ssm-log-batch", {"items": [items[0]]})[1]
             self.assertEqual(replay["results"][0]["status"], "stale")
-            self.assertEqual(self.call("/api/ssm-log-batch", {"items": [items[0]] * 101})[0], 400)
+            self.assertEqual(self.call("/api/ssm-log-batch", {"items": [{**items[0], "text": ""}] * 101})[0], 400)
+            self.assertEqual(self.call("/api/ssm-log-batch", {}, headers={"Content-Length": "1048577"})[0], 400)
         finally:
             with self.store.lock, self.store.reviews:
                 for id_ in (ids[0], ids[4]):

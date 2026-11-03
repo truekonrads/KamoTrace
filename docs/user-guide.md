@@ -1534,6 +1534,28 @@ JSON string arrays for `in` (commas in array members are literal); valueless
 empty/missing operators accept null or omitted values. Invalid fields/operators/
 sorts name the rejected value and valid choices, not guessed aliases.
 
+Event queries also accept constrained scalar paths such as
+`raw.requestParameters.name` or `raw.resources[0].ARN` in ordinary filters,
+sorters and field summaries. Add `query.raw_fields` to project a map of those
+paths to `{value, json_type}` in event rows and exports. For example, combine
+`{"field":"raw.requestParameters.name","op":"eq","value":"/doc"}`
+with `{"field":"error_code","op":"not_missing"}` to classify failed
+requests for that exact parameter. External filters and time bounds constrain
+every pipeline OR branch; raw paths are not pipeline v1 field syntax.
+Paths allow ASCII identifier keys and explicit array indices only: 256 characters,
+eight key/index steps, indices 0–1000 and ten distinct paths across projection,
+filters, summaries and sorting. No wildcard, quoted key, SQL or arbitrary JSONPath.
+Scalar values are text: numbers retain their exact original lexemes, booleans
+are `true`/`false`, sorting is lexicographic and numeric range/coercion operators
+are unavailable. Missing paths have null `json_type`; JSON null is `NULL`, and
+containers retain `OBJECT`/`ARRAY`, all with no scalar value. Missing operators
+therefore include nulls and containers; empty operators also include the empty
+string. Strings, numbers and booleans have types `STRING`, `NUMBER` and `BOOLEAN`.
+Extraction uses a precision-preserving scalar accessor (DuckDB's Python UDF
+requires NumPy); filtering, counts, grouping and ordering remain in the shared SQL
+query path. Raw evidence and canonical hashes are never rewritten. Saved Finding
+contexts preserve raw projections, filters and literal JSON-array members.
+
 Local Base64 analysis scans original command/request parameter string values and
 separate stdout/stderr/combined streams. It accepts conservative printable UTF-8
 or PowerShell-like UTF-16LE, standard/URL-safe spans, line wrapping and two decoding

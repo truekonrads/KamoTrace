@@ -1,6 +1,6 @@
 # MCP improvements: implementation plan
 
-Status: approved direction for implementation, 2026-11-03.
+Status: S01–S16 implemented and verified locally, 2026-11-03; not pushed or merged.
 
 ## Goal and authority
 
@@ -225,12 +225,22 @@ ready before publication. Generation must not silently mix annotation revisions.
   Added per-entry/case scan, candidate, recursion, output and structural bounds,
   bounded parameter cache, honest reasons/counts and chunked analysis JSON. No
   decompression. Enhanced-only search and exact chunk reconstruction verified;
-  all bounds exercised. Contract suite: 49 tests passed, including both MCP transports.
-- [ ] **S16: Add constrained raw scalar paths.** Reuse validated parameter-bound
+  core bounds exercised. Contract suite: 49 tests passed, including both MCP transports.
+- [x] **S16: Add constrained raw scalar paths.** Reuse validated parameter-bound
   paths for projection/filtering/summaries. Bound path length/depth/index and field
   count; define missing/null, scalar/container and numeric/text behavior. Verify
   `requestParameters.name` extraction and failure classification in one query,
   injection rejection, numeric precision and both sides of time boundaries.
+  Added parameter-bound raw.key.child[0] projection, filtering, sorting and summaries
+  through shared SQL queries (not pipeline v1). Scalar text retains exact numeric
+  lexemes using a Python accessor because DuckDB JSON extraction rounds decimals;
+  its UDF runtime requires the added NumPy dependency. HTTP checks cover /doc
+  failure classification, OR/time scope, precise integers/decimals, boolean/null/
+  missing/container semantics, lexicographic sorting, export/histogram consistency,
+  accepted/rejected path bounds and unchanged evidence-file SHA-256. Real HTTP/stdio
+  MCP sessions exercise the documented query/summary examples. Browser smoke and an
+  inspected pointer recording verify saved Finding reopen/edit retains raw filters,
+  projections and literal comma-containing array members, keeping one matching row.
 
 ## Deferred or rejected scope
 
@@ -264,3 +274,14 @@ Run repository checks: `uv run python -m unittest discover -s tests`,
 There is no configured static Python typecheck gate; do not invent one solely for
 Ralph terminology. Report actual checks, limitations, remaining stories and delivery
 state. Keep real exports, annotations and evidence screenshots out of commits.
+
+Final local verification (2026-11-03): 114 unittest tests passed, including 50 HTTP/
+MCP contract tests; JavaScript syntax, wheel/sdist build and diff whitespace checks
+passed. Full browser smoke passed with Playwright 1.64.1 and the orb's installed
+Chrome executable; no JavaScript errors. Synthetic desktop normal/limit decoding,
+preserved orphan retrieval and raw-filter editor/result captures were inspected,
+with pointer recordings for orphan retrieval and saved-query editing. An undrained
+9,901,524-byte export allowed an independent event query in 0.010 seconds; restarting
+the interrupted download returned exact bytes/SHA-256. No remaining stories or
+implementation blockers. Changes remain on local implement/mcp-improvements,
+based on db3361b74adcec1c6a881d5649b98bc5a2086796; publishing requires authorization.

@@ -63,6 +63,7 @@ class Filter(BaseModel):
 
 class Query(BaseModel):
     timezone: str = Field("UTC", description="IANA timezone for time_local filters, results and histogram boundaries.")
+    raw_fields: list[str] = Field([], max_length=10, description="Constrained scalar projections, e.g. raw.requestParameters.name. Same paths work in filters/summaries/sorts, not pipeline v1. Values are exact text, with JSON type metadata; no SQL, wildcards or quoted keys.")
     search: str = Field("", description="Case-insensitive substring over the raw event JSON.")
     pipeline: str | None = Field(None, description='Optional v1 filter expression: pipes mean AND; OR is explicit. Example: event_name = "ConsoleLogin" OR event_name = "AssumeRole" | search "AccessDenied". Dates remain start/end. Fields and operators: describe_schema().pipeline_fields. Values use JSON double-quoted strings; tag/lead are membership fields. Existing query properties AND with the whole pipeline.')
     pipeline_version: int = Field(1, strict=True, description="Pipeline language version. Only 1 is supported.")
@@ -77,7 +78,7 @@ class Query(BaseModel):
         None, description="Only events with a detection or contextual lead at or above this severity level.")
 
     def body(self):
-        return {"timezone": self.timezone, "search": self.search, "filters": [f.model_dump() for f in self.filters], "tags": self.tags,
+        return {"timezone": self.timezone, "raw_fields": self.raw_fields, "search": self.search, "filters": [f.model_dump() for f in self.filters], "tags": self.tags,
                 "annotation_id": self.note_id, "command_key": self.command_key, "start": self.start, "end": self.end,
                 "rules": self.rules, "min_level": self.min_level, "pipeline_version": self.pipeline_version,
                 **({"pipeline": self.pipeline} if self.pipeline is not None else {})}

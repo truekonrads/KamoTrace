@@ -163,6 +163,22 @@ such as Operation are not keys (`event_name` is).
   For empty/missing operators, omit `value` or pass null. Invalid fields,
   operators and sorts name the rejected value and valid choices; no aliases are inferred.
 
+- `describe_schema().raw_scalar_paths` describes constrained paths such as
+  `raw.requestParameters.name` and `raw.resources[0].ARN`. Use them in ordinary
+  filters, summaries and sorters, not pipeline v1 syntax. Project them with
+  `query.raw_fields`; event rows return `{path: {value, json_type}}`. For example,
+  `search_events(query={raw_fields: ["raw.requestParameters.number"], filters:
+  [{field: "raw.requestParameters.number", op: "eq", value: "9007199254740993"}]})`
+  preserves the exact number text; `summarize_field(field="raw.requestParameters.number")`
+  uses the same extraction. Combine a name filter with `error_code not_missing`
+  to classify failures for one parameter, rather than searching unrelated JSON text.
+  Limits: 256 characters/path, eight key/index steps, indices 0–1000, ten distinct
+  paths/query. ASCII identifier keys only; no quoted keys, wildcard or JSONPath.
+  Scalar values and sorting are text, without numeric coercion/range operators.
+  Types are `STRING/NUMBER/BOOLEAN`; absent type is null, JSON null is `NULL`,
+  containers are `ARRAY/OBJECT`. Those last three cases have no scalar value,
+  so `missing` includes all of them; `empty` also includes `""`. Retain all raw
+  filters/projections when saving a Finding context; browser reopening preserves them.
 - `tags`: the event must carry **every** listed tag. Combine tags only when you
   mean all of them.
 - `note_id`: only events linked to that note. `command_key`: only CloudTrail
