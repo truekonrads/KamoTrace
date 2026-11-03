@@ -153,15 +153,24 @@ orphans when exact historical identity exists, with unresolved cases accessible.
 
 ### Phase 3: bulk workflows, reference lookup and download links
 
-- [ ] **S10: Batch explicit SSM review edits.** Add a server endpoint and thin MCP
+- [x] **S10: Batch explicit SSM review edits.** Add a server endpoint and thin MCP
   mapping with per-item ok/stale/missing/invalid results. Bound item count and total
   request bytes within the existing 1 MiB limit. Define duplicate-ID behavior,
   transaction behavior and retry semantics; update selection revision after writes.
   Test mixed-result batches without echoing large review bodies.
-- [ ] **S11: Expose scoped inventory references.** Reuse `/api/reference`, with
+  Shared single/batch writer, 100-item/1-MiB limits, independent per-item commits,
+  all duplicate occurrences rejected, compact outcomes and revision invalidation.
+  Mixed seven-item HTTP batch verifies successful items on both sides of failures,
+  no failed writes, stale replay and stale search continuation; real MCP batches pass.
+- [x] **S11: Expose scoped inventory references.** Reuse `/api/reference`, with
   bounded summaries, account/region scope, ambiguous matches, snapshot times and
   sources. Do not invent absent hostnames or attach a singular asset to ambiguous
   IPs. Verify missing inventory and cross-scope duplicate addresses/names.
+  Added thin `lookup_reference`, bounded paginated server projection, explicit
+  ambiguity/snapshot/source labels and no history scan by default. Real HTTP/stdio
+  calls distinguish two owners of one private IP from an account/region-scoped
+  unique result. Missing-inventory HTTP check remains explicitly not searched.
+  Contract suite: 46 tests passed.
 - [ ] **S12: Prepare immutable NDJSON exports.** Accept the ordinary validated
   event/SSM selection and allowlisted fields, not SQL or paths. Generate a fixed
   snapshot with selection, evidence identity, analyst revision and labelled derived

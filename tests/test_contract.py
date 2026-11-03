@@ -889,6 +889,16 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual((await tool("edit_ssm_log_entry", **{**args, "entry_id": "0" * 64}))[0], "error")
                 self.assertEqual((await tool("delete_note", id=created["id"], updated=note["updated"]))["deleted"], True)
                 self.assertNotIn(created["id"], [n["id"] for n in rest("/api/reviews")["annotations"]])
+                batch = await tool("edit_ssm_log_entries", items=[{**args, "updated": review["updated"]},
+                    {**args, "entry_id": "0" * 64}])
+                self.assertEqual([r["status"] for r in batch["results"]], ["ok", "missing"])
+                reference = await tool("lookup_reference", kind="ip", value="10.0.1.5")
+                self.assertTrue(reference["ambiguous"])
+                self.assertFalse(reference["history_included"])
+                scoped = await tool("lookup_reference", kind="ip", value="10.0.1.5", account="123", region="us-east-1")
+                self.assertFalse(scoped["ambiguous"])
+                self.assertEqual([r["id"] for r in scoped["matches"]], ["i-other"])
+                self.assertEqual(scoped["snapshot"]["completed_at_utc"], "2026-10-29T15:01:00Z")
 
         for transport in (self.url + "/mcp", StdioServerParameters(
                 command=sys.executable, args=["-m", "kamotrace", "mcp", "--url", self.url])):
@@ -1411,6 +1421,11 @@ class BrowserContract(unittest.TestCase):
 
             try:
                 first, last = post("/api/ssm-log", {}), post("/api/ssm-log", {"page": 2})
+                reference = post("/api/reference", {"kind": "machine", "value": "i-session-target",
+                    "include_history": False, "projection": "summary"})
+                self.assertFalse(reference["inventory_loaded"])
+                self.assertFalse(reference["history_included"])
+                self.assertEqual(reference["matches"], [])
                 self.assertFalse(first["loaded"])
                 self.assertEqual((first["total"], len(first["data"]), len(last["data"])), (105, 100, 5))
                 self.assertEqual(len({e["entry_id"] for e in first["data"] + last["data"]}), 105)
@@ -1606,6 +1621,37 @@ class BrowserContract(unittest.TestCase):
         finally:
             for note in notes:
                 self.call("/api/reviews", {"action": "delete", "id": note["id"], "updated": note["updated"]})
+
+    def test_ssm_batch_reviews_have_independent_results_and_safe_retries(self):
+        rows = self.call("/api/ssm-log", {})[1]["data"]
+        ids = [e["entry_id"] for e in rows if e["review"]["updated"] is None][:5]
+        initial = self.call("/api/ssm-log", {"search": "stdout", "projection": "summary"})[1]
+        def edit(id_, **values):
+            return {"entry_id": id_, "updated": None, "text": "synthetic batch\n" * 1000,
+                    "tags": ["batch"], "finding": "Synthetic finding", **values}
+        items = [edit(ids[0]), edit(ids[1], updated="stale"), edit(ids[2], tags=["bad tag"]),
+                 edit("0" * 64), edit(ids[3]), edit(ids[3]), edit(ids[4])]
+        try:
+            status, result = self.call("/api/ssm-log-batch", {"items": items})
+            self.assertEqual(status, 200)
+            self.assertEqual([r["status"] for r in result["results"]], ["ok", "stale", "invalid", "missing", "invalid", "invalid", "ok"])
+            self.assertLess(len(json.dumps(result).encode()), 3000)
+            self.assertNotEqual(result["revision"], initial["revision"])
+            self.assertEqual(self.call("/api/ssm-log", {"search": "stdout", "projection": "summary", "page": 2,
+                "revision": initial["revision"]})[0], 409)
+            for id_ in (ids[0], ids[4]):
+                saved = self.call("/api/ssm-log", {"entry_id": id_})[1]["data"][0]["review"]
+                self.assertEqual(saved["text"], items[0]["text"])
+            for id_ in ids[1:4]:
+                self.assertIsNone(self.call("/api/ssm-log", {"entry_id": id_})[1]["data"][0]["review"]["updated"])
+            replay = self.call("/api/ssm-log-batch", {"items": [items[0]]})[1]
+            self.assertEqual(replay["results"][0]["status"], "stale")
+            self.assertEqual(self.call("/api/ssm-log-batch", {"items": [items[0]] * 101})[0], 400)
+        finally:
+            with self.store.lock, self.store.reviews:
+                for id_ in (ids[0], ids[4]):
+                    self.store.reviews.execute("DELETE FROM ssm_log_reviews WHERE entry_id=?", (id_,))
+                    self.store.reviews.execute("DELETE FROM ssm_review_sources WHERE entry_id=?", (id_,))
 
     def test_ssm_orphan_reviews_are_explicit_bounded_and_complete(self):
         # Large Unicode reviews must not leak into even a zero-match ordinary search.

@@ -403,6 +403,29 @@ def edit_ssm_log_entry(entry_id: str, text: str, tags: list[str], finding: str,
 
 
 @mcp.tool(annotations=READ)
+def lookup_reference(kind: Literal["identity", "machine", "ip"], value: str,
+                      account: str | None = None, region: str | None = None,
+                      include_history: bool = False,
+                      page: Annotated[int, Field(ge=1)] = 1) -> dict[str, Any]:
+    """Bounded scoped reference summaries from loaded inventory, with snapshot times and ambiguity.
+    Current configuration is not incident-time identity. No AWS/DNS/network lookups occur.
+    History is not searched unless explicitly requested; not searched does not mean no activity.
+    Follow next_page. Never attach a singular asset to ambiguous addresses or infer a hostname."""
+    return call("/api/reference", {"kind": kind, "value": value, "account": account, "region": region,
+        "include_history": include_history, "page": page, "projection": "summary"})
+
+
+@mcp.tool(annotations=WRITE)
+def edit_ssm_log_entries(items: Annotated[list[dict[str, Any]], Field(min_length=1, max_length=100)]) -> dict[str, Any]:
+    """Batch 1–100 explicit review edits within 1 MiB JSON. Each item has entry_id, text, tags,
+    finding and current updated (null for new). All duplicate-ID occurrences are invalid.
+    Valid items commit independently; results are ok/stale/missing/invalid with no review bodies.
+    Retry only rejected items after rereading/merging; replaying a successful old stamp is stale.
+    Selection revision advances after successful writes. No query-selected writes."""
+    return call("/api/ssm-log-batch", {"items": items})
+
+
+@mcp.tool(annotations=READ)
 def list_detections() -> dict[str, Any]:
     """Imported Suzaku Sigma rules (most severe first) with level, ATT&CK tactics/techniques and the
     number of linked evidence events, plus the import's provenance (Suzaku version, rules revision,

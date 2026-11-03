@@ -1498,6 +1498,8 @@ changed the note since, the call fails without writing; re-read it and retry.
 | `list_ssm_orphan_reviews` / `get_ssm_orphan_review` | Preserved, unattached reviews: 25 summaries/page and exact preview lookup. Ordinary searches return only a count. Complete review text remains available in chunks. |
 | `edit_ssm_log_entry` | Save an explicit entry's interpretation text, entry tags and entry finding using its current `updated` stamp (null for a new review). Stale writes fail; raw evidence and event tags/findings are not changed. |
 | `reattach_ssm_review` | Explicit, audited reattachment from an orphan to a current entry with no review. Requires the orphan stamp and an analyst reason; unknown/ambiguous identities additionally require an explicit analyst mapping. Never overwrites destination work. |
+| `edit_ssm_log_entries` | 1–100 explicit edits within 1 MiB. Independent per-item commits, `ok/stale/missing/invalid` results; all duplicate-ID occurrences are invalid. Retry rejected items after rereading; replayed successful stamps are stale. |
+| `lookup_reference` | Scoped `identity/machine/ip` summaries with sources, snapshot times, ambiguity and pagination. History is not searched unless explicitly requested; current configuration is not incident-time identity. Missing inventory is labelled, and no online lookup is triggered. |
 
 Review provenance is persisted separately from content-addressed IDs. Only exact
 current matches can backfill legacy metadata; unknown old hashes remain unresolved.

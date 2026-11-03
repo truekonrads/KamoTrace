@@ -368,9 +368,31 @@ class Store:
     def reference(self, body):
         from .inventory_store import reference
         if body.get("include_history", True) is False:
-            return reference(body, self.inventory, None, self.commands, self.reference_enrichment)
-        with self.locked("reference"):
-            return reference(body, self.inventory, self.connection, self.commands, self.reference_enrichment)
+            result = reference(body, self.inventory, None, self.commands, self.reference_enrichment)
+        else:
+            with self.locked("reference"):
+                result = reference(body, self.inventory, self.connection, self.commands, self.reference_enrichment)
+        if body.get("projection") == "summary":
+            page = body.get("page", 1)
+            if type(page) is not int or page < 1:
+                raise ValueError("page must be a positive integer")
+            snapshot = result["snapshot"] or {}
+            summarized = {}
+            for name in ("matches", "network_matches"):
+                summarized[name + "_total"] = len(result[name])
+                summarized[name] = [{k: text_preview(v) if isinstance(v, str) else v
+                    for k, v in match.items() if k in ("kind", "id", "name", "account", "region", "source", "command_count")}
+                    for match in result[name][(page-1)*25:page*25]]
+            return {"kind": result["kind"], "value": text_preview(result["value"]), "ambiguous": result["ambiguous"],
+                "inventory_loaded": self.inventory.report["loaded"], "history_included": result["history_included"],
+                "snapshot": {k: text_preview(str(snapshot[k]), 128) for k in
+                    ("account", "started_at_utc", "completed_at_utc") if k in snapshot},
+                "snapshot_limitations": [text_preview(str(v), 200) for v in snapshot.get("limitations", [])[:5]],
+                "snapshot_limitations_count": len(snapshot.get("limitations", [])),
+                "warning": "Current configuration is not incident-time identity or effective access. History not searched is not no activity.",
+                "page": page, "next_page": page+1 if page*25 < max(len(result["matches"]), len(result["network_matches"])) else None,
+                "previews": True, **summarized}
+        return result
 
     def ssm_log(self, body):
         with self.locked("ssm.log"):
@@ -588,27 +610,66 @@ class Store:
 
     def ssm_log_review(self, body):
         with self.locked("ssm.log_review"), self.reviews:
-            entry_id = body.get("entry_id")
-            if not isinstance(entry_id, str) or entry_id not in self.commands.log_entries:
-                raise ValueError("Unknown current log entry")
-            text, tags, finding = body.get("text"), body.get("tags"), body.get("finding")
-            if any(not isinstance(value, str) or len(value) > 30000 for value in (text, finding)):
-                raise ValueError("Review text and finding must be text up to 30,000 characters")
-            if (not isinstance(tags, list) or len(tags) > 100 or any(not isinstance(tag, str) or len(tag) > 256
-                    or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", tag) for tag in tags)):
-                raise ValueError("Use at most 100 lowercase hyphen-separated tag slugs, at most 256 characters each")
-            current = self.reviews.execute("SELECT updated FROM ssm_log_reviews WHERE entry_id=?", (entry_id,)).fetchone()
-            if "updated" not in body or body["updated"] != (current["updated"] if current else None):
-                raise ValueError("This log review changed since it was loaded; reload it and reapply your change")
-            review = {"text": text, "tags": sorted(set(tags)), "finding": finding,
-                      "updated": datetime.now(timezone.utc).isoformat()}
-            self.reviews.execute("""INSERT INTO ssm_log_reviews VALUES (?,?,?,?,?) ON CONFLICT(entry_id)
-                DO UPDATE SET text=excluded.text,tags=excluded.tags,finding=excluded.finding,updated=excluded.updated""",
-                (entry_id, text, json.dumps(review["tags"]), finding, review["updated"]))
-            self.reviews.execute("INSERT OR IGNORE INTO ssm_review_sources VALUES (?,?)",
-                (entry_id, json.dumps(self.commands.log_sources[entry_id], ensure_ascii=False)))
+            review = self.write_log_review(body)
             self.bump_log_revision()
             return review
+
+    def write_log_review(self, body):
+        """Shared explicit-ID write; caller owns the lock and SQLite transaction."""
+        entry_id = body.get("entry_id")
+        if not isinstance(entry_id, str) or entry_id not in self.commands.log_entries:
+            raise ValueError("Unknown current log entry")
+        text, tags, finding = body.get("text"), body.get("tags"), body.get("finding")
+        if any(not isinstance(value, str) or len(value) > 30000 for value in (text, finding)):
+            raise ValueError("Review text and finding must be text up to 30,000 characters")
+        if (not isinstance(tags, list) or len(tags) > 100 or any(not isinstance(tag, str) or len(tag) > 256
+                or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", tag) for tag in tags)):
+            raise ValueError("Use at most 100 lowercase hyphen-separated tag slugs, at most 256 characters each")
+        current = self.reviews.execute("SELECT updated FROM ssm_log_reviews WHERE entry_id=?", (entry_id,)).fetchone()
+        if "updated" not in body or body["updated"] != (current["updated"] if current else None):
+            raise ValueError("This log review changed since it was loaded; reload it and reapply your change")
+        review = {"text": text, "tags": sorted(set(tags)), "finding": finding,
+                  "updated": datetime.now(timezone.utc).isoformat()}
+        self.reviews.execute("""INSERT INTO ssm_log_reviews VALUES (?,?,?,?,?) ON CONFLICT(entry_id)
+            DO UPDATE SET text=excluded.text,tags=excluded.tags,finding=excluded.finding,updated=excluded.updated""",
+            (entry_id, text, json.dumps(review["tags"]), finding, review["updated"]))
+        self.reviews.execute("INSERT OR IGNORE INTO ssm_review_sources VALUES (?,?)",
+            (entry_id, json.dumps(self.commands.log_sources[entry_id], ensure_ascii=False)))
+        return review
+
+    def ssm_log_batch(self, body):
+        items = body.get("items")
+        if not isinstance(items, list) or not 1 <= len(items) <= 100:
+            raise ValueError("items must contain 1 to 100 explicit review edits")
+        if len(json.dumps(body).encode()) > 1048576:
+            raise ValueError("Batch exceeds the 1 MiB JSON request limit")
+        ids = [item.get("entry_id") for item in items if isinstance(item, dict) and isinstance(item.get("entry_id"), str)]
+        duplicates = {id_ for id_ in ids if ids.count(id_) > 1}
+        results = []
+        with self.locked("ssm.log_batch"):
+            for item in items:
+                id_ = item.get("entry_id") if isinstance(item, dict) else None
+                result = {"entry_id": id_ if isinstance(id_, str) and len(id_) == 64 else None}
+                if not isinstance(id_, str) or not re.fullmatch(r"[0-9a-f]{64}", id_) or id_ in duplicates:
+                    result.update(status="invalid", error="Each item needs a unique explicit entry_id; all duplicate occurrences are rejected")
+                elif id_ not in self.commands.log_entries:
+                    result.update(status="missing", error="Unknown current log entry")
+                else:
+                    current = self.reviews.execute("SELECT updated FROM ssm_log_reviews WHERE entry_id=?", (id_,)).fetchone()
+                    if "updated" not in item or item["updated"] != (current[0] if current else None):
+                        result.update(status="stale", error="Reread current review and merge before retrying")
+                    else:
+                        try:
+                            # Valid items commit independently; a rejected item never rolls back earlier items.
+                            with self.reviews:
+                                review = self.write_log_review(item)
+                            result.update(status="ok", updated=review["updated"])
+                        except ValueError as error:
+                            result.update(status="invalid", error=str(error))
+                results.append(result)
+            if any(r["status"] == "ok" for r in results):
+                self.bump_log_revision()
+            return {"results": results, "revision": self.log_revision}
 
     def refresh_reviews(self):
         for table, source in (("review_tags", "SELECT hash,slug FROM event_tags"),
@@ -1072,7 +1133,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/reference"):
+        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1090,6 +1151,7 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/ssm-log-orphans": self.store.ssm_log_orphans,
                          "/api/ssm-log-text": self.store.ssm_log_text,
                          "/api/ssm-log-reattach": self.store.ssm_log_reattach,
+                         "/api/ssm-log-batch": self.store.ssm_log_batch,
                          "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]

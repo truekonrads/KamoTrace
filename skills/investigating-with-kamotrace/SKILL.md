@@ -336,6 +336,24 @@ Available only when the analyst loaded an SSM export.
   are retained with an audit; use `read_ssm_log_text(field="review.history")`
   for its chunked JSON. The orphan stamp advances; stale retries cannot overwrite
   other work. Reattachment is not proof the interpretation fits changed content.
+- `edit_ssm_log_entries(items=[...])` batches 1–100 explicit entry reviews,
+  each with `entry_id`, `text`, `tags`, `finding`, `updated` (null for new), within
+  a 1 MiB request. Valid items commit independently; results are `ok`, `stale`,
+  `missing` or `invalid`, without echoing bodies. All occurrences of duplicate
+  IDs are invalid. A successful write advances the selection revision. Retry
+  only rejected items after rereading/merging; replaying an old successful stamp
+  is stale. Never turn a query directly into a write.
+
+### Scoped reference lookup
+
+`lookup_reference(kind="ip", value="10.0.1.5", account="123", region="us-east-1")`
+returns bounded summaries from loaded inventory with source, snapshot times,
+scope, `ambiguous`, counts and `next_page`. Kinds are `ip`, `machine`, `identity`.
+The example identifiers are synthetic; use the case's exact scope. Values are
+previews, not inferred hostnames. Current configuration is not incident-time
+identity or effective access. An ambiguous IP never identifies a singular asset.
+Missing inventory is labelled. History is **not searched** by default; explicitly
+set `include_history=true` only when needed. No AWS, DNS or online lookup occurs.
 
 Example: read `search_ssm_log(search="i-alpha")`, inspect the original streams
 and linked events, then call `edit_ssm_log_entry` with that entry's exact
