@@ -5,6 +5,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from functools import partial
+import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -36,6 +37,35 @@ OPERATORS = {"eq", "neq", "in", "contains", "not_contains", "empty", "not_empty"
 PAGE_SIZES = (25, 50, 100, 250, 500)
 LEVELS = ("informational", "low", "medium", "high", "critical")  # Suzaku/Sigma severity order
 TIMEZONES = sorted(available_timezones() - {"localtime"})
+INTERACTIVE_BUDGET = 80000  # Serialized UTF-8, including MCP's text and structured envelopes.
+SSM_SUMMARY_FIELDS = ("time_ms", "time_basis", "account", "region", "command_key", "command_id",
+                      "instance_id", "plugin", "operation", "status", "response_code", "output_state",
+                      "parameters", "decoded", "stdout", "stderr", "combined_output")
+SSM_TEXT_FIELDS = tuple(f for f in SSM_SUMMARY_FIELDS if f not in ("time_ms", "response_code")) + (
+    "review.text", "review.finding", "review.tags", "events")
+
+
+def text_preview(value, limit=96):
+    """Bound previews in UTF-8 bytes, never split a code point or alter the stored string."""
+    return value.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+
+def log_summary(entry, fields, preview_bytes=96):
+    row = {"entry_id": entry["entry_id"], "event_count": len(entry["events"]),
+           "review": {**entry["review"], "tags": entry["review"]["tags"][:5]}, "truncated": {}}
+    for key, value in [(k, entry[k]) for k in fields] + [
+            ("review.text", entry["review"]["text"]), ("review.finding", entry["review"]["finding"])]:
+        shown = text_preview(value, preview_bytes) if isinstance(value, str) else value
+        if key.startswith("review."):
+            row["review"][key.split(".")[1]] = shown
+        else:
+            row[key] = shown
+        if shown != value:
+            row["truncated"][key] = {"length": len(value), "offset_unit": "unicode_code_points"}
+    row["review"]["tags"] = [text_preview(t, 64) for t in row["review"]["tags"]]
+    if row["review"]["tags"] != entry["review"]["tags"]:
+        row["truncated"]["review.tags"] = {"length": len(entry["review"]["tags"]), "offset_unit": "items"}
+    return row
 
 
 class StaleSelection(ValueError):
@@ -308,6 +338,29 @@ class Store:
 
     def ssm_log(self, body):
         with self.locked("ssm.log"):
+            projection = body.get("projection", "full")
+            if projection not in ("full", "summary"):
+                raise ValueError("projection must be summary or full (browser detail)")
+            fields = body.get("fields", list(SSM_SUMMARY_FIELDS))
+            if not isinstance(fields, list) or any(f not in SSM_SUMMARY_FIELDS for f in fields):
+                raise ValueError("fields must be selected from: " + ", ".join(SSM_SUMMARY_FIELDS))
+            fields = list(dict.fromkeys(fields))
+
+            def projected(result):
+                if projection == "summary":
+                    entries = result["data"]
+                    result["limitations"] = [text_preview(str(t), 200) for t in result["limitations"][:10]]
+                    result["limitations_truncated"] = result["limitations"] != self.commands.log_info()["limitations"]
+                    result["projection"] = "summary"
+                    result["response_budget_bytes"] = INTERACTIVE_BUDGET
+                    # Keep every row in the fixed page; shorten previews, never change page arithmetic.
+                    # Escaped ASCII JSON is a conservative upper bound on serialized UTF-8 size.
+                    for preview_bytes in (96, 48, 24, 0):
+                        result["data"] = [log_summary(e, fields, preview_bytes) for e in entries]
+                        if len(json.dumps(result).encode("utf-8")) <= 24000:
+                            break  # Leaves headroom for both MCP copies, field names and pretty-printing.
+                return result
+
             entry_id = body.get("entry_id")
             if entry_id is not None:
                 # Exact lookup (e.g. reading the latest saved review), independent of search, scope and time.
@@ -315,8 +368,9 @@ class Store:
                     raise ValueError("entry_id lookup takes no search, search_scope, time, page or revision")
                 if not isinstance(entry_id, str) or entry_id not in self.commands.log_entries:
                     raise ValueError("Unknown current log entry")
-                return {"data": self.log_review_data([self.commands.log_entries[entry_id]]), "total": 1,
-                        "revision": self.log_revision, **self.commands.log_info()}
+                return projected({"data": self.log_review_data([self.commands.log_entries[entry_id]],
+                                                              include_events=projection == "full"), "total": 1,
+                        "revision": self.log_revision, **self.commands.log_info()})
             analyst = None
 
             def analyst_text(entry):
@@ -344,8 +398,49 @@ class Store:
             # readable rather than silently disappearing; they are never attached to another entry.
             unmatched = sum(r[0] not in self.commands.log_entries for r in self.reviews.execute(
                 "SELECT entry_id FROM ssm_log_reviews"))
-            return {**result, "data": self.log_review_data(result["data"]), "revision": self.log_revision,
-                    "unmatched_review_count": unmatched}
+            return projected({**result, "data": self.log_review_data(result["data"], include_events=projection == "full"), "revision": self.log_revision,
+                    "unmatched_review_count": unmatched})
+
+    def ssm_log_text(self, body):
+        """Read original strings or explicitly labelled serialized metadata, without executing content."""
+        with self.locked("ssm.log_text"):
+            entry_id, field = body.get("entry_id"), body.get("field")
+            if field not in SSM_TEXT_FIELDS:
+                raise ValueError("field must be one of: " + ", ".join(SSM_TEXT_FIELDS))
+            offset, limit = body.get("offset", 0), body.get("limit", 2000)
+            if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 2000:
+                raise ValueError("offset must be nonnegative; limit must be 1 to 2000 Unicode code points")
+            if not isinstance(entry_id, str):
+                raise ValueError("entry_id must be text")
+            if field.startswith("review."):
+                row = self.reviews.execute("SELECT text, finding, tags, updated FROM ssm_log_reviews WHERE entry_id=?",
+                                           (entry_id,)).fetchone()
+                if row is None and entry_id not in self.commands.log_entries:
+                    raise ValueError("Unknown entry or preserved review")
+                key = field.split(".")[1]
+                value = row[key] if row else "[]" if key == "tags" else ""
+                stamp = row["updated"] if row else None
+            else:
+                entry = self.commands.log_entries.get(entry_id)
+                if entry is None:
+                    raise ValueError("Unknown current log entry")
+                value = entry[field]
+                if field == "events":
+                    value = json.dumps(self.log_review_data([entry])[0]["events"], ensure_ascii=False)
+                stamp = None
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest() if value is not None else None
+            if "sha256" in body and body["sha256"] != digest:
+                raise StaleSelection("Text changed between chunks; restart at offset 0")
+            length = len(value) if value is not None else 0
+            if offset > length:
+                raise ValueError("offset exceeds text length")
+            end = min(length, offset + limit)
+            return {"entry_id": entry_id, "field": field, "text": value[offset:end] if value is not None else None,
+                    "offset": offset, "next_offset": end if end < length else None,
+                    "offset_unit": "unicode_code_points", "length": length,
+                    "utf8_bytes": len(value.encode("utf-8")) if value is not None else 0,
+                    "sha256": digest, "updated": stamp,
+                    "serialization": "json_metadata" if field in ("events", "review.tags") else "original_string"}
 
     def ssm_log_orphans(self, body):
         """Explicit, bounded discovery of preserved reviews with no current content match."""
@@ -357,23 +452,31 @@ class Store:
                 row = self.reviews.execute("SELECT * FROM ssm_log_reviews WHERE entry_id=?", (entry_id,)).fetchone()
                 if row is None:
                     raise ValueError("Unknown orphan review")
-                return {"review": {**dict(row), "tags": json.loads(row["tags"])}}
+                review = {**dict(row), "tags": json.loads(row["tags"])}
+                if body.get("projection") == "summary":
+                    review = {"entry_id": entry_id, **log_summary(
+                        {"entry_id": entry_id, "events": [], "review": review}, [])["review"],
+                        "text_length": len(row["text"]), "finding_length": len(row["finding"])}
+                return {"review": review}
             page = body.get("page", 1)
             if type(page) is not int or page < 1:
                 raise ValueError("page must be a positive integer")
             rows = [dict(r) for r in self.reviews.execute("""SELECT entry_id, updated,
-                substr(text,1,200) AS text_preview, length(text) AS text_length,
-                substr(finding,1,200) AS finding_preview, length(finding) AS finding_length
+                substr(text,1,64) AS text_preview, length(text) AS text_length,
+                substr(finding,1,64) AS finding_preview, length(finding) AS finding_length
                 FROM ssm_log_reviews ORDER BY updated, entry_id""") if r["entry_id"] not in self.commands.log_entries]
             return {"data": rows[(page-1)*25:page*25], "total": len(rows), "page": page,
                     "next_page": page+1 if page*25 < len(rows) else None}
 
-    def log_review_data(self, entries):
+    def log_review_data(self, entries, include_events=True):
         """Attach each entry's saved review and its linked events' tags/findings (read-only here). Caller holds the lock."""
         ids = json.dumps([e["entry_id"] for e in entries])
         hashes = json.dumps(list({e["record_sha256"] for entry in entries for e in entry["events"] if e["record_sha256"]}))
         saved = {r["entry_id"]: {"text": r["text"], "tags": json.loads(r["tags"]), "finding": r["finding"], "updated": r["updated"]}
                  for r in self.reviews.execute("SELECT * FROM ssm_log_reviews WHERE entry_id IN (SELECT value FROM json_each(?))", (ids,))}
+        if not include_events:
+            return [{**entry, "review": saved.get(entry["entry_id"],
+                {"text": "", "tags": [], "finding": "", "updated": None})} for entry in entries]
         tags, notes = defaultdict(list), defaultdict(list)
         for r in self.reviews.execute("""SELECT t.hash, t.slug, g.color FROM event_tags t JOIN tags g ON g.slug = t.slug
                 WHERE t.hash IN (SELECT value FROM json_each(?)) ORDER BY t.slug""", (hashes,)):
@@ -824,7 +927,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/reference"):
+        if self.path not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/reference"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -839,6 +942,7 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
                          "/api/reference": self.store.reference,
                          "/api/ssm-log-orphans": self.store.ssm_log_orphans,
+                         "/api/ssm-log-text": self.store.ssm_log_text,
                          "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]

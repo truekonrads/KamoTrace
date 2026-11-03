@@ -71,15 +71,24 @@ directly, retaining progress across context windows.
   Real HTTP/stdio sessions exercise orphan tools. Synthetic desktop check loaded
   25 then 26 reviews, no duplicate continuation, and rendered script-like text
   as plaintext (zero script nodes). Inspected screenshots/interaction recording.
-- [ ] **S02: Bound SSM search summaries.** Add allowed projections, smaller default
+- [x] **S02: Bound SSM search summaries.** Add allowed projections, smaller default
   pages, and bounded output/review/finding previews. Keep IDs, current review
   stamps, total, continuation and truncation metadata. Do not embed repeated full
   findings or event arrays. Verify a single huge row and Unicode-heavy results.
-- [ ] **S03: Retrieve full text in chunks.** Add validated field/offset/limit reads
+  MCP now requests server-owned summary projection: fixed 5-row pages, allowlisted
+  fields, bounded previews and explicit truncation/counts. Browser full projection
+  remains separate. Previews shrink by serialized size, never pages. HTTP contracts
+  traverse all 231 IDs exactly once; real HTTP/stdio result envelopes stay <80 KB.
+- [x] **S03: Retrieve full text in chunks.** Add validated field/offset/limit reads
   for large SSM text, with explicit offset units and length/digest metadata.
   Reconstruct original strings exactly across chunks. Keep pagination complete:
   fixed page sizes or cursors based on actual next positions, never dynamic page
   shrinking with old page-number arithmetic. Preserve search revision checks.
+  Added exact code-point chunks (1–2,000), length/UTF-8 bytes/SHA-256, missing vs
+  empty and digest-checked continuation, including preserved orphan reviews.
+  Large mixed Unicode/control-character output and reviews reconstruct exactly;
+  stale digests reject with 409. Contract suite: 44 tests passed, including real
+  HTTP/stdio chunk reconstruction and existing search-revision rejection.
 - [ ] **S04: Streamline discovery and note reads.** Return compact schema metadata,
   note summaries and direct note detail without first loading all note bodies.
   Clarify evidence_read_only and annotations_writable. Use consistent object

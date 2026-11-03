@@ -850,6 +850,10 @@ class BrowserContract(unittest.TestCase):
                 command = await tool("get_ssm_command", key=commands["data"][0]["key"])
                 self.assertEqual(sorted(s["instance_id"] for s in command["systems"]), ["i-alpha", "i-beta", "i-missing"])
                 log = await tool("search_ssm_log", search="alpha stdout")
+                budgeted = await client.call_tool("search_ssm_log", {})
+                self.assertLess(len(budgeted.model_dump_json().encode()), 80000)
+                self.assertEqual((await tool("read_ssm_log_text", entry_id=log["data"][0]["entry_id"], field="stdout"))["text"],
+                                 "alpha stdout <script>neverRun()</script>")
                 entry = log["data"][0]
                 args = {"entry_id": entry["entry_id"], "text": "echo synthetic\n",
                         "tags": ["decoded"], "finding": "Agent note: statically decoded Base64 as UTF-8; not executed.",
@@ -1466,6 +1470,14 @@ class BrowserContract(unittest.TestCase):
             try:
                 everything = post("/api/ssm-log", {})
                 order = everything["data"] + post("/api/ssm-log", {"page": 2})["data"] + post("/api/ssm-log", {"page": 3})["data"]
+                summaries, page = [], 1
+                while page:
+                    part = post("/api/ssm-log", {"projection": "summary", "page": page})
+                    self.assertLess(len(json.dumps(part).encode()), 24001)
+                    self.assertTrue(all("events" not in e for e in part["data"]))
+                    summaries.extend(e["entry_id"] for e in part["data"])
+                    page = part["next_page"]
+                self.assertEqual(summaries, [e["entry_id"] for e in order])
                 self.assertEqual((everything["total"], len({e["entry_id"] for e in order})), (231, 231))
                 request = [e for e in order if e["operation"] == "SendCommand"]  # request[i] is req-i, oldest first.
                 late = next(e for e in order if e["operation"] == "Command output")
@@ -1582,7 +1594,20 @@ class BrowserContract(unittest.TestCase):
                         self.assertEqual(summary.structured_content["data"][-1]["entry_id"], ids[-1])
                         full = await client.call_tool("get_ssm_orphan_review", {"entry_id": ids[-1]})
                         self.assertFalse(full.is_error)
-                        self.assertEqual(full.structured_content["review"], detail)
+                        self.assertEqual(full.structured_content["review"]["text_length"], len(text))
+                        self.assertLess(len(full.model_dump_json().encode()), 80000)
+                        offset, pieces, digest = 0, [], None
+                        while offset is not None:
+                            chunk = await client.call_tool("read_ssm_log_text", {
+                                "entry_id": ids[-1], "field": "review.text", "offset": offset,
+                                **({"sha256": digest} if digest else {})})
+                            self.assertFalse(chunk.is_error)
+                            self.assertLess(len(chunk.model_dump_json().encode()), 80000)
+                            data = chunk.structured_content
+                            pieces.append(data["text"])
+                            offset, digest = data["next_offset"], data["sha256"]
+                        self.assertEqual("".join(pieces), text)
+                        self.assertEqual(digest, hashlib.sha256(text.encode()).hexdigest())
             anyio.run(sessions)
         finally:
             with self.store.lock, self.store.reviews:
@@ -1610,7 +1635,7 @@ class BrowserContract(unittest.TestCase):
             saved = None
             for stage in range(3):
                 if stage == 2:
-                    document["invocation_details"][0]["record"]["StandardOutputContent"] += " changed"
+                    document["invocation_details"][0]["record"]["StandardOutputContent"] += " changed\n" + "🦆é\u0001\"\\\n" * 3001
                     export.write_text(json.dumps(document))
                 store = Store(self.database, annotations=annotations, ssm_export=export)
                 server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
@@ -1655,6 +1680,20 @@ class BrowserContract(unittest.TestCase):
                     else:
                         self.assertNotEqual(output["entry_id"], old_id)
                         self.assertIsNone(output["review"]["updated"])
+                        summary = post("/api/ssm-log", {"entry_id": output["entry_id"], "projection": "summary"})
+                        self.assertLess(len(json.dumps(summary).encode()), 24001)
+                        self.assertEqual(summary["data"][0]["truncated"]["stdout"]["length"], len(output["stdout"]))
+                        offset, pieces, digest = 0, [], None
+                        while offset is not None:
+                            chunk = post("/api/ssm-log-text", {"entry_id": output["entry_id"], "field": "stdout",
+                                "offset": offset, "limit": 1931, **({"sha256": digest} if digest else {})})
+                            pieces.append(chunk["text"])
+                            offset, digest = chunk["next_offset"], chunk["sha256"]
+                        self.assertEqual("".join(pieces), output["stdout"])
+                        self.assertEqual(digest, hashlib.sha256(output["stdout"].encode()).hexdigest())
+                        with self.assertRaises(HTTPError) as error:
+                            post("/api/ssm-log-text", {"entry_id": output["entry_id"], "field": "stdout", "sha256": "stale"})
+                        self.assertEqual(error.exception.code, 409)
                         # The old review is reported as unmatched, not inherited; the still-current one is not listed.
                         self.assertEqual(post("/api/ssm-log", {"search": "no such entry"})["unmatched_review_count"], 1)
                         self.assertEqual(post("/api/ssm-log-orphans", {})["data"][0]["entry_id"], old_id)

@@ -232,7 +232,9 @@ class Commands:
         rows = [e for e in self.log_order
                 if (start is None or e["time_ms"] is not None and e["time_ms"] >= start)
                 and (end is None or e["time_ms"] is not None and e["time_ms"] < end) and match(e)]
-        return {"data": rows[(page-1)*100:page*100], "total": len(rows), "search_scope": scope,
+        size = 5 if body.get("projection") == "summary" else 100
+        return {"data": rows[(page-1)*size:page*size], "total": len(rows), "search_scope": scope,
+                "page": page, "size": size, "next_page": page+1 if page*size < len(rows) else None,
                 "review_dependent": bool(needle) and scope != "raw", **self.log_info()}
 
     def log_info(self):
