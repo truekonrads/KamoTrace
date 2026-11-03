@@ -1510,7 +1510,11 @@ derived provenance. Original `raw_json` is an exact stored **string**, not repar
 JSON; supplemental SSM JSON is reconstructed and labelled separately. Later analyst
 edits never alter a prepared export. Downloads do not hold the Store lock.
 Links expire after ten minutes; disposable files are reclaimed on the next export
-request/download or server shutdown. Restarting the server invalidates all links.
+request/download or server shutdown once no active reader remains. Expired links
+reject new downloads immediately, but an active download retains its artifact's
+quota charge until its final reader closes, including disconnect/error paths.
+Slow downloads can therefore prevent new exports rather than bypass the disk cap.
+Restarting the server invalidates all links.
 The default trusted link base is loopback; `serve --export-base-url https://trusted-origin`
 can configure a trusted origin, without changing binding or access checks. Never
 derive links from incoming Host headers. Loopback links work only for clients on
@@ -1555,6 +1559,12 @@ Extraction uses a precision-preserving scalar accessor (DuckDB's Python UDF
 requires NumPy); filtering, counts, grouping and ordering remain in the shared SQL
 query path. Raw evidence and canonical hashes are never rewritten. Saved Finding
 contexts preserve raw projections, filters and literal JSON-array members.
+Interactive raw projections and raw-value summaries reject responses exceeding
+24,000 bytes of conservative ASCII JSON, leaving headroom for the 80,000-byte
+MCP envelopes. They never truncate a value or merge summary groups. Narrow the
+selection, reduce projections/page size, or use `create_export` to retrieve exact
+values; exports use the same validated selection without this interactive cap.
+Predicates, grouping, counts and histogram selection remain exact.
 
 Local Base64 analysis scans original command/request parameter string values and
 separate stdout/stderr/combined streams. It accepts conservative printable UTF-8

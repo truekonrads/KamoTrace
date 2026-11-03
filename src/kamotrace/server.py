@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo, available_timezones
 import duckdb
 
 from .pipeline import FIELDS as PIPELINE_FIELDS, PipelineError, compile_pipeline, describe as describe_pipeline
-from .raw_paths import CONTRACT as RAW_PATH_CONTRACT, fields as raw_fields, scalar as raw_scalar
+from .raw_paths import CONTRACT as RAW_PATH_CONTRACT, fields as raw_fields, scalar as raw_scalar, check_response as check_raw_response
 
 
 logger = logging.getLogger(__name__)
@@ -927,7 +927,7 @@ class Store:
                           "ssm": "JSON-backed in-memory supplied export; separate systems and plugins retained"}})
                 page, revision = 1, None
                 while True:
-                    result = (self.query({**selection, "page": page, "size": 100}) if dataset == "events" else
+                    result = (self.query({**selection, "page": page, "size": 100}, interactive=False) if dataset == "events" else
                               self.ssm_log({**selection, "page": page, "revision": revision}))
                     revision = result.get("revision")
                     for row in result["data"]:
@@ -942,7 +942,7 @@ class Store:
                     page += 1
         return self.exports.prepare(write, base_url)
 
-    def query(self, body):
+    def query(self, body, *, interactive=True):
         sql, params, count_sql, count_params, size = build_query(body, self.raw_function)
         paths = raw_fields(body)
         started = time.monotonic()
@@ -959,8 +959,11 @@ class Store:
                 row["tags"] = [dict(r) for r in self.reviews.execute("SELECT t.* FROM tags t JOIN event_tags e USING(slug) WHERE e.hash=? ORDER BY slug", (row["record_sha256"],))]
                 row["annotations"] = [r[0] for r in self.reviews.execute("SELECT annotation_id FROM annotation_events WHERE hash=?", (row["record_sha256"],))]
                 row["detections"] = found.get(row["id"], [])
-        return {"data": rows, "last_page": max(1, math.ceil(total / size)), "last_row": total,
-                "sql": sql, "params": params, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+        result = {"data": rows, "last_page": max(1, math.ceil(total / size)), "last_row": total,
+                  "sql": sql, "params": params, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+        if interactive and body.get("raw_fields"):
+            check_raw_response(result)
+        return result
 
     def histogram(self, body):
         zone = query_timezone(body)
@@ -1014,6 +1017,7 @@ class Store:
         paths = raw_fields(body)
         if field not in {*FIELDS, "time_local", *paths}:
             raise ValueError("Unknown summary column")
+        is_raw = field in paths
         field = paths[field] + ".value" if field in paths else field
         _, _, count_sql, params, _ = build_query(body, self.raw_function)
         if "value" in body:
@@ -1035,12 +1039,15 @@ class Store:
         ) SELECT * FROM ranked WHERE top_rank <= 5 OR bottom_rank <= 5"""
         with self.locked("column_values"):
             rows = self.rows(sql, params, operation="column_values.summary")
-        return {"top": [{"value": r["value"], "events": r["events"]}
+        result = {"top": [{"value": r["value"], "events": r["events"]}
                         for r in sorted(rows, key=lambda r: r["top_rank"]) if r["top_rank"] <= 5],
                 "bottom": [{"value": r["value"], "events": r["events"]}
                            for r in sorted(rows, key=lambda r: r["bottom_rank"]) if r["bottom_rank"] <= 5],
                 "total": int(rows[0]["total"]) if rows else 0,
                 "distinct_values": rows[0]["distinct_values"] if rows else 0}
+        if is_raw:
+            check_raw_response(result)
+        return result
 
     def detail(self, record):
         with self.locked("event.detail"):
@@ -1196,12 +1203,14 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/inventory":
             self.respond(self.store.inventory.report)
         elif path.startswith("/api/exports/"):
-            artifact = self.store.exports and self.store.exports.open(path.removeprefix("/api/exports/"))
-            if not artifact:
+            if self.store.exports is None:
                 self.respond({"error": "Unknown or expired export"}, 404)
                 return
-            stream, info = artifact
-            with stream:
+            with self.store.exports.open(path.removeprefix("/api/exports/")) as artifact:
+                if artifact is None:
+                    self.respond({"error": "Unknown or expired export"}, 404)
+                    return
+                stream, info = artifact
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
                 self.send_header("Content-Disposition", 'attachment; filename="kamotrace-export.ndjson"')

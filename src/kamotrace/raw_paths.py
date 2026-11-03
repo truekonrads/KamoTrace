@@ -26,12 +26,34 @@ def scalar(raw, field):
     return {"value": text, "json_type": kind}
 
 PATH = re.compile(r"raw\.[A-Za-z_][A-Za-z_0-9]*(?:(?:\.[A-Za-z_][A-Za-z_0-9]*)|(?:\[(?:0|[1-9][0-9]{0,3})\]))*\Z")
+RESPONSE_BYTES = 24000  # Conservative ASCII JSON, leaving room for both MCP representations.
 CONTRACT = {"prefix": "raw.", "example": "raw.requestParameters.name", "max_length": 256,
             "max_depth": 8, "max_index": 1000, "max_fields": 10,
+            "interactive_response_bytes": RESPONSE_BYTES,
+            "oversized": "Rejected without truncation; narrow the selection/projection or use create_export for exact values",
             "value": "Unquoted scalar text, including exact numeric text; no numeric coercion or range operators",
             "missing": "Missing, JSON null and containers have no scalar value; missing/empty operators use that null",
             "projection": "raw_fields maps requested paths to value and json_type; absent type is null, JSON null is NULL, containers retain OBJECT/ARRAY",
             "sorting": "Lexicographic scalar text, not numeric order", "pipeline": "Use ordinary filters, not pipeline v1 field syntax"}
+
+
+def check_response(value):
+    """Reject rather than truncate keys/values; SQL comparisons and exports remain exact."""
+    message = "Raw scalar interactive response exceeds 24,000 bytes; narrow the selection/projection or use create_export for exact values"
+    pending, characters = [value], 0
+    while pending:
+        part = pending.pop()
+        if isinstance(part, str):
+            characters += len(part)
+            if characters > RESPONSE_BYTES:
+                raise ValueError(message)
+        elif isinstance(part, dict):
+            pending.extend(part.keys())
+            pending.extend(part.values())
+        elif isinstance(part, (list, tuple)):
+            pending.extend(part)
+    if len(json.dumps(value).encode("utf-8")) > RESPONSE_BYTES:
+        raise ValueError(message)
 
 
 def fields(body):

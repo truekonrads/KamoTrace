@@ -1689,11 +1689,11 @@ class BrowserContract(unittest.TestCase):
                 self.assertEqual(self.call("/api/exports", {"dataset": "events"})[0], 400)
             entered, release, written = threading.Event(), threading.Event(), threading.Event()
             ordinary_query, prepared = self.store.query, []
-            def paused_query(body):
+            def paused_query(body, **options):
                 entered.set()
                 if not release.wait(10):
                     raise ValueError("Test export barrier timed out")
-                return ordinary_query(body)
+                return ordinary_query(body, **options)
             def edit():
                 self.call("/api/reviews", {"action": "tag", "slug": "export-snapshot",
                     "hashes": [row["record_sha256"]], "color": "#112233"})
@@ -1722,6 +1722,99 @@ class BrowserContract(unittest.TestCase):
             if self.store.exports is not None:
                 self.store.exports.close()
                 self.store.exports = None
+
+    def test_expired_exports_keep_quota_until_all_downloads_close(self):
+        from kamotrace.exports import Exports
+        exports = Exports()
+        def write(emit):
+            emit({"type": "manifest"})
+            emit({"type": "event", "text": "synthetic" * 1000})
+        try:
+            with patch("kamotrace.exports.MAX_ARTIFACTS", 1), patch("kamotrace.exports.time.time", return_value=1000) as clock:
+                info = exports.prepare(write, self.url)
+                with exports.open(info["id"]) as first:
+                    with exports.open(info["id"]) as second:
+                        # Exception/disconnect paths must also release their lease.
+                        with self.assertRaisesRegex(RuntimeError, "disconnect"):
+                            with exports.open(info["id"]):
+                                raise RuntimeError("disconnect")
+                        clock.return_value = 1601
+                        with exports.open(info["id"]) as expired:
+                            self.assertIsNone(expired)
+                        with self.assertRaisesRegex(ValueError, "quota"):
+                            exports.prepare(write, self.url)
+                        data = first[0].read()
+                        self.assertEqual(hashlib.sha256(data).hexdigest(), info["sha256"])
+                        self.assertEqual(second[0].read(), data)
+                    with self.assertRaisesRegex(ValueError, "quota"):
+                        exports.prepare(write, self.url)
+                replacement = exports.prepare(write, self.url)
+                with exports.open(replacement["id"]) as active:
+                    self.assertEqual(active[0].read(), data)
+                    exports.close()
+                    with exports.open(replacement["id"]) as closed:
+                        self.assertIsNone(closed)
+                self.assertFalse(exports.root.exists())
+        finally:
+            exports.close()
+
+    def test_ssm_precise_numeric_identities_keep_missing_and_repeated_ids_distinct(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, database, supplemental = root / "events.json", root / "events.duckdb", root / "ssm.json"
+            decimals = ["0.123456789012345678901", "0.123456789012345678902"]
+            def record(value, identified):
+                event = {"eventTime": "2026-01-02T01:00:00Z", "eventSource": "ssm.amazonaws.com",
+                    "eventName": "StartSession", "recipientAccountId": "123", "awsRegion": "us-east-1",
+                    "requestParameters": {"target": "i-synthetic", "number": "DECIMAL"},
+                    **({"eventID": "repeated-id"} if identified else {})}
+                return json.dumps(event).replace('"DECIMAL"', value)
+            originals = [record(d, identified) for identified in (False, True) for d in decimals]
+            source.write_text('{"Records":[' + ",".join(originals) + "]}")
+            # Different key order still deduplicates exact content, preferring original evidence.
+            extra = record("0.123456789012345678903", True)
+            supplemental.write_text('{"account_id":"123","commands":[],"invocations":[],"invocation_details":[],"cloudtrail_records":['
+                + originals[0].replace('{"eventTime": "2026-01-02T01:00:00Z", ', '{')[:-1]
+                + ', "eventTime":"2026-01-02T01:00:00Z"},' + extra + "]}")
+            build(source, database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            store = Store(database, ssm_export=supplemental)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            def post(path, body):
+                with urlopen(Request(f"http://127.0.0.1:{server.server_port}" + path,
+                    data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})) as response:
+                    return json.load(response)
+            try:
+                entries = post("/api/ssm-log", {})
+                self.assertEqual(entries["total"], 5)
+                linked = [e["events"][0] for e in entries["data"]]
+                self.assertEqual({e["id"] for e in linked if e["id"] is not None}, {1, 2, 3, 4})
+                self.assertEqual(sum(e["source"] == "Supplemental SSM export" for e in linked), 1)
+                self.assertEqual(len({e["key"] for e in linked}), 5)
+                for e in linked:
+                    original = post("/api/ssm-event", {"key": e["key"]})
+                    expected = originals[e["id"] - 1] if e["id"] else extra
+                    value = next(v for v in [*decimals, "0.123456789012345678903"] if v in expected)
+                    self.assertIn(value, original["raw_json"])
+                    self.assertIn(value, original["request"])
+                    if e["id"]:
+                        self.assertEqual(hashlib.sha256(original["raw_json"].encode()).hexdigest(), original["record_sha256"])
+                exported = post("/api/exports", {"dataset": "ssm", "fields": ["entry_id", "events", "event_raw_json"]})
+                with urlopen(exported["download_url"]) as response:
+                    data = response.read()
+                self.assertEqual(hashlib.sha256(data).hexdigest(), exported["sha256"])
+                self.assertEqual({r["events"][0]["key"] for r in map(json.loads, data.splitlines()[1:])}, {e["key"] for e in linked})
+                self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                if store.exports is not None:
+                    store.exports.close()
+                store.reviews.close()
+                store.connection.close()
 
     def test_local_base64_derivations_are_bounded_labelled_and_not_raw(self):
         def encoded(text, encoding="utf-8", urlsafe=False):
@@ -1904,6 +1997,74 @@ class BrowserContract(unittest.TestCase):
                     store.exports.close()
                 store.connection.close()
                 store.reviews.close()
+
+    def test_raw_interactive_budget_rejects_large_values_but_keeps_exact_exports(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as resources:
+            root = Path(folder)
+            source, database = root / "events.json", root / "events.duckdb"
+            long = "Z" * 100000
+            values = [long, *["x" * 1500 + str(i) for i in range(25)], "\0" * 4500, "🦆" * 2200]
+            records = [{"eventID": f"budget-{i}", "eventTime": "2026-01-02T01:00:00Z",
+                "eventSource": "ssm.amazonaws.com", "eventName": "Large" if i == 0 else "Medium" if i <= 25 else "Escaped",
+                "requestParameters": {"long": value}} for i, value in enumerate(values)]
+            source.write_text(json.dumps({"Records": records}))
+            build(source, database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            store = Store(database)
+            resources.callback(store.connection.close)
+            resources.callback(store.reviews.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            base = f"http://127.0.0.1:{server.server_port}"
+            resources.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            resources.callback(thread.join)
+            resources.callback(server.shutdown)
+            server.mcp_request = resources.enter_context(http_transport(base))
+            path = "raw.requestParameters.long"
+            medium = {"filters": [{"field": "event_name", "op": "eq", "value": "Medium"}]}
+            escaped = {"filters": [{"field": "event_name", "op": "eq", "value": "Escaped"}]}
+            async def session(transport):
+                async with Client(transport) as client:
+                    for name, args in (("search_events", {"query": {"raw_fields": [path]}}),
+                        ("summarize_field", {"field": path}),
+                        ("search_events", {"query": {**medium, "raw_fields": [path]}, "size": 25}),
+                        ("search_events", {"query": {**escaped, "raw_fields": [path]}}),
+                        ("summarize_field", {"field": path, "query": escaped})):
+                        result = await client.call_tool(name, args)
+                        self.assertTrue(result.is_error, name)
+                        self.assertIn("create_export", result.content[0].text)
+                        self.assertLess(len(result.model_dump_json().encode()), 80000)
+                    # No truncation of exact predicates, grouping keys or full exported values.
+                    exact = {"filters": [{"field": path, "op": "eq", "value": values[25]}]}
+                    projected = await client.call_tool("search_events", {"query": {**exact, "raw_fields": [path]}})
+                    self.assertFalse(projected.is_error)
+                    self.assertEqual(projected.structured_content["total"], 1)
+                    self.assertEqual(projected.structured_content["events"][0]["raw_fields"][path]["value"], values[25])
+                    self.assertLess(len(projected.model_dump_json().encode()), 80000)
+                    summary = await client.call_tool("summarize_field", {"field": path, "query": medium})
+                    self.assertFalse(summary.is_error)
+                    self.assertEqual((summary.structured_content["total"], summary.structured_content["distinct_values"]), (25, 25))
+                    self.assertTrue(all(r["value"] in values[1:] and r["events"] == 1 for r in summary.structured_content["top"]))
+                    self.assertLess(len(summary.model_dump_json().encode()), 80000)
+                    exported = await client.call_tool("create_export", {"dataset": "events",
+                        "query": {"raw_fields": [path]}, "fields": ["id", "raw_fields"]})
+                    self.assertFalse(exported.is_error, exported)
+                    info = exported.structured_content
+                    with urlopen(info["download_url"]) as response:
+                        data = response.read()
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), info["sha256"])
+                    self.assertEqual({r["raw_fields"][path]["value"] for r in map(json.loads, data.splitlines()[1:])}, set(values))
+                    store.exports.close()
+                    store.exports = None
+            try:
+                for transport in (base + "/mcp", StdioServerParameters(command=sys.executable,
+                    args=["-m", "kamotrace", "mcp", "--url", base])):
+                    anyio.run(session, transport)
+                self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
+            finally:
+                if store.exports is not None:
+                    store.exports.close()
 
     def test_ssm_batch_reviews_have_independent_results_and_safe_retries(self):
         rows = self.call("/api/ssm-log", {})[1]["data"]

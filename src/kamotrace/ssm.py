@@ -1,7 +1,8 @@
 """Read local SSM evidence and join commands, system invocations and plugin outputs."""
 import hashlib
 import io
-import json
+
+import simplejson as json
 
 from .importer import open_json
 from .server import parse_time
@@ -16,7 +17,7 @@ class Commands:
         document = {}
         if path:
             with open_json(path) as stream, io.TextIOWrapper(stream, encoding="utf-8-sig") as text:
-                document = json.load(text)
+                document = json.load(text, use_decimal=True)
         if path and (not isinstance(document, dict) or not isinstance(document.get("account_id"), str)
                      or any(not isinstance(document.get(k), list) for k in ("commands", "invocations", "invocation_details"))):
             raise ValueError("Expected an SSM command/session activity export with account_id, commands, invocations and invocation_details")
@@ -62,7 +63,9 @@ class Commands:
         sources.extend(local)  # Prefer original evidence JSON when both exports contain the event.
         request_values = {}
         for source_record, raw, record_hash in sources:
-            event = json.loads(raw)
+            # Match the importer's precision-preserving JSON model, including supplemental
+            # records. Float normalization can collapse distinct requests without eventIDs.
+            event = json.loads(raw, use_decimal=True)
             if event.get("eventSource") != "ssm.amazonaws.com":
                 continue
             request, response = event.get("requestParameters") or {}, event.get("responseElements") or {}
@@ -197,7 +200,7 @@ class Commands:
             # activity: it is already a linked event of each of the command's system/plugin entries.
             if event["operation"] not in REQUESTS or event["command_key"] in self.commands:
                 continue
-            raw = json.loads(event["raw_json"])
+            raw = json.loads(event["raw_json"], use_decimal=True)
             request = raw.get("requestParameters")
             targets = (request or {}).get("instanceIds") or []
             target = (request or {}).get("target") or (request or {}).get("instanceId")

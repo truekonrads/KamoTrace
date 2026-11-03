@@ -1,6 +1,8 @@
 # MCP improvements: implementation plan
 
-Status: S01–S16 implemented and verified locally, 2026-11-03; not pushed or merged.
+Status: S01–S16 and all three reproduced oracle fixes implemented and verified
+locally, 2026-11-03; not pushed or merged. Browser smoke has an unrelated
+intermittent response-matching assertion (details below).
 
 ## Goal and authority
 
@@ -275,7 +277,7 @@ There is no configured static Python typecheck gate; do not invent one solely fo
 Ralph terminology. Report actual checks, limitations, remaining stories and delivery
 state. Keep real exports, annotations and evidence screenshots out of commits.
 
-Final local verification (2026-11-03): 114 unittest tests passed, including 50 HTTP/
+Initial local verification (2026-11-03): 114 unittest tests passed, including 50 HTTP/
 MCP contract tests; JavaScript syntax, wheel/sdist build and diff whitespace checks
 passed. Full browser smoke passed with Playwright 1.64.1 and the orb's installed
 Chrome executable; no JavaScript errors. Synthetic desktop normal/limit decoding,
@@ -285,3 +287,49 @@ with pointer recordings for orphan retrieval and saved-query editing. An undrain
 the interrupted download returned exact bytes/SHA-256. No remaining stories or
 implementation blockers. Changes remain on local implement/mcp-improvements,
 based on db3361b74adcec1c6a881d5649b98bc5a2086796; publishing requires authorization.
+
+### Oracle review follow-up
+
+Oracle requested changes on the implementation through bfe8208. NumPy was
+explicitly accepted; it remains installed. All three reproduced findings are fixed:
+
+- [x] **R1 / P1: Precise SSM event identities.** The ordinary JSON float parse
+  collapsed requests whose decimals differed beyond binary-float precision.
+  SSM now uses the importer's Decimal-capable JSON model for export loading,
+  event identity normalization and request serialization. Missing and repeated
+  event IDs retain distinct precise content; exact supplemental copies still
+  deduplicate with original evidence preferred. The regression had two entries
+  before the fix versus five after (four distinct originals plus one distinct
+  supplemental record), with exact decimal request text, original hashes, HTTP
+  reads, SSM export completeness and unchanged evidence-file SHA-256 checked.
+- [x] **R2 / P2: Bounded interactive raw values.** Raw projections/summaries
+  now reject results over 24,000 conservative ASCII-JSON bytes, with an actionable
+  `create_export` instruction. No value/key truncation, group merging, predicate
+  changes or silently reduced page size. Only the internal export call bypasses
+  this response cap; query validation and the export row/byte quotas remain.
+  Real HTTP/stdio MCP regressions cover a 100,000-character scalar, a complete
+  25-row page, control characters and astral Unicode; successful/error envelopes
+  stay below 80,000 bytes. Exact tail-distinguished comparisons, 25 distinct
+  summary groups and full exported values/SHA-256 are checked through both clients.
+- [x] **R3 / P2: Download leases retain quota.** Expired tokens reject new
+  downloads, but files stay registered, allocated and charged until their final
+  reader closes. Context-managed leases release on success/error/disconnect;
+  shutdown waits for preparation and defers active-file cleanup. The regression
+  covers two simultaneous readers, an exception path, expiry, blocked preparation,
+  exact bytes/hash, final-reader release and shutdown. A real undrained 11,251,524-
+  byte HTTP download retained quota after expiry: new GET returned 404 and new
+  preparation 400, while an independent event query took 0.011 seconds. Disconnect
+  released quota; replacement preparation/download succeeded with the exact hash.
+
+Combined verification: 117 unittest tests passed (53 contract tests), JavaScript
+syntax, wheel/sdist build and diff whitespace checks passed. Browser smoke with
+Playwright 1.64.1 and installed Chrome passed without JavaScript errors on a
+diagnostic rerun after two runs failed at the existing hybrid-query assertion
+(`tests/browser_smoke.py:132`, missing `search`). That test matches any event
+response; a linked-Finding request uses the same route without `search`, so a
+response-matcher race is suspected, not conclusively captured. No browser code or
+test was changed for these fixes; a separate follow-up was suggested. No remaining
+oracle fixes or S01–S16 stories. Intentional limits: oversized interactive raw
+results require a narrower query or export; active downloads can block new export
+preparations until readers close. All changes remain local, with no publishing
+authorization.

@@ -160,7 +160,8 @@ def describe_schema(timezone: str = "UTC", include_timezones: bool = False) -> d
 def search_events(query: Query | None = None, sort: list[Sort] | None = None,
                   page: Annotated[int, Field(ge=1)] = 1, size: Literal[25, 50, 100, 250, 500] = 100) -> dict[str, Any]:
     """Search CloudTrail events. Returns the full filtered total and one page of rows with their
-    record_sha256, tags and linked note IDs. Default sort is newest first; time_local uses query.timezone."""
+    record_sha256, tags and linked note IDs. Default sort is newest first; time_local uses query.timezone.
+    Oversized raw projections are rejected, never truncated; narrow the query or use create_export."""
     return search(query, sort, page, size)
 
 
@@ -182,7 +183,8 @@ def create_export(dataset: Literal["events", "ssm"], query: Query | None = None,
 @mcp.tool(annotations=READ)
 def summarize_field(field: str, query: Query | None = None) -> dict[str, Any]:
     """Prevalence of a field across the whole filtered result: the five most and least common values,
-    distinct value count and total."""
+    distinct value count and total. Oversized raw summaries are rejected; narrow the query or use
+    create_export to retrieve exact values. Grouping/comparison keys are never truncated."""
     return call("/api/column-values", {**(query or Query()).body(), "field": field})
 
 

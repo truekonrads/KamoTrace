@@ -1,4 +1,5 @@
 """Disposable immutable exports, privately staged and addressed only by opaque IDs."""
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -25,16 +26,19 @@ class Exports:
         self.lock = threading.Lock()
         self.preparing = threading.BoundedSemaphore(1)
         self.artifacts = {}
+        self.closed = False
 
     def cleanup(self):
         """Caller holds registry lock. Only registry-owned disposable files can be deleted."""
         for token, artifact in list(self.artifacts.items()):
-            if artifact["expires"] <= time.time():
+            if artifact["expires"] <= time.time() and not artifact["readers"]:
                 try:
                     artifact["path"].unlink(missing_ok=True)
                 except PermissionError:  # Windows may still have an active download; retry next request.
                     continue
                 del self.artifacts[token]
+        if self.closed and not self.artifacts:
+            self.directory.cleanup()
 
     def prepare(self, writer, base_url):
         if not self.preparing.acquire(blocking=False):
@@ -42,9 +46,11 @@ class Exports:
         output = None
         try:
             with self.lock:
+                if self.closed:
+                    raise ValueError("Export manager is closed")
                 self.cleanup()
                 if len(self.artifacts) >= MAX_ARTIFACTS:
-                    raise ValueError("Export disk quota reached (4 artifacts / 128 MiB); wait for expiry")
+                    raise ValueError("Export disk quota reached (4 artifacts / 128 MiB); wait for expiry and active downloads to close")
             token = secrets.token_hex(16)
             output = self.root / (token + ".ndjson")
             digest, size, rows = hashlib.sha256(), 0, 0
@@ -84,24 +90,39 @@ class Exports:
                 "download_url": base_url.rstrip("/") + "/api/exports/" + token,
                 "reachability": "Loopback URLs work only for clients on the server machine. Use bounded text reads if download is unreachable."}
             with self.lock:
-                self.artifacts[token] = {"path": output, "expires": expires, "info": info}
+                self.artifacts[token] = {"path": output, "expires": expires, "info": info, "readers": 0}
             return info
         finally:
             if output is not None:
                 output.with_suffix(".lock").unlink(missing_ok=True)
             self.preparing.release()
 
+    @contextmanager
     def open(self, token):
-        if not re.fullmatch(r"[0-9a-f]{32}", token):
-            return None
+        """A download lease retains storage/quota until its final reader closes."""
+        artifact, stream = None, None
         with self.lock:
             self.cleanup()
-            artifact = self.artifacts.get(token)
-            if artifact is None or artifact["expires"] <= time.time():
-                return None
-            # Open before releasing the registry lock; a slow download owns its handle,
-            # not the Store lock. Expiry cannot substitute content underneath it.
-            return artifact["path"].open("rb"), artifact["info"]
+            if not self.closed and re.fullmatch(r"[0-9a-f]{32}", token):
+                candidate = self.artifacts.get(token)
+                if candidate is not None and candidate["expires"] > time.time():
+                    stream = candidate["path"].open("rb")
+                    artifact = candidate
+                    artifact["readers"] += 1
+        if artifact is None:
+            yield None
+            return
+        try:
+            with stream:
+                yield stream, artifact["info"]
+        finally:
+            with self.lock:
+                artifact["readers"] -= 1
+                self.cleanup()
 
     def close(self):
-        self.directory.cleanup()
+        with self.preparing, self.lock:
+            self.closed = True
+            for artifact in self.artifacts.values():
+                artifact["expires"] = 0
+            self.cleanup()

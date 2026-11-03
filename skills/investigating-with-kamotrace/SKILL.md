@@ -179,6 +179,11 @@ such as Operation are not keys (`event_name` is).
   containers are `ARRAY/OBJECT`. Those last three cases have no scalar value,
   so `missing` includes all of them; `empty` also includes `""`. Retain all raw
   filters/projections when saving a Finding context; browser reopening preserves them.
+  Interactive raw projections/summaries have a 24,000-byte conservative ASCII-JSON
+  cap to bound MCP responses. Oversized results fail explicitly, never truncate
+  keys or values. Narrow the selection/projection or use `create_export` with
+  `query.raw_fields` and export `fields=["id", "raw_fields"]` for exact values.
+  Filtering, grouping, counts and exports retain exact comparison semantics.
 - `tags`: the event must carry **every** listed tag. Combine tags only when you
   mean all of them.
 - `note_id`: only events linked to that note. `command_key`: only CloudTrail
@@ -407,7 +412,10 @@ replacement for evidence. Supplemental raw JSON is reconstructed and labelled.
 Later edits do not alter an existing artifact. Links expire in ten minutes and
 do not survive a server restart. Limits are one preparation, four artifacts /
 128 MiB total, 50,000 rows / 32 MiB each; narrow fields or selection on a limit
-error. Links use the trusted configured server origin, not caller Host input.
+error. Expired links reject new downloads; active readers retain quota charges
+until the final download closes, including disconnects. Slow readers can block
+new preparations rather than bypass disk limits. Links use the trusted configured
+server origin, not caller Host input.
 Loopback URLs work only on the server machine; if unreachable, keep using bounded
 SSM/note chunks and event pages. Never send an export to an online service.
 
