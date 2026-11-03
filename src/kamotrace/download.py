@@ -42,6 +42,8 @@ LIMITATIONS = [
 # so two workers keep a slow (high-latency) connection near that limit without exceeding it.
 LOOKUP_INTERVAL = 0.55
 WINDOW_WORKERS = 2
+# Bound transfers within each active S3 listing; Regions/services still run independently.
+S3_WORKERS = 8
 # Show a CloudTrail ETA only after every unfinished Region has this much of its own AWS pace measured,
 # and project a running day from its own density only once this fraction of it is covered.
 ETA_MIN_PAGES = 10
@@ -265,6 +267,7 @@ class Collector:
         self.progress = progress
         self.compress = compress
         self.clients = {}
+        self.object_locks = {}
         # Region and window workers share this one connection; self.lock serializes every use of it.
         self.db = sqlite3.connect(folder / "checkpoint.sqlite", timeout=1, check_same_thread=False)
         self.lock = threading.RLock()
@@ -299,6 +302,9 @@ class Collector:
         def run(item):
             try:
                 return function(item)
+            except BaseException:
+                self.stopped.set()  # Stop queued/nested workers before the coordinator wakes up.
+                raise
             finally:
                 self.progress.idle()
 
@@ -322,6 +328,7 @@ class Collector:
                 raise future.exception()  # The real failure, not a worker it stopped.
         if self.stopped.is_set():
             raise Stopped("collection stopped by another worker")
+        return [future.result() for future in futures]
 
     def pace(self, region):
         """Space LookupEvents call starts in a Region, shared by all of that Region's workers."""
@@ -460,19 +467,23 @@ class Collector:
                           "file": "logs/" + name, "events": len(events)}
 
     def s3(self, region, bucket, prefix, logs, session_ids=None, cloudtrail=None):
-        for page in self.pages("s3", region, "list_objects_v2", {"Bucket": bucket, "Prefix": prefix},
-                               token="ContinuationToken", result_token="NextContinuationToken"):
-            for item in page.get("Contents", []):
-                key = item["Key"]
-                if cloudtrail is not None:
-                    match = trailcheck.LOG_NAME.fullmatch(key.removeprefix(prefix))
-                    if not match or match.groups() != cloudtrail or item.get("Size", 0) <= 0:
-                        continue
-                if session_ids is not None and not any(
-                        part in session_ids or part.removesuffix(".log") in session_ids for part in key.split("/")):
-                    continue
-                identity = encode([bucket, key])
-                name = hashlib.sha256(identity.encode()).hexdigest() + ".bin"
+        def download(item):
+            if self.stopped.is_set():
+                raise Stopped("collection stopped by another worker")
+            key = item["Key"]
+            if cloudtrail is not None:
+                match = trailcheck.LOG_NAME.fullmatch(key.removeprefix(prefix))
+                if not match or match.groups() != cloudtrail or item.get("Size", 0) <= 0:
+                    return
+            if session_ids is not None and not any(
+                    part in session_ids or part.removesuffix(".log") in session_ids for part in key.split("/")):
+                return
+            identity = encode([bucket, key])
+            name = hashlib.sha256(identity.encode()).hexdigest() + ".bin"
+            with self.lock:
+                object_lock = self.object_locks.setdefault(name, threading.Lock())
+            # Overlapping listings must verify/reuse the same bytes, never race on a .part file.
+            with object_lock:
                 target = self.folder / "logs" / name
                 expected = item["Size"]
                 with self.lock:
@@ -506,8 +517,15 @@ class Collector:
                     with self.lock, self.db:
                         self.db.execute("INSERT OR REPLACE INTO objects (name, sha256, etag) VALUES (?,?,?)",
                                         (name, digest, item["ETag"]))
-                logs[identity] = {"bucket": bucket, "key": key, "etag": item["ETag"],
+                return identity, {"bucket": bucket, "key": key, "etag": item["ETag"],
                                   "size": expected, "sha256": digest, "file": "logs/" + name}
+
+        for page in self.pages("s3", region, "list_objects_v2", {"Bucket": bucket, "Prefix": prefix},
+                               token="ContinuationToken", result_token="NextContinuationToken"):
+            # Finish a bounded page before advancing its checkpointed listing cursor.
+            for result in self.parallel(download, page.get("Contents", []), S3_WORKERS):
+                if result is not None:
+                    logs[result[0]] = result[1]  # Preserve listing order, not completion order.
 
     def ssm(self, region, document, logs, session_s3, session_groups):
         # Widen server-side filters to whole seconds, then enforce inclusive microsecond bounds locally.

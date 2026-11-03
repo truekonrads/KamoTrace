@@ -599,6 +599,99 @@ class DownloadContract(unittest.TestCase):
         for stub in self.stubs.values():
             stub.assert_no_pending_responses()
 
+    def test_cloudtrail_s3_parallel_objects_failure_resume_and_integrity(self):
+        root = "audit/AWSLogs/123456789012/CloudTrail/"
+        prefix = root + "us-east-1/2026/10/01/"
+        records = [{"eventID": f"parallel-{i}", "awsRegion": "us-east-1",
+                    "eventTime": f"2026-10-01T12:{i:02d}:00Z", "eventName": "Synthetic"} for i in range(11)]
+        keys = [prefix + f"123456789012_CloudTrail_us-east-1_20261001T1200Z_part{i}.json.gz"
+                for i in range(11)]
+        data = {key: gzip.compress(json.dumps({"Records": [record]}).encode())
+                for key, record in zip(keys, records)}
+        # More objects than workers, asymmetric listing order, and a repeated object.
+        order = [7, 2, 5, 0, 6, 1, 4, 3, 8, 9]
+        barrier = threading.Barrier(8, timeout=5)
+        lock = threading.Lock()
+        fetched = []
+        active, peak = 0, 0
+        interrupted = True
+
+        class Body(io.BytesIO):
+            def read(body, size=-1):
+                if interrupted and body.tell() > 0:
+                    raise OSError("synthetic interrupted S3 body")
+                return super().read(min(size, 11) if interrupted else size)
+
+        class S3:  # Key-addressed responses: concurrent transfers cannot use Stubber's FIFO queue.
+            def get_bucket_location(fake, **kwargs):
+                return {}
+
+            def list_objects_v2(fake, Bucket, Prefix, ContinuationToken=None):
+                self.assertEqual((Bucket, Prefix), ("synthetic-logs", prefix))
+                indices = [*order, 0] if ContinuationToken is None else [10]
+                return {"Contents": [{"Key": keys[i], "Size": len(data[keys[i]]), "ETag": f'"version-{i}"'}
+                                     for i in indices],
+                        **({"NextContinuationToken": "last"} if ContinuationToken is None else {})}
+
+            def get_object(fake, Bucket, Key, IfMatch):
+                nonlocal active, peak
+                self.assertEqual(Bucket, "synthetic-logs")
+                index = keys.index(Key)
+                self.assertEqual(IfMatch, f'"version-{index}"')
+                with lock:
+                    fetched.append(Key)
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    if index < 8 and interrupted:
+                        barrier.wait()  # Eight distinct GETs must be in flight, not just eight queued tasks.
+                    raw = Body(data[Key]) if index == 10 else io.BytesIO(data[Key])
+                    return {"Body": StreamingBody(raw, len(data[Key]))}
+                finally:
+                    with lock:
+                        active -= 1
+
+        self.clients["s3", "us-east-1"] = S3()
+        options = ("--services", "cloudtrail", "--progress", "off", "--cloudtrail-s3", "s3://synthetic-logs/" + root)
+        self.identity()
+        _, error = self.run_cli(*options, status=1)
+        self.assertIn("synthetic interrupted S3 body", error)
+        self.assertNotIn("stopped by another worker", error)
+        self.assertEqual(peak, 8)
+        self.assertCountEqual(fetched, keys)  # The repeated key must reuse verified bytes.
+        self.assertFalse(json.loads((self.folder / "manifest.json").read_text())["complete"])
+        self.assertFalse((self.folder / "cloudtrail.json").exists())
+        with closing(sqlite3.connect(self.folder / "checkpoint.sqlite")) as checkpoint:
+            self.assertEqual(checkpoint.execute("SELECT COUNT(*) FROM objects").fetchone()[0], 10)
+
+        interrupted = False
+        fetched.clear()
+        # Resume must not refresh listings or bucket discovery, and only restarts the partial object.
+        with patch.object(S3, "list_objects_v2", side_effect=AssertionError("listing must be cached")), \
+                patch.object(S3, "get_bucket_location", side_effect=AssertionError("location must be cached")):
+            self.identity()
+            self.run_cli(*options)
+            self.assertEqual(fetched, [keys[10]])
+            exported = (self.folder / "cloudtrail.json").read_bytes()
+            self.assertCountEqual(json.loads(exported)["Records"], records)
+            manifest = json.loads((self.folder / "manifest.json").read_text())
+            self.assertTrue(manifest["complete"])
+            self.assertEqual([item["key"] for item in manifest["logs"]], [keys[i] for i in [*order, 10]])
+            for item in manifest["logs"]:
+                original = data[item["key"]]
+                self.assertEqual((self.folder / item["file"]).read_bytes(), original)
+                self.assertEqual(item["sha256"], hashlib.sha256(original).hexdigest())
+
+            damaged = self.folder / manifest["logs"][0]["file"]
+            damaged.write_bytes(b"x" * damaged.stat().st_size)
+            fetched.clear()
+            self.identity()
+            self.run_cli(*options)
+            self.assertEqual(fetched, [keys[order[0]]])
+            self.assertEqual(damaged.read_bytes(), data[keys[order[0]]])
+            self.assertEqual((self.folder / "cloudtrail.json").read_bytes(), exported)
+            self.assertEqual(json.loads((self.folder / "manifest.json").read_text())["logs"], manifest["logs"])
+
     def s3_page(self, prefix, key, data, extra_key=None, interrupt=False):
         objects = [{"Key": key, "Size": len(data), "ETag": '"synthetic-etag"'}]
         if extra_key:

@@ -236,8 +236,11 @@ time (their API quotas are separate), so SSM history near its 30-day limit is no
 left waiting behind a long CloudTrail download. Two daily CloudTrail batches per
 region run at once; they share that region's pace of at most one LookupEvents call
 start every 0.55 s (AWS allows two per second per account and region, shared with
-other tools using the same account). Output order does not depend on timing. The
-first failure, including a missing SSM, S3, CloudWatch Logs or KMS permission, stops
+other tools using the same account). S3 objects download with up to eight workers
+per active listing (CloudTrail or SSM); regions/services still run independently.
+Each listing page finishes before advancing to the next page, and overlapping
+listings serialize access to the same object. Output order does not depend on
+timing. The first failure, including a missing SSM, S3, CloudWatch Logs or KMS permission, stops
 all workers after their in-flight call or S3 block and is reported. SDK retries
 handle transient failures/throttling. Interrupted S3 objects restart, while
 completed objects are reused only when both their saved ETag and local SHA-256
