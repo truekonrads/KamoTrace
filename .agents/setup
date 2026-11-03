@@ -5,11 +5,26 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 SECONDS=0
 
 # Amp's base orb already supplies uv, Node and npm. Reuse them rather than
-# reinstalling toolchains; only the managed Python and locked project need setup.
+# reinstalling those toolchains.
 printf '[setup] Checking orb tools\n'
 uv --version
 node --version
 npm --version
+
+printf '[setup] Checking AWS CLI\n'
+# aws login requires v2.32.0; Debian 12's awscli package is too old.
+aws_version="$(aws --version 2>/dev/null || true)"
+if [[ ! "$aws_version" =~ ^aws-cli/2\.([0-9]+)\. ]] || (( BASH_REMATCH[1] < 32 )); then
+    installer="$(mktemp -d)"
+    trap 'rm -rf -- "$installer"' EXIT
+    curl --fail --silent --show-error --location \
+        "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$installer/awscliv2.zip"
+    unzip -q "$installer/awscliv2.zip" -d "$installer"
+    sudo "$installer/aws/install" --update
+    rm -rf -- "$installer"
+    trap - EXIT
+fi
+aws --version
 
 printf '[setup] Syncing Python 3.12 and locked runtime/development dependencies\n'
 uv sync --locked --python 3.12 --dev --compile-bytecode
