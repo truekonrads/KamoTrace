@@ -1334,25 +1334,65 @@ async function stepLogMatch(delta) {
 }
 
 // Saved reviews whose entry no longer exists stay readable (plaintext), never reattached.
-function renderLogUnmatched(reviews) {
-  $("log-unmatched").hidden = !reviews.length;
+function renderLogUnmatched(count) {
+  $("log-unmatched").hidden = !count;
   $("log-unmatched-summary").textContent =
-    `${number(reviews.length)} saved entry review${reviews.length === 1 ? "" : "s"} no longer match${reviews.length === 1 ? "es" : ""} a current entry`;
-  $("log-unmatched-list").replaceChildren(
-    ...reviews.map((review) => {
-      const item = document.createElement("div");
-      item.className = "log-unmatched-item";
-      logLine(
-        item,
-        `Entry ${review.entry_id.slice(0, 12)}… · saved ${review.updated}`,
-      );
-      if (review.tags.length)
-        logLine(item, `entry tags: ${review.tags.join(", ")}`, "ssm-log-tags");
-      if (review.text) logField(item, "interpretation · analyst", review.text);
-      if (review.finding) logField(item, "entry finding", review.finding);
-      return item;
-    }),
-  );
+    `${number(count)} saved entry review${count === 1 ? "" : "s"} no longer match${count === 1 ? "es" : ""} a current entry`;
+  const list = $("log-unmatched-list");
+  list.replaceChildren();
+  const load = (page) => {
+    const button = document.createElement("button");
+    button.textContent =
+      page === 1 ? "Load saved reviews" : "More saved reviews";
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        const result = await request("/api/ssm-log-orphans", { page });
+        if (!button.isConnected) return;
+        for (const summary of result.data) {
+          const item = document.createElement("details");
+          item.className = "log-unmatched-item";
+          const title = document.createElement("summary");
+          title.textContent = `Entry ${summary.entry_id.slice(0, 12)}… · saved ${summary.updated}`;
+          item.append(title);
+          item.ontoggle = async () => {
+            if (!item.open || item.dataset.loaded) return;
+            item.dataset.loaded = "loading";
+            try {
+              const { review } = await request("/api/ssm-log-orphans", {
+                entry_id: summary.entry_id,
+              });
+              if (review.tags.length)
+                logLine(
+                  item,
+                  `entry tags: ${review.tags.join(", ")}`,
+                  "ssm-log-tags",
+                );
+              if (review.text)
+                logField(item, "interpretation · analyst", review.text);
+              if (review.finding)
+                logField(item, "entry finding", review.finding);
+              item.dataset.loaded = "yes";
+            } catch (e) {
+              delete item.dataset.loaded;
+              logLine(
+                item,
+                `Could not load review: ${e.message}. Close and reopen to retry.`,
+              );
+            }
+          };
+          list.insertBefore(item, button);
+        }
+        button.remove();
+        if (result.next_page) load(result.next_page);
+      } catch (e) {
+        button.textContent = `Retry saved reviews: ${e.message}`;
+        button.disabled = false;
+      }
+    };
+    list.append(button);
+  };
+  if (count) load(1);
 }
 
 // The first entry whose bottom is below the viewport top, and its offset. Entries are in document
@@ -1805,7 +1845,7 @@ async function loadLog({ more = false, retry = null, fresh = false } = {}) {
         logCards.clear();
         logStale = false;
         $("command-log").replaceChildren();
-        renderLogUnmatched(result.unmatched_reviews);
+        renderLogUnmatched(result.unmatched_review_count);
         if (!result.total)
           $("command-log").textContent =
             "No matching activity. Widen the time range, change the search scope or clear search.";

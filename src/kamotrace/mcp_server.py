@@ -343,6 +343,19 @@ def search_ssm_log(search: Annotated[str, Field(max_length=2000, description=(
 
 
 @mcp.tool(annotations=READ)
+def list_ssm_orphan_reviews(page: Annotated[int, Field(ge=1)] = 1) -> dict[str, Any]:
+    """Preserved reviews with no current entry: 25 summaries per page, independent of search.
+    Follow next_page until null. No review is automatically reassociated with changed content."""
+    return call("/api/ssm-log-orphans", {"page": page})
+
+
+@mcp.tool(annotations=READ)
+def get_ssm_orphan_review(entry_id: str) -> dict[str, Any]:
+    """Read a preserved orphan review by its exact old entry_id from list_ssm_orphan_reviews."""
+    return call("/api/ssm-log-orphans", {"entry_id": entry_id})
+
+
+@mcp.tool(annotations=READ)
 def get_ssm_log_entry(entry_id: str) -> dict[str, Any]:
     """One current log entry by exact entry_id with its latest saved review (use before re-editing
     after a stale edit). Independent of search and time range; fails if the entry no longer exists."""

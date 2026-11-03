@@ -342,12 +342,31 @@ class Store:
                                      "to continue. Pass the revision returned with page 1 for later pages.")
             # Saved reviews whose source content is no longer an entry (changed export or grouping) stay
             # readable rather than silently disappearing; they are never attached to another entry.
-            unmatched = [{"entry_id": r["entry_id"], "text": r["text"], "tags": json.loads(r["tags"]),
-                          "finding": r["finding"], "updated": r["updated"]}
-                         for r in self.reviews.execute("SELECT * FROM ssm_log_reviews ORDER BY updated, entry_id")
-                         if r["entry_id"] not in self.commands.log_entries]
+            unmatched = sum(r[0] not in self.commands.log_entries for r in self.reviews.execute(
+                "SELECT entry_id FROM ssm_log_reviews"))
             return {**result, "data": self.log_review_data(result["data"]), "revision": self.log_revision,
-                    "unmatched_reviews": unmatched}
+                    "unmatched_review_count": unmatched}
+
+    def ssm_log_orphans(self, body):
+        """Explicit, bounded discovery of preserved reviews with no current content match."""
+        with self.locked("ssm.log_orphans"):
+            entry_id = body.get("entry_id")
+            if entry_id is not None:
+                if not isinstance(entry_id, str) or entry_id in self.commands.log_entries:
+                    raise ValueError("Unknown orphan review")
+                row = self.reviews.execute("SELECT * FROM ssm_log_reviews WHERE entry_id=?", (entry_id,)).fetchone()
+                if row is None:
+                    raise ValueError("Unknown orphan review")
+                return {"review": {**dict(row), "tags": json.loads(row["tags"])}}
+            page = body.get("page", 1)
+            if type(page) is not int or page < 1:
+                raise ValueError("page must be a positive integer")
+            rows = [dict(r) for r in self.reviews.execute("""SELECT entry_id, updated,
+                substr(text,1,200) AS text_preview, length(text) AS text_length,
+                substr(finding,1,200) AS finding_preview, length(finding) AS finding_length
+                FROM ssm_log_reviews ORDER BY updated, entry_id""") if r["entry_id"] not in self.commands.log_entries]
+            return {"data": rows[(page-1)*25:page*25], "total": len(rows), "page": page,
+                    "next_page": page+1 if page*25 < len(rows) else None}
 
     def log_review_data(self, entries):
         """Attach each entry's saved review and its linked events' tags/findings (read-only here). Caller holds the lock."""
@@ -805,7 +824,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/reference"):
+        if self.path not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/reference"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -819,6 +838,7 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
                          "/api/reference": self.store.reference,
+                         "/api/ssm-log-orphans": self.store.ssm_log_orphans,
                          "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]

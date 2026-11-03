@@ -745,6 +745,9 @@ class BrowserContract(unittest.TestCase):
                     return ("error", result.content[0].text) if result.is_error else result.structured_content
 
                 names = {t.name for t in (await client.list_tools()).tools}
+                orphan_page = await tool("list_ssm_orphan_reviews", page=1)
+                self.assertIn("next_page", orphan_page)
+                self.assertEqual((await tool("get_ssm_orphan_review", entry_id="nonexistent"))[0], "error")
                 self.assertLessEqual({"describe_schema", "search_events", "get_event", "tag_events", "untag_events",
                                       "create_note", "edit_note", "link_note_events", "unlink_note_events",
                                       "search_ssm_commands", "get_ssm_command", "search_ssm_log", "get_ssm_log_entry", "edit_ssm_log_entry"}, names)
@@ -1545,6 +1548,46 @@ class BrowserContract(unittest.TestCase):
                 store.reviews.close()
                 store.connection.close()
 
+    def test_ssm_orphan_reviews_are_explicit_bounded_and_complete(self):
+        # Large Unicode reviews must not leak into even a zero-match ordinary search.
+        ids = [f"orphan-{i:05}" for i in range(2003)]
+        text = "synthetic 🦆\n" * 2500
+        with self.store.lock, self.store.reviews:
+            self.store.reviews.executemany("INSERT INTO ssm_log_reviews VALUES (?,?,?,?,?)",
+                [(id_, text, '["preserved"]', text, "synthetic-stamp") for id_ in ids])
+        try:
+            status, result = self.call("/api/ssm-log", {"search": "nothing matches synthetic orphan"})
+            self.assertEqual(status, 200)
+            self.assertEqual(result["total"], 0)
+            self.assertEqual(result["unmatched_review_count"], len(ids))
+            self.assertLess(len(json.dumps(result, ensure_ascii=False).encode()), 5000)
+            seen, page = [], 1
+            while page:
+                status, result = self.call("/api/ssm-log-orphans", {"page": page})
+                self.assertEqual(status, 200)
+                self.assertLess(len(json.dumps(result, ensure_ascii=False).encode()), 80000)
+                seen.extend(row["entry_id"] for row in result["data"])
+                page = result["next_page"]
+            self.assertEqual(seen, ids)
+            detail = self.call("/api/ssm-log-orphans", {"entry_id": ids[-1]})[1]["review"]
+            self.assertEqual((detail["text"], detail["finding"], detail["tags"]), (text, text, ["preserved"]))
+            self.assertEqual(self.call("/api/ssm-log-orphans", {"page": 0})[0], 400)
+
+            async def sessions():
+                for transport in (self.url + "/mcp", StdioServerParameters(
+                        command=sys.executable, args=["-m", "kamotrace", "mcp", "--url", self.url])):
+                    async with Client(transport) as client:
+                        summary = await client.call_tool("list_ssm_orphan_reviews", {"page": 81})
+                        self.assertFalse(summary.is_error)
+                        self.assertEqual(summary.structured_content["data"][-1]["entry_id"], ids[-1])
+                        full = await client.call_tool("get_ssm_orphan_review", {"entry_id": ids[-1]})
+                        self.assertFalse(full.is_error)
+                        self.assertEqual(full.structured_content["review"], detail)
+            anyio.run(sessions)
+        finally:
+            with self.store.lock, self.store.reviews:
+                self.store.reviews.executemany("DELETE FROM ssm_log_reviews WHERE entry_id=?", [(id_,) for id_ in ids])
+
     def test_ssm_log_review_persistence_and_changed_export_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1605,7 +1648,7 @@ class BrowserContract(unittest.TestCase):
                         post("/api/ssm-log-review", {"entry_id": supplemental["entry_id"], "text": "Supplemental request", "tags": [],
                             "finding": "Failed request without command ID", "updated": None})
                     elif stage == 1:
-                        self.assertEqual(post("/api/ssm-log", {})["unmatched_reviews"], [])
+                        self.assertEqual(post("/api/ssm-log", {})["unmatched_review_count"], 0)
                         self.assertEqual(output["entry_id"], old_id)
                         self.assertEqual(output["review"], saved)
                         self.assertEqual(supplemental["review"]["text"], "Supplemental request")
@@ -1613,8 +1656,10 @@ class BrowserContract(unittest.TestCase):
                         self.assertNotEqual(output["entry_id"], old_id)
                         self.assertIsNone(output["review"]["updated"])
                         # The old review is reported as unmatched, not inherited; the still-current one is not listed.
-                        self.assertEqual(post("/api/ssm-log", {"search": "no such entry"})["unmatched_reviews"],
-                                         [{"entry_id": old_id, **saved}])
+                        self.assertEqual(post("/api/ssm-log", {"search": "no such entry"})["unmatched_review_count"], 1)
+                        self.assertEqual(post("/api/ssm-log-orphans", {})["data"][0]["entry_id"], old_id)
+                        self.assertEqual(post("/api/ssm-log-orphans", {"entry_id": old_id})["review"],
+                                         {"entry_id": old_id, **saved})
                         with self.assertRaises(HTTPError) as error:
                             post("/api/ssm-log-review", {"entry_id": old_id})
                         self.assertEqual(error.exception.code, 400)

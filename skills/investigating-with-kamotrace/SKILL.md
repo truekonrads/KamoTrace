@@ -297,7 +297,9 @@ Available only when the analyst loaded an SSM export.
   and findings are **not** event tags or shared Markdown notes: use `tag_events`
   and `create_note` with linked original `record_sha256` values to record shared
   evidence findings. Supplemental/unlinked entries can still carry entry reviews.
-  `search_ssm_log` also returns `unmatched_reviews`: saved reviews whose
+  `search_ssm_log` returns only `unmatched_review_count`. Use
+  `list_ssm_orphan_reviews(page=1)` and follow `next_page` for bounded summaries,
+  then `get_ssm_orphan_review(entry_id=...)` for a saved review whose
   `entry_id` is no longer a current entry. They are read-only history; do not
   copy them onto another entry without checking it is the same source content.
 

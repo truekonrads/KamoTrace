@@ -61,10 +61,16 @@ directly, retaining progress across context windows.
 
 ### Phase 1: bounded interactive reads and efficient edits
 
-- [ ] **S01: Separate orphan review retrieval.** Replace the unbounded search
+- [x] **S01: Separate orphan review retrieval.** Replace the unbounded search
   payload with a count and paginated orphan summaries/detail. Update the browser
   consumer directly. Verify zero-match searches with thousands of large orphan
   reviews remain small and every orphan is still retrievable.
+  Implemented count-only search, explicit 25-row orphan summaries and exact detail,
+  thin MCP tools and lazy browser retrieval. Contract suite: 44 tests passed;
+  2,003 large Unicode orphans traversed exactly once, zero-match response <5 KB.
+  Real HTTP/stdio sessions exercise orphan tools. Synthetic desktop check loaded
+  25 then 26 reviews, no duplicate continuation, and rendered script-like text
+  as plaintext (zero script nodes). Inspected screenshots/interaction recording.
 - [ ] **S02: Bound SSM search summaries.** Add allowed projections, smaller default
   pages, and bounded output/review/finding previews. Keep IDs, current review
   stamps, total, continuation and truncation metadata. Do not embed repeated full
