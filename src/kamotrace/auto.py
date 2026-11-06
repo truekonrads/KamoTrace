@@ -8,6 +8,8 @@ import argparse
 from contextlib import ExitStack
 import json
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 import duckdb
@@ -41,6 +43,31 @@ def run_command(main, argv, what):
         status = exit.code
     if status not in (None, 0):
         raise StageError(f"{what} failed (exit status {status})", status if isinstance(status, int) else 1)
+
+
+def check_suzaku_version(executable):
+    """Advisory only: never upgrade tools or prevent offline preparation."""
+    try:
+        result = subprocess.run([str(executable.resolve()), "--version"], cwd=executable.resolve().parent,
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=10, check=True)
+        match = re.fullmatch(r"Suzaku\s+v?(\d+\.\d+\.\d+)(?:\s+[^\r\n]+)?", result.stdout.strip(), re.IGNORECASE)
+        if not match:
+            raise ValueError("unrecognized Suzaku --version output")
+        current = match[1]
+        with get_suzaku.get(get_suzaku.RELEASES + "/latest") as response:
+            latest = json.load(response)["tag_name"].lstrip("v")
+        if not re.fullmatch(r"\d+\.\d+\.\d+", latest):
+            raise ValueError("unrecognized latest Suzaku release version")
+        if tuple(map(int, current.split("."))) < tuple(map(int, latest.split("."))):
+            message = f"WARNING: Suzaku {current} is older than the latest stable release {latest}. "
+            if latest.split(".")[0] == get_suzaku.SUPPORTED_MAJOR:
+                message += "Run kamotrace get-suzaku to install the latest supported release."
+            else:
+                message += f"KamoTrace currently supports Suzaku {get_suzaku.SUPPORTED_MAJOR}.x; do not upgrade to an unsupported major."
+            say("get-suzaku", message + " Continuing with the selected executable.")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+        say("get-suzaku", f"WARNING: could not check for Suzaku updates: {error}; continuing with the selected executable.")
 
 
 def dbip_installed(tools):
@@ -265,6 +292,9 @@ def main(argv=None):
                     raise StageError(f"get-suzaku did not install Suzaku {args.suzaku_version or ''} in {tools}")
             else:
                 say(stage, f"using installed {suzaku}")
+
+        if not (args.skip_suzaku or args.timeline):
+            check_suzaku_version(suzaku)
 
         # 2. DB-IP Lite, unless other enrichment sources were given.
         stage = STAGES[1]

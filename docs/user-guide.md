@@ -405,6 +405,13 @@ and DB-IP Lite are still downloaded only from their official sources and
 verified as described for [`get-suzaku`](#download-and-run-suzaku) and
 [IP enrichment](#ip-enrichment). Credit DB-IP Lite data (CC BY 4.0).
 
+When running Suzaku, auto compares the selected executable's `--version` with
+GitHub's latest stable release and warns if it is older (including pinned versions
+and `--suzaku` executables). This is advisory: it never upgrades an installed tool.
+If the check fails, for example offline or because of GitHub rate limits, auto
+warns and continues. A newer unsupported major is reported without recommending
+an incompatible upgrade. `--skip-suzaku` and `--timeline` skip this check.
+
 AWS access uses your existing login, exactly as [`download`](preparation.md#download-from-an-existing-aws-login)
 does; there is no login prompt, so it is safe for unattended use with `--no-serve`
 and `--progress log`. `--services` must include `cloudtrail`. Running Suzaku needs a

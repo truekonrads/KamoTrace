@@ -30,6 +30,9 @@ FAKE_SUZAKU = """#!{python}
 import gzip, json, sys
 from pathlib import Path
 import duckdb
+if sys.argv[1:] == ["--version"]:
+    print("suzaku 3.0.0 Synthetic Release")
+    sys.exit(0)
 if Path(__file__).with_name("FAIL").exists():
     sys.exit("synthetic Suzaku failure")
 args = sys.argv[1:]
@@ -78,6 +81,7 @@ class AutoContract(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.tools = self.root / "tools"
+        self.stack.enter_context(patch("kamotrace.get_suzaku.get", side_effect=OSError("offline")))
         self.stack.enter_context(patch.dict(os.environ, {"KAMOTRACE_TOOLS": str(self.tools), "KAMOTRACE_BIND": ""}))
         os.environ.pop("KAMOTRACE_BIND")
         # The browser server is constructed for real (validating every sidecar), but never listens.
@@ -123,6 +127,8 @@ class AutoContract(unittest.TestCase):
         self.requests = []
 
         def get(url):
+            if url == get_suzaku.RELEASES + "/latest":
+                return io.BytesIO(b'{"tag_name": "v3.0.0"}')
             self.requests.append(url)
             return io.BytesIO(responses[url])
         self.stack.enter_context(patch("kamotrace.get_suzaku.get", get))
@@ -615,6 +621,49 @@ class AutoContract(unittest.TestCase):
         self.assertFalse((target / "case.duckdb").exists())
         _, error = self.run_auto(target, "--services", "ssm", status=2)
         self.assertIn("must include cloudtrail", error)
+
+
+class AutoSuzakuVersionContract(unittest.TestCase):
+    def test_auto_warns_without_upgrading_or_blocking_preparation(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            source = root / "events.json"
+            source.write_text(json.dumps({"Records": [record("e1", "2026-01-01T00:00:00Z")]}), encoding="utf-8")
+            executable = root / "suzaku.exe"
+            executable.touch()
+            options = ["auto", str(root / "case"), "--source", str(source), "--suzaku", str(executable),
+                       "--skip-enrich", "--skip-inventory", "--no-serve"]
+            cases = [
+                ("3.9.0", "v3.10.0", "Suzaku 3.9.0 is older", None),
+                ("3.10.0", "v3.10.0", None, None),
+                ("3.10.1", "v3.10.0", None, None),
+                ("3.10.0", "v4.0.0", "do not upgrade to an unsupported major", None),
+                ("3.9.0", None, "could not check for Suzaku updates", OSError("offline")),
+                ("unknown", "v3.10.0", "unrecognized Suzaku --version output", None),
+                ("3.9.0", "invalid", "unrecognized latest Suzaku release version", None),
+                ("3.9.0", "v3.10.0", "could not check for Suzaku updates",
+                 subprocess.TimeoutExpired("suzaku --version", 10)),
+            ]
+            for current, latest, warning, error in cases:
+                with self.subTest(current=current, latest=latest, error=error), ExitStack() as stack:
+                    log = io.StringIO()
+                    stack.enter_context(redirect_stderr(log))
+                    stack.enter_context(redirect_stdout(io.StringIO()))
+                    result = subprocess.CompletedProcess([], 0, f"suzaku {current} Synthetic Release\n", "")
+                    stack.enter_context(patch("kamotrace.auto.subprocess.run", return_value=result,
+                                             side_effect=error if isinstance(error, subprocess.TimeoutExpired) else None))
+                    stack.enter_context(patch("kamotrace.get_suzaku.get",
+                                             return_value=io.BytesIO(json.dumps({"tag_name": latest}).encode()),
+                                             side_effect=error if isinstance(error, OSError) else None))
+                    stack.enter_context(patch("kamotrace.auto.run_suzaku", return_value=(Mock(), root / "timeline")))
+                    stack.enter_context(patch("kamotrace.auto.import_timeline"))
+                    self.assertEqual(main(options), 0, log.getvalue())
+                    if warning:
+                        self.assertIn("WARNING:", log.getvalue())
+                        self.assertIn(warning, log.getvalue())
+                    else:
+                        self.assertNotIn("WARNING:", log.getvalue())
+                    self.assertEqual(executable.read_bytes(), b"")
 
 
 class AutoInventoryContract(unittest.TestCase):
