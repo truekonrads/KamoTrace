@@ -32,7 +32,7 @@
         <span id="coverage">Opening local evidence…</span>
       </div>
       <nav class="workspace-tabs" aria-label="Evidence views">
-        <button id="events-tab" aria-pressed="true">CloudTrail events</button>
+        <button id="events-tab" aria-pressed="true">Events</button>
         <button id="commands-tab" aria-pressed="false">SSM commands</button>
         <button
           id="inventory-tab"
@@ -571,6 +571,8 @@
             </span>
           </div>
           <div class="review-toolbar">
+            <button id="add-manual-event" type="button">Add key event</button>
+            <span id="manual-save-status" role="status"></span>
             <span id="selected-count" role="status">0 selected</span>
             <button
               id="add-to-note"
@@ -586,7 +588,7 @@
               Clear selection
             </button>
             <span id="stale" hidden
-              >Tags or findings changed since this query ran ·
+              >Events, tags or findings changed since this query ran ·
               <button id="refresh-stale" class="text-button">
                 Refresh results
               </button></span
@@ -1053,6 +1055,54 @@
       <div id="note-preview" class="markdown"></div>
       <button id="save-note" class="primary">Save finding</button>
     </dialog>
+    <dialog id="manual-event-dialog" aria-labelledby="manual-event-title">
+      <form id="manual-event-form">
+        <div class="dialog-heading">
+          <h2 id="manual-event-title">Add key event</h2>
+          <button id="cancel-manual-event" type="button">Cancel</button>
+        </div>
+        <p class="hint">
+          Investigator-entered event, not imported evidence. Edits keep tags and
+          Findings and retain prior revisions.
+        </p>
+        <label for="manual-date">Event date (with timezone offset)</label>
+        <input
+          id="manual-date"
+          type="text"
+          required
+          placeholder="2026-11-17T10:00:00+08:00"
+        />
+        <label for="manual-content-mode">Content format</label>
+        <select id="manual-content-mode">
+          <option value="text">Text</option>
+          <option value="json">JSON (nested content supported)</option>
+        </select>
+        <label for="manual-content">Content</label>
+        <textarea id="manual-content" rows="8" required></textarea>
+        <label for="manual-origin">Origin / basis for this event</label>
+        <input
+          id="manual-origin"
+          required
+          maxlength="2000"
+          placeholder="For example: investigator review of payment statement"
+        />
+        <label for="manual-author"
+          >Entered / edited by (optional, self-reported)</label
+        >
+        <input id="manual-author" maxlength="2000" />
+        <label for="manual-ip">IP address (optional)</label>
+        <input id="manual-ip" placeholder="IPv4 or IPv6" />
+        <label for="manual-identity">Identity (optional)</label>
+        <input id="manual-identity" />
+        <p id="manual-error" role="alert"></p>
+        <button id="save-manual-event" type="submit" class="primary">
+          Save event and refresh
+        </button>
+        <p class="hint">
+          Current timeline filters and time range remain applied after saving.
+        </p>
+      </form>
+    </dialog>
     <dialog id="detail" aria-labelledby="detail-title">
       <div class="dialog-heading">
         <div>
@@ -1060,6 +1110,7 @@
           <span id="detail-id"></span>
         </div>
         <span class="detail-actions">
+          <button id="edit-manual-event" hidden>Edit key event</button>
           <button id="detail-prev" title="Previous loaded event (K)">
             ← Prev
           </button>
@@ -1073,6 +1124,14 @@
       <div id="event-command-links" class="command-links"></div>
       <pre id="raw-event"></pre>
       <div id="record-hash"></div>
+      <details>
+        <summary>Source provenance</summary>
+        <pre id="event-provenance"></pre>
+      </details>
+      <details id="event-revisions-section" hidden>
+        <summary>Previous revisions</summary>
+        <div id="event-revisions"></div>
+      </details>
     </dialog>
     <dialog id="sheet-cell-dialog" aria-labelledby="sheet-cell-title">
       <div class="dialog-heading">

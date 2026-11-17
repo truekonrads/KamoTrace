@@ -85,7 +85,7 @@ def main():
                 expect(page.locator("#load-status")).to_have_text("3 loaded · all")
                 expect(rows).to_have_count(3)
                 for row in rows.all():
-                    expect(row.locator('[tabulator-field="event_name"] .cell-text')).to_have_text("SendCommand")
+                    expect(row.locator('[tabulator-field="summary"] .cell-text')).to_have_text("SendCommand")
                 page.screenshot(path=str(results / "search.png"))
 
                 zone = page.get_by_role("combobox", name="Timezone", exact=True)
@@ -153,7 +153,7 @@ def main():
                     assert {r["event_id"] for r in result["data"]} == {"event-0", "event-2", "event-3"}
                 expect(rows).to_have_count(3)
                 for row in rows.all():
-                    expect(row.locator('[tabulator-field="event_name"] .cell-text')).to_have_text("SendCommand")
+                    expect(row.locator('[tabulator-field="summary"] .cell-text')).to_have_text("SendCommand")
                 expect(page.locator("#scopes")).to_contain_text("SendCommand")
                 page.screenshot(path=str(results / "pipeline-hybrid-preserved.png"))
                 # A single pipeline search plus an external search is not one plain-text query.
@@ -590,6 +590,30 @@ def main():
                 page.locator("#collapse-sidebar").click()
                 expect(page.locator("#rail")).to_be_visible()
                 expect(rows).to_have_count(5)
+                page.locator("#add-manual-event").click()
+                page.locator("#manual-date").fill("2026-10-25T10:00:00+08:00")
+                page.locator("#manual-content-mode").select_option("json")
+                content = '{"description":"Manual synthetic payment","reference":9007199254740993,"fraction":0.123456789012345678901}'
+                page.locator("#manual-content").fill(content)
+                page.locator("#manual-origin").fill("Synthetic statement review")
+                page.locator("#save-manual-event").click()
+                expect(page.locator("#load-status")).to_have_text("6 loaded · all")
+                manual = rows.filter(has_text="Manual synthetic payment")
+                expect(manual).to_have_count(1)
+                manual.locator('[tabulator-field="summary"] .cell-text').click()
+                expect(page.locator("#detail-title")).to_have_text("Investigator-entered key event")
+                page.locator("#edit-manual-event").click()
+                expect(page.locator("#manual-event-dialog")).to_be_visible()
+                saved_content = page.locator("#manual-content").input_value()
+                assert "9007199254740993" in saved_content and "0.123456789012345678901" in saved_content
+                page.locator("#manual-content").fill(saved_content.replace("Manual synthetic payment", "Corrected synthetic payment"))
+                page.locator("#save-manual-event").click()
+                expect(rows.filter(has_text="Corrected synthetic payment")).to_have_count(1)
+                rows.filter(has_text="Corrected synthetic payment").locator('[tabulator-field="summary"] .cell-text').click()
+                expect(page.locator("#raw-event")).to_contain_text("9007199254740993")
+                page.locator("#event-revisions-section > summary").click()
+                expect(page.locator("#event-revisions")).to_contain_text("Manual synthetic payment")
+                page.screenshot(path=str(results / "manual-key-event.png"))
                 assert not errors, f"Browser JavaScript errors: {errors}"
                 print("PASS: event search/timezone/history, hybrid pipeline scopes, shortcut draft races, autocomplete/newlines, reference cards, inventory map/tables/coverage, tab state, error/retry and no-snapshot; no JavaScript errors.")
             except Exception:

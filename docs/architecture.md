@@ -19,6 +19,7 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `download.py` | Checkpointed collection of selected CloudTrail, SSM, GuardDuty and inventory data using an existing AWS login. |
 | `trailcheck.py`, `ssmcheck.py`, `aws_policy.py` | Audit collection configuration/coverage and generate reviewable permission templates; never grant permissions or change AWS configuration. |
 | `importer.py` | Stream CloudTrail JSON into evidence DuckDB, verify canonical hashes and provenance, and provide output locking/staging/publication helpers. |
+| `other_events.py` | Stream provider-neutral JSONL into immutable DuckDB datasets and publish revisioned investigator-entered manual events separately. |
 | `suzaku.py`, `guardduty.py`, `enrich.py` | Build evidence-bound derived sidecars and load them read-only for investigation. |
 | `get_suzaku.py`, `get_dbip.py` | Download and verify optional external tools/data, separately from the application distribution. |
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
@@ -67,6 +68,10 @@ and the temporary relations used to join them. One server must own a given
 annotations sidecar: another process would have its own stale temporary copy.
 Browser and MCP writes go through that Store, including optimistic note-edit
 checks. Sidecars and exports are loaded at startup, not live-watched.
+
+`other_events.py` uses the same event-column contract for immutable JSONL datasets, with explicit `other` labels, origin manifests, exact JSON numbers and namespaced review keys. Store attaches additional datasets read-only, then builds one temporary `events`/`browse_events` projection used by the shared query compiler, tag/Findings joins, histograms, exports and MCP. AWS linkage loaders run against the primary dataset before this union, so generic events cannot acquire guessed SSM or detection links. A generic import can also be the primary dataset of an AWS-free case.
+
+Manual key events persist in `<database stem>.manual.duckdb`, bound to the primary import identity. Create/edit validates a record, holds the existing output lock, copies a positively identified manual dataset into private staging, retains the old revision and atomically publishes the replacement. Store updates its temporary manual snapshot under the query lock. Manual events use stable namespaced review keys, separate from changing `content_sha256`; imported records remain immutable. Edits require the current `updated` stamp. Revision authors are self-reported. The small investigator-authored dataset is copied per write; large external datasets use streamed immutable imports, not this write path. One Store/server must own the case. See the [public contract](user-guide.md#other-events-and-manual-key-events).
 
 The supporting components answer different questions:
 

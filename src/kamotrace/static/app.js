@@ -3339,6 +3339,75 @@ function loadStatus() {
 }
 
 // ---- Event inspector (non-modal side panel) -------------------------------------------------
+let editingManual = null;
+
+function manualEditor(row = null, data = null) {
+  editingManual = row ? { id: row.id, updated: data.updated } : null;
+  $("manual-event-title").textContent = row
+    ? "Edit key event"
+    : "Add key event";
+  $("manual-date").value = data?.editor.date || new Date().toISOString();
+  $("manual-content-mode").value = data ? "json" : "text";
+  $("manual-content").value = data?.editor.content_json || "";
+  $("manual-origin").value = data?.origin || "";
+  $("manual-author").value = data?.author || "";
+  $("manual-ip").value = data?.editor.ip || "";
+  $("manual-identity").value = data?.editor.identity || "";
+  $("manual-error").textContent = "";
+  $("manual-event-dialog").showModal();
+  $("manual-content").focus();
+}
+
+async function saveManual(event) {
+  event.preventDefault();
+  const button = $("save-manual-event");
+  if (button.disabled) return;
+  const controls = $("manual-event-form").querySelectorAll(
+    "input, textarea, select, button",
+  );
+  controls.forEach((control) => {
+    control.disabled = true;
+  });
+  $("manual-error").textContent = "";
+  try {
+    // Embed JSON content as text, not parsed numbers. Server validation owns its syntax.
+    const content =
+      $("manual-content-mode").value === "json"
+        ? $("manual-content").value
+        : JSON.stringify($("manual-content").value);
+    JSON.parse(content); // Validate one JSON value only; discard parsed numbers and save the original text.
+    const fields = { date: $("manual-date").value };
+    if ($("manual-ip").value) fields.ip = $("manual-ip").value;
+    if ($("manual-identity").value)
+      fields.identity = $("manual-identity").value;
+    const record =
+      JSON.stringify(fields).slice(0, -1) + ',"content":' + content + "}";
+    await request("/api/manual-events", {
+      ...editingManual,
+      record_json: record,
+      origin: $("manual-origin").value,
+      author: $("manual-author").value,
+    });
+    $("manual-event-dialog").close();
+    $("detail").close();
+    $("manual-save-status").textContent =
+      "Saved · current filters and time range still apply";
+    meta = await request("/api/meta", { timezone: meta.timezone });
+    await apply(applied, false);
+  } catch (e) {
+    if ($("manual-event-dialog").open)
+      $("manual-error").textContent = e.message;
+    else {
+      error("Event saved, but results could not refresh: " + e.message);
+      $("stale").hidden = false;
+    }
+  } finally {
+    controls.forEach((control) => {
+      control.disabled = false;
+    });
+  }
+}
+
 function openDetail() {
   if (!$("detail").open) $("detail").show();
 }
@@ -3425,8 +3494,30 @@ async function detail(row) {
     detailRow = row.record_sha256
       ? { ...row, guardduty_findings: data.guardduty_findings }
       : null;
+    $("detail-title").textContent =
+      data.event_type === "manual"
+        ? "Investigator-entered key event"
+        : data.event_type === "other"
+          ? "Imported other event"
+          : "Original CloudTrail event";
+    $("edit-manual-event").hidden = data.event_type !== "manual";
+    $("edit-manual-event").onclick = () => manualEditor(row, data);
+    $("event-provenance").textContent = JSON.stringify(
+      data.provenance,
+      null,
+      2,
+    );
+    $("event-revisions").replaceChildren();
+    $("event-revisions-section").hidden = !data.revisions?.length;
+    for (const revision of data.revisions || []) {
+      const heading = document.createElement("p");
+      heading.textContent = `${revision.updated} · ${revision.author || "Author not supplied"} · ${revision.origin}`;
+      const raw = document.createElement("pre");
+      raw.textContent = revision.raw_json;
+      $("event-revisions").append(heading, raw);
+    }
     $("detail-id").textContent =
-      `${data.event_id} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
+      `${data.event_id || data.event_type} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
     const loaded = table
       .getRows()
       .find((item) => item.getData().id === row.id)
@@ -3457,7 +3548,11 @@ async function detail(row) {
     }
     $("raw-event").textContent = output;
     $("record-hash").textContent =
-      "Canonical record SHA-256: " + data.record_sha256;
+      "Content SHA-256: " +
+      data.content_sha256 +
+      (data.event_type !== "cloudtrail"
+        ? " · Stable review key: " + data.record_sha256
+        : "");
     const rows = table.getRows();
     const index = rows.findIndex((r) => r.getData().id === row.id);
     $("detail-prev").hidden = $("detail-next").hidden = index < 0;
@@ -3977,6 +4072,12 @@ async function init() {
       color: $("recolor").value,
     });
   $("events-tab").onclick = () => switchView(false);
+  $("add-manual-event").onclick = () => manualEditor();
+  $("cancel-manual-event").onclick = () => $("manual-event-dialog").close();
+  $("manual-event-dialog").oncancel = (event) => {
+    if ($("save-manual-event").disabled) event.preventDefault();
+  };
+  $("manual-event-form").onsubmit = saveManual;
   $("commands-tab").onclick = () => switchView(true);
   $("inventory-tab").onclick = () => switchView(false, true, true);
   $("show-sql").onclick = () => {
@@ -4566,8 +4667,9 @@ async function init() {
         formatter: detectionCell,
       },
       textColumn("Local time", "time_local", 150, { cssClass: "tabular-cell" }),
-      textColumn("Operation", "event_name", 180),
-      textColumn("AWS service", "event_source", 170),
+      textColumn("Type", "event_type", 100),
+      textColumn("Operation / content", "summary", 240),
+      textColumn("Service / origin", "source_label", 190),
       textColumn("Identity", "identity", 330),
       textColumn("Source IP", "source_ip", 130, { cssClass: "mono-cell" }),
       textColumn("Country", "country", 120),
@@ -4693,6 +4795,7 @@ async function init() {
   );
   $("column-summary").addEventListener("close", () => ++summaryRequest);
   document.addEventListener("keydown", (e) => {
+    if ($("manual-event-dialog").open) return;
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
     if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
       e.preventDefault();

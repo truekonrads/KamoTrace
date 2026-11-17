@@ -2701,5 +2701,140 @@ class MFAContract(unittest.TestCase):
         self.assertEqual([m["identity"]["event_count"] for m in session["matches"] if m["source"] == "cloudtrail"], [1])
 
 
+class OtherEventsContract(unittest.TestCase):
+    call = BrowserContract.call
+
+    def test_jsonl_validation_batches_and_provenance(self):
+        from kamotrace.cli import main
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, database = root / "payments.jsonl.gz", root / "other.duckdb"
+            row = '{"date":"2026-10-25T00:00:00+08:00","content":{"amount":9007199254740993,"fraction":0.123456789012345678901}}'
+            source.write_bytes(gzip.compress(((row + "\n") * 1001).encode()))
+            self.assertEqual(main(["import-other", "--source", str(source), "--database", str(database),
+                                   "--origin", "Synthetic ledger export, converted to JSONL"]), 0)
+            store = Store(database)
+            try:
+                self.assertEqual(store.meta["total"], 1001)
+                result = store.query({"size": 25, "page": 41, "raw_fields": ["raw.content.amount", "raw.content.fraction"]})
+                self.assertEqual(result["data"][0]["raw_fields"]["raw.content.amount"]["value"], "9007199254740993")
+                self.assertEqual(result["data"][0]["raw_fields"]["raw.content.fraction"]["value"], "0.123456789012345678901")
+                store.review_write({"action": "tag", "hashes": [result["data"][0]["record_sha256"]],
+                                    "slug": "duplicates", "color": "#c45436"})
+                self.assertEqual(store.query({"tags": ["duplicates"]})["last_row"], 1001)
+                detail = store.detail(1001)
+                self.assertEqual(detail["provenance"]["source_ordinal"], 1001)
+                self.assertEqual(detail["provenance"]["imports"][0]["sources"][0]["source_sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+            finally:
+                store.connection.close()
+                store.reviews.close()
+            before = database.read_bytes()
+            with self.assertRaises(SystemExit):
+                main(["import-other", "--source", str(source), "--database", str(database), "--origin", "Replacement"])
+            self.assertEqual(database.read_bytes(), before)
+            for invalid in ('{}', '{"date":"2026-10-25","content":"x"}',
+                            '{"date":"2026-10-25T00:00:00Z","content":null}',
+                            '{"date":"2026-10-25T00:00:00Z","content":"x","ip":"not-an-ip"}'):
+                with self.subTest(invalid=invalid):
+                    bad = root / "invalid.jsonl"
+                    bad.write_text(row + "\n" + invalid)
+                    output = root / "invalid.duckdb"
+                    with self.assertRaises(SystemExit):
+                        main(["import-other", "--source", str(bad), "--database", str(output), "--origin", "Test"])
+                    self.assertFalse(output.exists())
+
+    def test_combined_timeline_manual_edits_reviews_and_mcp(self):
+        from kamotrace.other_events import build as import_other
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
+            root = Path(folder)
+            aws, other = root / "aws.duckdb", root / "other.duckdb"
+            source = root / "aws.json"
+            source.write_text('{"Records":[{"eventTime":"2026-10-24T16:00:00Z","eventID":"aws-1","eventName":"ConsoleLogin"}]}')
+            build(source, aws)
+            source = root / "other.jsonl"
+            source.write_text('\n{"date":"2026-10-25T00:00:00+08:00","content":{"payment":9007199254740993},"ip":"2001:db8::1","identity":"customer-42"}\n'
+                              '{"date":"2026-10-25T00:00:01+08:00","content":"later"}')
+            import_other([source], other, "Synthetic payment ledger")
+            original = {p: p.read_bytes() for p in (aws, other)}
+            store = Store(aws, other_events=[other])
+            cleanup.callback(store.connection.close)
+            cleanup.callback(store.reviews.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            cleanup.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            cleanup.callback(thread.join)
+            cleanup.callback(server.shutdown)
+            self.url = f"http://127.0.0.1:{server.server_port}"
+            server.mcp_request = cleanup.enter_context(http_transport(self.url))
+
+            def rest(route, body=None, status=200):
+                code, value = self.call(route, body)
+                self.assertEqual(code, status, value)
+                return value
+
+            self.assertEqual({r["event_type"] for r in rest("/api/events", {})["data"]}, {"other", "cloudtrail"})
+            other_rows = rest("/api/events", {"filters": [{"field": "event_type", "op": "eq", "value": "other"}]})["data"]
+            self.assertTrue(all(r["event_name"] is None and r["event_source"] is None for r in other_rows))
+            self.assertTrue(all(r["source_label"] == "Synthetic payment ledger" for r in other_rows))
+            self.assertEqual(rest("/api/meta")["facets"]["event_name"], ["ConsoleLogin"])
+            selection = {"start": "2026-10-25T00:00:00+08:00", "end": "2026-10-25T00:00:01+08:00",
+                         "pipeline_version": 1, "pipeline": 'event_type = "other" OR event_type = "cloudtrail"'}
+            self.assertEqual(rest("/api/events", selection)["last_row"], 2)
+            self.assertEqual(rest("/api/histogram", selection)["total"], 2)
+            raw = '{"date":"2026-10-25T00:00:00+08:00","content":{"description":"Unauthorised payment <script>neverRun()</script>","amount":9007199254740993,"fraction":0.123456789012345678901}}'
+            new = rest("/api/manual-events", {"record_json": raw, "origin": "Statement review", "author": "Analyst one"})
+            rest("/api/reviews", {"action": "tag", "hashes": [new["record_sha256"]], "slug": "key-event", "color": "#c45436"})
+            note = rest("/api/reviews", {"action": "annotate", "hashes": [new["record_sha256"]], "body": "Synthetic finding"})
+            changed = {"id": new["id"], "updated": new["updated"], "record_json": raw.replace("Unauthorised payment", "Corrected payment"),
+                       "origin": "Statement review, corrected", "author": "Analyst two"}
+            edit = rest("/api/manual-events", changed)
+            self.assertEqual(edit["record_sha256"], new["record_sha256"])
+            rest("/api/manual-events", changed, status=409)
+            rest("/api/manual-events", {**changed, "id": 2}, status=400)
+            detail = rest(f"/api/events/{new['id']}")
+            self.assertIn("9007199254740993", detail["editor"]["content_json"])
+            self.assertIn("0.123456789012345678901", detail["editor"]["content_json"])
+            self.assertEqual(detail["revisions"][0]["author"], "Analyst one")
+            self.assertIn("Unauthorised payment", detail["revisions"][0]["raw_json"])
+            self.assertEqual(hashlib.sha256(detail["raw_json"].encode()).hexdigest(), detail["content_sha256"])
+            tagged = rest("/api/events", {"tags": ["key-event"], "annotation_id": note["id"]})
+            self.assertEqual([r["id"] for r in tagged["data"]], [new["id"]])
+            self.assertEqual(rest("/api/column-values", {"field": "event_type"})["total"], 4)
+            export = rest("/api/exports", {"dataset": "events", "selection": {"tags": ["key-event"]}})
+            cleanup.callback(store.exports.close)
+            with urlopen(export["download_url"]) as response:
+                exported = [json.loads(line) for line in response.read().splitlines()]
+            self.assertEqual(exported[1]["provenance"]["origin"], changed["origin"])
+            self.assertEqual(exported[1]["raw_json"], detail["raw_json"])
+
+            async def session():
+                async with Client(self.url + "/mcp") as client:
+                    schema = await client.call_tool("describe_schema", {})
+                    self.assertTrue(schema.structured_content["manual_events_writable"])
+                    result = await client.call_tool("search_events", {"query": {"pipeline_version": 1, "pipeline": 'event_type = "manual"'}})
+                    self.assertEqual(result.structured_content["total"], 1)
+                    event = await client.call_tool("get_event", {"id": new["id"]})
+                    self.assertTrue(event.structured_content["raw_json_matches_hash"])
+                    added = await client.call_tool("create_manual_event", {"record_json": raw, "origin": "MCP analyst note"})
+                    self.assertFalse(added.is_error, added)
+                    value = added.structured_content
+                    amended = await client.call_tool("edit_manual_event", {"id": value["id"], "updated": value["updated"],
+                        "record_json": raw.replace("Unauthorised", "Reported"), "origin": "MCP analyst correction"})
+                    self.assertFalse(amended.is_error, amended)
+            anyio.run(session)
+            cleanup.close()  # Reopen after stopping the sole owner of the case and annotations.
+            reopened = Store(aws, other_events=[other])
+            try:
+                self.assertEqual(reopened.query({"tags": ["key-event"]})["last_row"], 1)
+                self.assertEqual(reopened.meta["total"], 5)
+                self.assertEqual(reopened.detail(new["id"])["raw_json"], detail["raw_json"])
+            finally:
+                reopened.connection.close()
+                reopened.reviews.close()
+            for path, before in original.items():
+                self.assertEqual(path.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

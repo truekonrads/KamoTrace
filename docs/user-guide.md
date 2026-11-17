@@ -20,6 +20,7 @@ For implementation responsibilities and rationale, see
 - [Add offline IP enrichment](#ip-enrichment)
 - [Browse AWS inventory and map](#aws-inventory-and-map)
 - [Record findings and tag events](#findings-and-event-tags)
+- [Combine other events and editable key events](#other-events-and-manual-key-events)
 - [Search and inspect CloudTrail events](#cloudtrail-workflow)
 - [Browse SSM commands and output](#ssm-command-browser-desktop)
 - [Check where SSM logs sessions and commands](#ssm-logging-check)
@@ -330,6 +331,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | --- | --- |
 | `kamotrace auto CASE_FOLDER [options]` | [Full-auto](#full-auto-preparation): tools, AWS download, import, enrichment, detections, then `serve`; rerun to resume |
 | `kamotrace import --source FILE_OR_FOLDER... --database NEW.duckdb` | Combine CloudTrail JSON/gzip exports; repeat `--source`, or use `-` for binary stdin |
+| `kamotrace import-other --source FILE.jsonl... --database NEW.duckdb --origin TEXT` | Import provider-neutral events with documented origin; plain or gzip JSONL |
 | `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume selected CloudTrail, SSM, GuardDuty or inventory collection with an existing AWS login; CloudTrail/SSM by default |
 | `kamotrace inventory [--output FOLDER] [--emit-policy PATH\|-]` | [Current network and IAM inventory](#aws-inventory-and-map); policy-only mode without `--output` makes no AWS calls |
 | `kamotrace policy [--output PATH\|-] [--bucket NAME]... [--kms-key ARN]... [--validate \| --validate-file PATH]` | [Combined collection policy](preparation.md#aws-collection-iam-policy) for CloudTrail, SSM and inventory; offline generation, optional AWS IAM Access Analyzer validation |
@@ -995,6 +997,37 @@ Use the bar above the grid to work with selected events:
   belongs to (the import's source hash and record count), older sidecars
   included. Opening it with a different database is refused, so one case's
   notes can't be mixed into another's.
+
+## Other events and manual key events
+
+The **Events** timeline combines CloudTrail, imported other events and investigator-entered key events. The **Type** column distinguishes `cloudtrail`, `other` and `manual`; filter it with **+ Filter** or `event_type = "manual"` in Pipeline mode. **Operation / content** shows the AWS operation or a bounded content preview; **Service / origin** shows the AWS service or documented origin. Search covers full raw records, not only previews. The optional identity is free text, not an asserted AWS principal.
+
+### Import other events
+
+Use UTF-8 JSONL, one object per nonblank line. Required fields are `date` (RFC 3339 timestamp including seconds and an explicit `Z`/offset) and non-null `content` (text, nested object/array, number or boolean). Optional `ip` must be IPv4/IPv6 and `identity` must be text; omit unknown values. No other top-level keys are accepted: place provider-specific fields inside `content`. Numbers retain their precision. Example:
+
+```json
+{"date":"2026-10-25T09:30:00+08:00","content":{"description":"Unauthorised payment","amount":123.45,"reference":"synthetic-payment"},"identity":"customer-42"}
+```
+
+```powershell
+kamotrace import-other --source payments.jsonl tickets.jsonl.gz --database other.duckdb --origin "Synthetic ledger and ticket exports; converted to JSONL by the investigator"
+kamotrace serve --database case.duckdb --other-events other.duckdb
+```
+
+`--other-events` is repeatable and accepts only `import-other` databases. For a case without AWS logs, use `kamotrace serve --database other.duckdb` instead. Imports stream in batches to a new immutable DuckDB; an invalid line rejects the entire import without publishing a partial database. Existing datasets are never overwritten. Every import requires an origin description; retain originals for reproducibility. Details and exports include schema version, origin, import time, source-file byte hashes/sizes and the one-based original line locator (including blank lines). Gzip hashes cover compressed bytes. Restart the server to load newly imported datasets.
+
+### Add and edit key events
+
+Choose **Add key event**. Enter its date with timezone offset, text or JSON content, required origin/basis and optional self-reported author, IP and identity. Open a manual event and choose **Edit key event** to change it. Nested JSON is edited as text, so opening and saving never rounds numbers through JavaScript. **Save event and refresh** explicitly reruns the current timeline selection; it does not clear filters or widen the time range. A saved event outside that selection will not appear until you adjust it.
+
+Manual events are investigator statements, not imported source evidence. They persist in `<database stem>.manual.duckdb`, separate from the primary evidence and SQLite reviews. Each edit retains prior content, origin, author and timestamps, viewable under **Previous revisions**. An edit must supply the current `updated` stamp; conflicting edits fail without replacing the draft. Cancel and reopen the event before reconciling a conflict. Author is self-reported, not authenticated. Deletion is not supported.
+
+Tags and Findings work across all three types. `record_sha256` remains the review key: CloudTrail uses its existing canonical hash, imported other records use a namespaced canonical-content hash, and manual events use a stable identity that does not change when edited. Identical imported other records share reviews; separately created manual events do not. `content_sha256` checks the current stored JSON. The inspector displays both where they differ and always renders content as plaintext. AWS-only fields and exact SSM/detection links are not invented for other events.
+
+The primary database still binds the SQLite annotation sidecar to the case. Additional explicitly supplied other-event datasets can be added or removed without discarding existing CloudTrail reviews; reviews for absent records remain stored. Numeric row IDs are opaque runtime locators and may change when attached dataset order changes. Back up the primary/other DuckDB files, `.manual.duckdb` and `.annotations.sqlite3` together with the server stopped; one server must own a case's writable state.
+
+MCP clients use the same timeline tools and `event_type`/`origin` filters. `create_manual_event(record_json, origin, author?)` creates one key event; `edit_manual_event(id, updated, record_json, origin, author?)` replaces a manual event while preserving its reviews. Pass exact record JSON as a string; read `get_event` before editing. Neither API accepts paths, SQL or imported-record modifications.
 
 ## CloudTrail workflow
 

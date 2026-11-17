@@ -22,6 +22,11 @@ SCALARS = {
     "city": ("City", "Offline IP city lookup"),
     "asn": ("ASN", "Offline IP autonomous system number"),
     "ip_info": ("IP attributes", "Offline IP enrichment attributes"),
+    "event_type": ("Event type", "cloudtrail, other (imported), or manual (investigator-entered)"),
+    "origin": ("Origin", "Documented source of imported or manually entered other events"),
+    "content_preview": ("Content preview", "First 240 characters of other-event content; search/raw paths cover full content"),
+    "summary": ("Operation / content", "CloudTrail operation or bounded other-event content preview"),
+    "source_label": ("Service / origin", "CloudTrail service or documented other-event origin"),
 }
 SCALAR_OPS = ["=", "!=", "in", "contains", "is missing", "is not missing", "is empty", "is not empty"]
 FIELDS = {key: {"label": label, "description": description, "operators": SCALAR_OPS[:]}

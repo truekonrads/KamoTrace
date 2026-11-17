@@ -222,6 +222,7 @@ def build_query(body, scalar_function):
         raise ValueError("Invalid page or page size")
     where = "\nWHERE " + "\n  AND ".join(conditions) if conditions else ""
     sql = ("SELECT id, record_sha256, time_local, event_name, event_source, identity, source_ip, country,\n"
+           "       event_type, origin, content_preview, summary, source_label, updated,\n"
            "       identity_type, key_id, target, document_name, error_code, region, isp, city, asn, ip_info, user_agent, event_id\n"
            + "".join(f", {raw[f]}.value AS {raw[f]}, {raw[f]}.json_type AS {raw[f]}_type\n"
                      for f in dict.fromkeys(body.get("raw_fields", []))) +
@@ -230,7 +231,7 @@ def build_query(body, scalar_function):
 
 
 class Store:
-    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None):
+    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=()):
         with ExitStack() as startup:
             logger.info("Opening evidence database (read-only): %s", database)
             self.connection = duckdb.connect(str(database), read_only=True)
@@ -300,22 +301,25 @@ class Store:
             self.reference_enrichment = {row[0]: dict(zip(("country", "city", "asn", "isp", "ip_info"), row[1:]))
                 for row in self.connection.execute("SELECT ip, country, city, asn, isp, ip_info FROM ip_enrichment").fetchall()}
             self.startup_timing("enrichment", stage_started)
-            logger.info("Preparing event browser view")
-            self.connection.execute("""
+            # AWS-only sidecars load against the primary immutable database before the combined view.
+            browse_view = """
                 CREATE TEMP VIEW browse_events AS
                 SELECT e.source_record AS id, e.record_sha256, e.event_id, e.event_time,
                     strftime(e.event_time AT TIME ZONE 'UTC', '%Y-%m-%d %H:%M:%S') AS time_local,
                     e.event_source, e.event_name, e.source_ip, e.identity_type,
-                    coalesce(e.identity_arn, e.user_identity->>'$.userName',
+                    coalesce(e.event_name, e.content_preview) AS summary,
+                    coalesce(e.event_source, e.origin) AS source_label,
+                    coalesce(e.generic_identity, e.identity_arn, e.user_identity->>'$.userName',
                         e.user_identity->>'$.principalId', e.user_identity->>'$.invokedBy', '(unattributed)') AS identity,
                     e.user_identity->>'$.accessKeyId' AS key_id,
                     coalesce(e.request_parameters->>'$.target', e.request_parameters->>'$.instanceIds',
                         e.request_parameters->>'$.instanceId') AS target,
                     e.request_parameters->>'$.documentName' AS document_name,
                     e.error_code, e.aws_region AS region, e.user_agent, e.raw_event,
+                    e.event_type, e.origin, e.content_preview, e.updated,
                     coalesce(g.country, '(unmapped / service / private)') AS country, g.isp, g.city, g.asn, g.ip_info
                 FROM events e LEFT JOIN ip_enrichment g ON e.source_ip = g.ip
-            """)
+            """
             from .ssm import Commands
             from .suzaku import load_detections
             logger.info("Loading and linking SSM commands: %s", ssm_export or "none (no export supplied)")
@@ -349,6 +353,8 @@ class Store:
             stage_started = time.monotonic()
             self.guardduty_run = load_guardduty(self.connection, guardduty)
             self.startup_timing("guardduty", stage_started)
+            self.prepare_other_events(database, other_events, identity)
+            self.connection.execute(browse_view)
             # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
             self.connection.execute("SET enable_external_access=false")
             logger.info("Calculating event counts, time range and filter metadata")
@@ -357,6 +363,48 @@ class Store:
             self.startup_timing("metadata", stage_started)
             # The Store owns both connections after initialization succeeds.
             startup.pop_all()
+
+    def prepare_other_events(self, database, paths, identity):
+        from .other_events import EVENTS_VIEW, FORMAT, MANUAL_BASE, RAW_SCHEMA, manual_rows
+        self.case_identity = json.loads(identity)
+        self.manual_path = database.with_suffix(".manual.duckdb")
+        self.connection.execute(f"CREATE TEMP TABLE manual_raw ({RAW_SCHEMA})")
+        rows = manual_rows(self.manual_path, self.case_identity)
+        if rows:
+            self.connection.executemany("INSERT INTO manual_raw VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+        catalog = self.connection.execute("SELECT current_database()").fetchone()[0].replace('"', '""')
+        primary = f'"{catalog}".main.events'
+        info = json.loads(self.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
+        self.event_sources = [info]
+        aws_extra = """, 'cloudtrail'::VARCHAR AS event_type, NULL::VARCHAR AS origin,
+            NULL::VARCHAR AS generic_identity, NULL::VARCHAR AS content_preview,
+            NULL::VARCHAR AS author, NULL::VARCHAR AS created, NULL::VARCHAR AS updated,
+            record_sha256 AS content_sha256"""
+        selects = ["SELECT *" + ("" if info.get("format") == FORMAT else aws_extra) + ", 0 AS dataset_index FROM " + primary]
+        offset = int(info["records"])
+        for index, path in enumerate(paths):
+            alias = f"other_{index}"
+            # Only trusted startup CLI paths; HTTP requests never supply paths.
+            self.connection.execute(f"ATTACH '{str(Path(path).resolve()).replace(chr(39), chr(39)*2)}' AS {alias} (READ_ONLY)")
+            metadata = json.loads(self.connection.execute(f"SELECT metadata FROM {alias}.build_info").fetchone()[0])
+            if metadata.get("format") != FORMAT:
+                raise ValueError("--other-events requires a dataset built by import-other")
+            self.event_sources.append(metadata)
+            selects.append(f"SELECT * REPLACE (source_record + {offset} AS source_record), {index + 1} AS dataset_index FROM {alias}.events")
+            offset += int(metadata["records"])
+        if offset >= MANUAL_BASE:
+            raise ValueError("Too many imported events for exact browser row identifiers")
+        selects.append("SELECT *, -1 AS dataset_index FROM (" + EVENTS_VIEW.replace("FROM raw_events", "FROM manual_raw") + ")")
+        self.connection.execute("CREATE TEMP VIEW events AS " + " UNION ALL ".join(selects))
+
+    def manual_write(self, body):
+        from .other_events import save_manual
+        with self.locked("manual.write"):
+            row = save_manual(self.manual_path, self.case_identity, body)
+            self.connection.execute("DELETE FROM manual_raw WHERE source_record=?", [row[0]])
+            self.connection.execute("INSERT INTO manual_raw VALUES (?,?,?,?,?,?,?,?,?,?)", row)
+            self.meta = self.metadata()
+            return {"id": row[0], "record_sha256": row[2], "updated": row[8]}
 
     def startup_timing(self, stage, started):
         logger.info("startup stage=%s elapsed_ms=%.3f", stage, (time.monotonic() - started) * 1000)
@@ -874,7 +922,8 @@ class Store:
                 "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
                 "levels": LEVELS, "detections_loaded": self.suzaku_run is not None or self.guardduty_run is not None,
                 "enrichment": self.enrichment_run,
-                "timezone": zone, "timezones": TIMEZONES, "database": "cloudtrail.duckdb", "read_only": True}
+                "timezone": zone, "timezones": TIMEZONES, "database": "events.duckdb", "read_only": True,
+                "manual_events_writable": True}
 
     def timezone_metadata(self, body):
         with self.locked("metadata"):
@@ -886,7 +935,7 @@ class Store:
             return datetime.fromtimestamp(ms / 1000, ZoneInfo(zone)).isoformat() if ms is not None else None
         return {"events": self.meta["total"], "timezone": zone,
             "first_event": instant(self.meta["start_ms"]), "end_exclusive": instant(self.meta["end_ms"]),
-            "evidence_read_only": True, "annotations_writable": True,
+            "evidence_read_only": True, "annotations_writable": True, "manual_events_writable": True,
             "fields": FIELDS, "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS),
             "pipeline_version": 1, "pipeline_fields": PIPELINE_FIELDS, "page_sizes": PAGE_SIZES,
             "ssm_summary_fields": SSM_SUMMARY_FIELDS, "ssm_text_fields": SSM_TEXT_FIELDS,
@@ -905,7 +954,7 @@ class Store:
                           else {"search", "search_scope", "start", "end"})
         if set(selection) - selection_keys:
             raise ValueError("Unknown export selection fields: " + ", ".join(sorted(set(selection) - selection_keys)))
-        allowed = (["id", "record_sha256", *FIELDS, "tags", "annotations", "detections", "raw_json", "raw_fields"] if dataset == "events"
+        allowed = (["id", "record_sha256", *FIELDS, "tags", "annotations", "detections", "raw_json", "raw_fields", "provenance", "content_sha256"] if dataset == "events"
                    else ["entry_id", *SSM_SUMMARY_FIELDS, "review", "events", "event_raw_json", "analysis"])
         fields = body.get("fields", allowed)
         if not isinstance(fields, list) or not fields or len(fields) > 40 or any(f not in allowed for f in fields):
@@ -931,8 +980,9 @@ class Store:
                               self.ssm_log({**selection, "page": page, "revision": revision}))
                     revision = result.get("revision")
                     for row in result["data"]:
-                        if dataset == "events" and "raw_json" in fields:
-                            row["raw_json"] = self.detail(row["id"])["raw_json"]
+                        if dataset == "events" and any(f in fields for f in ("raw_json", "provenance", "content_sha256")):
+                            detail = self.detail(row["id"])
+                            row.update({f: detail[f] for f in ("raw_json", "provenance", "content_sha256") if f in fields})
                         if dataset == "ssm" and "event_raw_json" in fields:
                             row["event_raw_json"] = [{k: self.commands.events[e["key"]][k]
                                 for k in ("key", "source", "record_sha256", "raw_json")} for e in row["events"]]
@@ -1051,9 +1101,32 @@ class Store:
 
     def detail(self, record):
         with self.locked("event.detail"):
-            rows = self.rows("SELECT event_id, record_sha256, raw_event::VARCHAR AS raw_json FROM events WHERE source_record=?",
+            rows = self.rows("""SELECT event_id, record_sha256, raw_event::VARCHAR AS raw_json,
+                event_type, origin, author, created, updated, content_sha256, source_file, source_ordinal, dataset_index
+                FROM events WHERE source_record=?""",
                              [record], operation="event.detail")
             if rows:
+                row = rows[0]
+                row["provenance"] = {k: row[k] for k in ("event_type", "origin", "author", "created", "updated", "source_file", "source_ordinal")}
+                dataset = row.pop("dataset_index")
+                row["provenance"]["imports"] = [self.event_sources[dataset]] if dataset >= 0 else []
+                # Return exact content text separately so the manual editor never parses JSON numbers.
+                if row["event_type"] == "manual":
+                    from .other_events import json as precise_json, manual_rows
+                    original = precise_json.loads(row["raw_json"], use_decimal=True)
+                    row["editor"] = {"date": original["date"], "ip": original.get("ip"),
+                        "identity": original.get("identity"),
+                        "content_json": precise_json.dumps(original["content"], use_decimal=True, ensure_ascii=False)}
+                    manual_rows(self.manual_path, self.case_identity)
+                    history = duckdb.connect(str(self.manual_path), read_only=True)
+                    try:
+                        row["revisions"] = [dict(zip(("raw_json", "origin", "author", "created", "updated", "content_sha256"), r))
+                            for r in history.execute("""SELECT raw_event::VARCHAR, origin, author, created, updated, content_sha256
+                                FROM revisions WHERE source_record=? ORDER BY updated""", [record]).fetchall()]
+                    finally:
+                        history.close()
+                else:
+                    row["editor"] = None
                 rows[0]["ssm_commands"] = self.commands.for_record(record)
                 rows[0]["detections"] = self.row_detections([record]).get(record, [])
                 rows[0]["guardduty_findings"] = self.rows("""SELECT g.rule_id, g.raw_finding
@@ -1244,7 +1317,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
+        if self.path not in ("/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1255,6 +1328,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object")
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
+                         "/api/manual-events": self.store.manual_write,
                          "/api/schema": self.store.schema, "/api/notes": self.store.notes_read,
                          "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
@@ -1283,7 +1357,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace serve", description=__doc__)
-    parser.add_argument("--database", type=Path, required=True, help="Evidence DuckDB built by `kamotrace import`")
+    parser.add_argument("--database", type=Path, required=True, help="Primary DuckDB built by `kamotrace import` or `import-other`")
     parser.add_argument("--enrichment", type=Path,
                         help="IP enrichment from `kamotrace enrich` (default: <database>.enrichment.duckdb if present)")
     parser.add_argument("--port", type=int, default=8765)
@@ -1295,6 +1369,7 @@ def main(argv=None):
     parser.add_argument("--bind", default=os.environ.get("KAMOTRACE_BIND", "127.0.0.1"),
                         help="Listening address (default: 127.0.0.1, or $KAMOTRACE_BIND inside the container)")
     parser.add_argument("--annotations", type=Path, help="SQLite sidecar (default: beside the evidence database)")
+    parser.add_argument("--other-events", type=Path, action="append", default=[], help="Additional immutable import-other DuckDB (repeatable)")
     parser.add_argument("--ssm-export", type=Path, help="Local ssm_command_session_activity[.enriched].json export")
     parser.add_argument("--inventory-export", type=Path,
                         help="AWS inventory export folder containing report.json; current configuration, not historical evidence")
@@ -1327,7 +1402,7 @@ def main(argv=None):
     try:
         store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
                       args.ssm_export, args.detections and args.detections.resolve(), inventory_export=args.inventory_export,
-                      guardduty=args.guardduty and args.guardduty.resolve())
+                      guardduty=args.guardduty and args.guardduty.resolve(), other_events=args.other_events)
     except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
         parser.error(str(error))
     logger.info("Binding HTTP server to %s:%s", args.bind, args.port)

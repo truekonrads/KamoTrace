@@ -620,6 +620,10 @@ Stdin is spooled to private temporary disk for hashing and independent record
 verification, then deleted. Keep your original inputs for reproducibility and
 Suzaku; a stdin import cannot recreate the incoming original file for you.
 
+#### Other-event JSONL
+
+Use `kamotrace import-other --source events.jsonl --database other.duckdb --origin "Where these events came from and how they were converted"` for arbitrary non-CloudTrail records. Each line requires `date` (RFC 3339 with offset) and non-null `content`; optional `ip` and `identity` are strings. Nested content remains JSON with exact numbers. The command streams plain/gzip JSONL into a new immutable database, retaining file hashes and original line numbers; invalid records fail the whole import. Attach it with `serve --database case.duckdb --other-events other.duckdb`, or serve `other.duckdb` as the primary database for an other-events-only case. See [other events and editable manual key events](user-guide.md#other-events-and-manual-key-events) for the schema, provenance and backup rules. Investigator-entered manual events use a separate revisioned DuckDB and do not modify imported evidence.
+
 ### 4. Add GeoIP information
 
 Enrich source IP addresses before investigating. Country, city and network

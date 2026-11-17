@@ -1859,6 +1859,33 @@ dialog::backdrop {
   filter: drop-shadow(0 8px 8px #0004);
   animation: duck-visit 4.2s ease-in-out both;
 }
+#manual-event-dialog {
+  width: min(650px, calc(100vw - 64px));
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+}
+#manual-event-form > label {
+  display: block;
+  margin: 12px 0 4px;
+  font-weight: 600;
+}
+#manual-event-form > input,
+#manual-event-form > textarea,
+#manual-event-form > select {
+  width: 100%;
+  box-sizing: border-box;
+}
+#manual-content {
+  font-family: var(--font-mono);
+  resize: vertical;
+}
+#manual-error {
+  color: var(--error);
+}
+#manual-save-status {
+  color: var(--muted);
+  max-width: 200px;
+}
 @keyframes duck-visit {
   0%,
   100% {

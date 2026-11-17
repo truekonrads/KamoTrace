@@ -19,6 +19,7 @@ import sys
 COMMANDS = {
     "auto": ("kamotrace.auto", "Full-auto, resumable: tools, AWS download, import, enrichment, detections, then the UI"),
     "import": ("kamotrace.importer", "Load CloudTrail JSON/gzip files, folders or stdin into a new, read-only evidence DuckDB"),
+    "import-other": ("kamotrace.other_events", "Stream other-event JSONL into a new immutable DuckDB with required origin provenance"),
     "download": ("kamotrace.download", "Resume CloudTrail and SSM collection using an existing AWS login"),
     "trailcheck": ("kamotrace.trailcheck", "Read-only audit of trails, logging/delivery state, S3 destinations and log dates"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),
