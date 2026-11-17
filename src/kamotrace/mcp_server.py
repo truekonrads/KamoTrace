@@ -196,7 +196,8 @@ def event_histogram(bucket_minutes: Annotated[int, Field(ge=1, le=525600)] = 144
                     query: Query | None = None) -> dict[str, Any]:
     """Event counts per time bucket (query.timezone-aligned, empty buckets included, at most 2,000 buckets)."""
     result = call("/api/histogram", {**(query or Query()).body(), "bucket_minutes": bucket_minutes})
-    return {"bucket_minutes": result["bucket_minutes"], "total": result["total"], "buckets": result["data"]}
+    return {"bucket_minutes": result["bucket_minutes"], "total": result["total"], "buckets": result["data"],
+            "key_positions": result["key_positions"]}
 
 
 @mcp.tool(annotations=READ)
@@ -211,7 +212,8 @@ def get_event(id: Annotated[int, Field(ge=1, description="The event's `id` from 
 
 @mcp.tool(annotations=WRITE)
 def create_manual_event(record_json: str, origin: str, author: str = "") -> dict[str, Any]:
-    """Add one investigator-entered key event, not imported evidence. record_json is exact JSON text:
+    """Add one investigator-entered manual event, not imported evidence. Prominence uses the key-event tag.
+    record_json is exact JSON text:
     required date (RFC 3339 with offset) and non-null content; optional ip and identity strings.
     Content may be nested JSON; pass numeric literals as text without float conversion.
     origin documents the source/basis; author is optional and self-reported. Returns id, review key and updated.

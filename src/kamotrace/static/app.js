@@ -2504,6 +2504,8 @@ async function refreshReviews() {
   tabLabel("notes-tab", "Findings", reviews.annotations.length);
   renderTags();
   renderNotes();
+  document.querySelector(".key-event-dot").style.color =
+    reviews.tags.find((t) => t.slug === "key-event")?.color || "#7c3aed";
   if (applied) renderScopes();
 }
 
@@ -3026,7 +3028,11 @@ function renderQuickTag() {
       ).length,
     ]),
   );
-  const tags = reviews.tags
+  const tags = (
+    reviews.tags.some((t) => t.slug === "key-event")
+      ? reviews.tags
+      : [{ slug: "key-event", color: "#7c3aed" }, ...reviews.tags]
+  )
     .filter((t) => t.slug.includes(term))
     .sort(
       (a, b) =>
@@ -3035,7 +3041,7 @@ function renderQuickTag() {
     );
   $("quick-tag-list").replaceChildren(
     ...tags.map((tag) => {
-      const count = counts.get(tag.slug);
+      const count = counts.get(tag.slug) || 0;
       const li = document.createElement("li");
       const label = document.createElement("label");
       const box = document.createElement("input");
@@ -3056,7 +3062,14 @@ function renderQuickTag() {
       const state = document.createElement("span");
       state.className = "count";
       state.textContent = n > 1 ? `${count}/${n}` : "";
-      label.append(box, swatch(tag), tag.slug, state);
+      label.append(
+        box,
+        swatch(tag),
+        tag.slug === "key-event"
+          ? "key-event · highlight on timelines"
+          : tag.slug,
+        state,
+      );
       li.append(label);
       return li;
     }),
@@ -3211,9 +3224,14 @@ async function writeReview(body) {
       if (change) Object.assign(detailRow, change);
       detailFindings();
     }
+    if (["tag", "untag", "color"].includes(body.action))
+      refreshKeyMarkers().catch((e) =>
+        error("Tags saved; timeline markers could not refresh: " + e.message),
+      );
     const tagFiltered =
       ["tag", "untag"].includes(body.action) &&
-      applied.tags.includes(body.slug);
+      (applied.tags.includes(body.slug) ||
+        pipelineMembership("tag", body.slug));
     const noteFiltered =
       ["link", "unlink", "delete"].includes(body.action) &&
       applied.annotation_id === id;
@@ -3344,8 +3362,8 @@ let editingManual = null;
 function manualEditor(row = null, data = null) {
   editingManual = row ? { id: row.id, updated: data.updated } : null;
   $("manual-event-title").textContent = row
-    ? "Edit key event"
-    : "Add key event";
+    ? "Edit manual event"
+    : "Add manual event";
   $("manual-date").value = data?.editor.date || new Date().toISOString();
   $("manual-content-mode").value = data ? "json" : "text";
   $("manual-content").value = data?.editor.content_json || "";
@@ -3496,7 +3514,7 @@ async function detail(row) {
       : null;
     $("detail-title").textContent =
       data.event_type === "manual"
-        ? "Investigator-entered key event"
+        ? "Investigator-entered manual event"
         : data.event_type === "other"
           ? "Imported other event"
           : "Original CloudTrail event";
@@ -3675,6 +3693,83 @@ async function columnSummary(title, field, match) {
 }
 
 // ---- Charts -----------------------------------------------------------------------------------
+let markerRequest = 0;
+
+async function refreshKeyMarkers() {
+  if (!lastHistogram || lastHistogram.error || !lastSelection) return;
+  const id = ++markerRequest,
+    queryId = latestQuery,
+    applyId = latestApply,
+    histogram = lastHistogram,
+    selection = lastSelection;
+  const data = await request("/api/histogram", {
+    ...selection,
+    bucket_minutes: histogram.bucket_minutes,
+  }).catch((e) => ({ error: e.message }));
+  if (
+    id !== markerRequest ||
+    queryId !== latestQuery ||
+    applyId !== latestApply ||
+    histogram !== lastHistogram ||
+    selection !== lastSelection
+  )
+    return;
+  if (data.error) throw new Error(data.error);
+  // Only review marks change here. Counts and filtered membership require explicit refresh.
+  lastHistogram.data = lastHistogram.data.map((row, i) => ({
+    ...row,
+    key_events: data.data[i].key_events,
+    key_first_ms: data.data[i].key_first_ms,
+    key_last_ms: data.data[i].key_last_ms,
+  }));
+  lastHistogram.key_positions = data.key_positions;
+  meta.histogram = data.overview;
+  meta.key_positions = data.overview_key_positions;
+  timeline();
+  frequency(lastHistogram, lastContext);
+}
+
+function keyMarker(element, row, positions, x, width, y) {
+  if (!row.key_events) return;
+  const position = (ms) =>
+    x + (width * (ms - row.start_ms)) / (row.end_ms - row.start_ms);
+  const first = position(row.key_first_ms),
+    last = position(row.key_last_ms);
+  const color =
+    reviews.tags.find((t) => t.slug === "key-event")?.color || "#7c3aed";
+  const title = `${number(row.key_events)} key-event tagged events in bucket`;
+  if (positions.truncated && first !== last)
+    element("line", {
+      x1: first,
+      x2: last,
+      y1: y,
+      y2: y,
+      stroke: color,
+      "stroke-width": 3,
+      class: "key-event-span",
+      "pointer-events": "none",
+    });
+  const stamps = positions.positions_ms.filter(
+    (ms) => ms >= row.start_ms && ms < row.end_ms,
+  );
+  if (positions.truncated) stamps.push(row.key_first_ms, row.key_last_ms);
+  for (const ms of new Set(stamps)) {
+    const px = position(ms),
+      label = `${shown(ms)} · key event · ${title}`;
+    const mark = element("path", {
+      d: `M ${px} ${y - 4} l 4 4 l -4 4 l -4 -4 Z`,
+      fill: color,
+      class: "key-event-marker",
+      "pointer-events": "none",
+      role: "img",
+      "aria-label": label,
+    });
+    const tip = document.createElementNS(mark.namespaceURI, "title");
+    tip.textContent = label;
+    mark.append(tip);
+  }
+}
+
 function svgBuilder(width, height) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -3691,6 +3786,9 @@ function svgBuilder(width, height) {
 
 function timeline() {
   if (!meta || !$("timeline").clientWidth) return;
+  $("key-overview-status").textContent = meta.key_positions.truncated
+    ? "Dense key events: first 2,000 positions plus daily endpoint spans; narrow the selected chart for detail."
+    : "";
   const max = Math.max(...meta.histogram.map((r) => r.total)),
     width = $("timeline").clientWidth,
     gap = width / meta.histogram.length;
@@ -3711,7 +3809,7 @@ function timeline() {
       "aria-label": `${r.day}: ${r.total} events; select this day`,
     });
     const title = document.createElementNS(svg.namespaceURI, "title");
-    title.textContent = `${r.day}: ${number(r.total)} events; ${r.ssm} SSM commands/sessions`;
+    title.textContent = `${r.day}: ${number(r.total)} events; ${r.ssm} SSM commands/sessions; ${r.key_events || 0} key events`;
     bar.append(title);
     const choose = () => range(ms, r.end_ms);
     bar.addEventListener("click", choose);
@@ -3745,6 +3843,7 @@ function timeline() {
         },
         r.day.slice(5),
       );
+    keyMarker(element, r, meta.key_positions, i * gap, gap, 5);
   });
   $("timeline").replaceChildren(svg);
 }
@@ -3770,6 +3869,10 @@ function frequency(data, context) {
   const peak = Math.max(filteredPeak, ...(ctx ? ctx.values() : []));
   $("frequency-summary").textContent =
     `${number(data.total)} selected events · ${number(data.data.length)} buckets of ${number(data.bucket_minutes)} min · peak ${number(filteredPeak)}` +
+    ` · ${number(data.data.reduce((n, r) => n + (r.key_events || 0), 0))} key events` +
+    (data.key_positions.truncated
+      ? " · DENSE KEY EVENTS: first 2,000 positions plus endpoint spans; narrow the time range/filters for all positions"
+      : "") +
     " · amber marks below baseline = zero; positive bars ≥ 1px" +
     (ctx ? ` · context ${number(context.total)} events` : "") +
     (context?.error ? ` · context unavailable: ${context.error}` : "");
@@ -3835,6 +3938,7 @@ function frequency(data, context) {
     const title = document.createElementNS(svg.namespaceURI, "title");
     title.textContent =
       `${row.bucket_start_local} ${meta.timezone}: ${number(row.events)} selected events` +
+      `; ${row.key_events || 0} key events` +
       (ctx ? ` of ${number(ctx.get(row.start_ms) || 0)} in context` : "") +
       ` (${data.bucket_minutes} minute bucket; boundary buckets may be partial)`;
     bar.append(title);
@@ -3844,6 +3948,7 @@ function frequency(data, context) {
         pickBuckets(data, i, i);
       }
     });
+    keyMarker(element, row, data.key_positions, x, stepWidth, 5);
     if (i === 0 || (i % ticks === 0 && i * stepWidth < plot - 105))
       element(
         "text",
@@ -4566,6 +4671,11 @@ async function init() {
         lastSelection = selection;
         lastHistogram = histogram;
         lastContext = context;
+        if (!histogram.error) {
+          meta.histogram = histogram.overview;
+          meta.key_positions = histogram.overview_key_positions;
+          timeline();
+        }
         frequency(histogram, context);
         $("result-count").textContent = `${number(result.last_row)} matching`;
         $("query-time").textContent = `${number(result.elapsed_ms)} ms`;
@@ -4588,6 +4698,11 @@ async function init() {
     },
     rowFormatter: (row) => {
       const d = row.getData();
+      const key = d.tags.find((t) => t.slug === "key-event");
+      row.getElement().classList.toggle("key-event-row", !!key);
+      row
+        .getElement()
+        .style.setProperty("--key-event-color", key?.color || "#7c3aed");
       row
         .getElement()
         .classList.toggle(

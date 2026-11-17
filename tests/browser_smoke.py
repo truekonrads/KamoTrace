@@ -601,7 +601,7 @@ def main():
                 manual = rows.filter(has_text="Manual synthetic payment")
                 expect(manual).to_have_count(1)
                 manual.locator('[tabulator-field="summary"] .cell-text').click()
-                expect(page.locator("#detail-title")).to_have_text("Investigator-entered key event")
+                expect(page.locator("#detail-title")).to_have_text("Investigator-entered manual event")
                 page.locator("#edit-manual-event").click()
                 expect(page.locator("#manual-event-dialog")).to_be_visible()
                 saved_content = page.locator("#manual-content").input_value()
@@ -614,6 +614,25 @@ def main():
                 page.locator("#event-revisions-section > summary").click()
                 expect(page.locator("#event-revisions")).to_contain_text("Manual synthetic payment")
                 page.screenshot(path=str(results / "manual-key-event.png"))
+                page.locator("#close-detail").click()
+                # Prominence is a tag on existing events, independent of manual provenance.
+                # Toggling it patches rows/marks without resetting selection or loaded rows.
+                page.get_by_role("checkbox", name="Select all loaded events", exact=True).check()
+                page.locator("#quick-tag").click()
+                key_tag = page.get_by_role("checkbox", name="key-event: on none; add to all 6", exact=True)
+                expect(key_tag).to_be_visible()
+                key_tag.check()
+                expect(page.locator("#events .key-event-row")).to_have_count(6)
+                expect(page.locator("#selected-count")).to_have_text("6 selected")
+                expect(page.locator("#frequency-summary")).to_contain_text("6 key events")
+                assert page.locator("#timeline .key-event-marker").count() > 0
+                expect(rows).to_have_count(6)
+                page.screenshot(path=str(results / "key-event-tags.png"))
+                page.get_by_role("checkbox", name="key-event: on all; remove from all 6", exact=True).uncheck()
+                expect(page.locator("#events .key-event-row")).to_have_count(0)
+                expect(page.locator("#frequency-summary")).to_contain_text("0 key events")
+                expect(page.locator("#timeline .key-event-marker")).to_have_count(0)
+                expect(page.locator("#selected-count")).to_have_text("6 selected")
                 assert not errors, f"Browser JavaScript errors: {errors}"
                 print("PASS: event search/timezone/history, hybrid pipeline scopes, shortcut draft races, autocomplete/newlines, reference cards, inventory map/tables/coverage, tab state, error/retry and no-snapshot; no JavaScript errors.")
             except Exception:

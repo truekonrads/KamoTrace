@@ -468,16 +468,20 @@
               ></div>
               <p class="hint chart-hint">
                 Drag across the chart to select a time range · click a bucket to
-                narrow to it · Back undoes either.
+                narrow to it · Back undoes either. Diamonds mark key-event
+                timestamps; coincident events share a marker. Dense views show
+                endpoint spans, not continuous activity, with an explicit limit.
               </p>
             </div>
             <div class="context-strip">
               <div class="chart-key">
                 <span class="blue-dot"></span>All events, daily context
                 <span class="red-dot"></span>SSM command/session starts
+                <span class="key-event-dot">◆</span>Key events
                 <span class="hint">Click a day or drag the slider</span>
               </div>
               <div id="timeline" aria-label="Daily event histogram"></div>
+              <p id="key-overview-status" class="hint" aria-live="polite"></p>
               <div id="time-slider"></div>
             </div>
           </div>
@@ -571,7 +575,9 @@
             </span>
           </div>
           <div class="review-toolbar">
-            <button id="add-manual-event" type="button">Add key event</button>
+            <button id="add-manual-event" type="button">
+              Add manual event
+            </button>
             <span id="manual-save-status" role="status"></span>
             <span id="selected-count" role="status">0 selected</span>
             <button
@@ -1058,7 +1064,7 @@
     <dialog id="manual-event-dialog" aria-labelledby="manual-event-title">
       <form id="manual-event-form">
         <div class="dialog-heading">
-          <h2 id="manual-event-title">Add key event</h2>
+          <h2 id="manual-event-title">Add manual event</h2>
           <button id="cancel-manual-event" type="button">Cancel</button>
         </div>
         <p class="hint">
@@ -1110,7 +1116,7 @@
           <span id="detail-id"></span>
         </div>
         <span class="detail-actions">
-          <button id="edit-manual-event" hidden>Edit key event</button>
+          <button id="edit-manual-event" hidden>Edit manual event</button>
           <button id="detail-prev" title="Previous loaded event (K)">
             ← Prev
           </button>

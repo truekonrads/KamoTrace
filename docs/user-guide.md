@@ -20,7 +20,7 @@ For implementation responsibilities and rationale, see
 - [Add offline IP enrichment](#ip-enrichment)
 - [Browse AWS inventory and map](#aws-inventory-and-map)
 - [Record findings and tag events](#findings-and-event-tags)
-- [Combine other events and editable key events](#other-events-and-manual-key-events)
+- [Combine other events and editable manual events](#other-events-and-manual-key-events)
 - [Search and inspect CloudTrail events](#cloudtrail-workflow)
 - [Browse SSM commands and output](#ssm-command-browser-desktop)
 - [Check where SSM logs sessions and commands](#ssm-logging-check)
@@ -918,6 +918,14 @@ In the collapsed rail:
 - The list scrolls when there are more tags than fit. **All tags** expands the
   sidebar on the **Event tags** tab.
 
+### Mark key events
+
+Key events are prominent milestones, such as suspected initial access or a change of attacker state. They are an investigator designation, not an automatic detection or a separate event type. Select existing AWS, imported other or manual events, choose **Tag events**, and check **key-event · highlight on timelines**. The tag is offered even before its first use. Uncheck it to remove prominence; other tags and Findings remain intact. A manual event is not automatically a key event.
+
+The `key-event` tag gives rows a coloured background and edge, using the tag's editable colour. Diamonds on **Selected event frequency** show each distinct matching key-event timestamp, and the summary counts all matching key events, not only loaded rows. Coincident events share a diamond. The master **All events, daily context** strip shows key-event positions across the whole dataset, even when the current filters exclude them. Each chart is limited to the first 2,000 distinct positions; dense views explicitly warn and add first/last endpoint spans for each bucket/day. These spans do not assert continuous activity. Narrow the time range or filters for individual positions. Bucket/day boundaries use the selected timezone. Tag writes update row highlights and marks in place without clearing selection or scroll; filtered membership and counts still require **Refresh results** when marked stale. MCP changes appear when results are rerun.
+
+Filter key events with the ordinary tag controls or `tag = "key-event"` in Pipeline mode. MCP clients use `tag_events`/`untag_events` with `tag: "key-event"` and explicit event hashes. Histogram buckets expose `key_events`, `key_first_ms` and `key_last_ms`; zero-match buckets have count 0 and null endpoints. `key_positions` contains sorted distinct `positions_ms` and a `truncated` flag; these millisecond instants are scoped to the whole filtered selection, not loaded rows.
+
 ### Browse event tags
 
 The **Event tags** tab lists every tag, its colour and its event count across
@@ -998,9 +1006,11 @@ Use the bar above the grid to work with selected events:
   included. Opening it with a different database is refused, so one case's
   notes can't be mixed into another's.
 
-## Other events and manual key events
+<a id="other-events-and-manual-key-events"></a>
 
-The **Events** timeline combines CloudTrail, imported other events and investigator-entered key events. The **Type** column distinguishes `cloudtrail`, `other` and `manual`; filter it with **+ Filter** or `event_type = "manual"` in Pipeline mode. **Operation / content** shows the AWS operation or a bounded content preview; **Service / origin** shows the AWS service or documented origin. Search covers full raw records, not only previews. The optional identity is free text, not an asserted AWS principal.
+## Other events and manual events
+
+The **Events** timeline combines CloudTrail, imported other events and investigator-entered manual events. The **Type** column distinguishes `cloudtrail`, `other` and `manual`; filter it with **+ Filter** or `event_type = "manual"` in Pipeline mode. **Operation / content** shows the AWS operation or a bounded content preview; **Service / origin** shows the AWS service or documented origin. Search covers full raw records, not only previews. The optional identity is free text, not an asserted AWS principal. [Key-event prominence](#mark-key-events) is a separate tag that can apply to any of these types.
 
 ### Import other events
 
@@ -1017,9 +1027,9 @@ kamotrace serve --database case.duckdb --other-events other.duckdb
 
 `--other-events` is repeatable and accepts only `import-other` databases. For a case without AWS logs, use `kamotrace serve --database other.duckdb` instead. Imports stream in batches to a new immutable DuckDB; an invalid line rejects the entire import without publishing a partial database. Existing datasets are never overwritten. Every import requires an origin description; retain originals for reproducibility. Details and exports include schema version, origin, import time, source-file byte hashes/sizes and the one-based original line locator (including blank lines). Gzip hashes cover compressed bytes. Restart the server to load newly imported datasets.
 
-### Add and edit key events
+### Add and edit manual events
 
-Choose **Add key event**. Enter its date with timezone offset, text or JSON content, required origin/basis and optional self-reported author, IP and identity. Open a manual event and choose **Edit key event** to change it. Nested JSON is edited as text, so opening and saving never rounds numbers through JavaScript. **Save event and refresh** explicitly reruns the current timeline selection; it does not clear filters or widen the time range. A saved event outside that selection will not appear until you adjust it.
+Choose **Add manual event**. Enter its date with timezone offset, text or JSON content, required origin/basis and optional self-reported author, IP and identity. Open a manual event and choose **Edit manual event** to change it. Nested JSON is edited as text, so opening and saving never rounds numbers through JavaScript. **Save event and refresh** explicitly reruns the current timeline selection; it does not clear filters or widen the time range. A saved event outside that selection will not appear until you adjust it.
 
 Manual events are investigator statements, not imported source evidence. They persist in `<database stem>.manual.duckdb`, separate from the primary evidence and SQLite reviews. Each edit retains prior content, origin, author and timestamps, viewable under **Previous revisions**. An edit must supply the current `updated` stamp; conflicting edits fail without replacing the draft. Cancel and reopen the event before reconciling a conflict. Author is self-reported, not authenticated. Deletion is not supported.
 
@@ -1027,7 +1037,7 @@ Tags and Findings work across all three types. `record_sha256` remains the revie
 
 The primary database still binds the SQLite annotation sidecar to the case. Additional explicitly supplied other-event datasets can be added or removed without discarding existing CloudTrail reviews; reviews for absent records remain stored. Numeric row IDs are opaque runtime locators and may change when attached dataset order changes. Back up the primary/other DuckDB files, `.manual.duckdb` and `.annotations.sqlite3` together with the server stopped; one server must own a case's writable state.
 
-MCP clients use the same timeline tools and `event_type`/`origin` filters. `create_manual_event(record_json, origin, author?)` creates one key event; `edit_manual_event(id, updated, record_json, origin, author?)` replaces a manual event while preserving its reviews. Pass exact record JSON as a string; read `get_event` before editing. Neither API accepts paths, SQL or imported-record modifications.
+MCP clients use the same timeline tools and `event_type`/`origin` filters. `create_manual_event(record_json, origin, author?)` creates one manual event; `edit_manual_event(id, updated, record_json, origin, author?)` replaces a manual event while preserving its reviews. Pass exact record JSON as a string; read `get_event` before editing. Neither API accepts paths, SQL or imported-record modifications.
 
 ## CloudTrail workflow
 

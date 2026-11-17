@@ -116,6 +116,8 @@ contexts are inert query data, revalidated when reopened, never stored executabl
 SQL. Tag/note writes patch loaded rows in place so investigators keep their
 selection and scroll; refreshing filtered membership/counts is explicit.
 
+Key-event prominence is the existing `key-event` tag, independent of provenance/type. Histogram queries use the shared selection compiler and aggregate the tagged count and exact first/last epoch-millisecond positions per bucket; the daily overview is deliberately unfiltered. Both charts show distinct tagged timestamps as diamonds, capped at 2,000 positions per selection/overview with explicit truncation warnings and endpoint spans for dense buckets. Counts always include all matching events. Tag writes patch rows and refresh review marks only, retaining applied counts/membership until an explicit rerun. No evidence or storage schema changes are needed for prominence.
+
 The frontend uses static JavaScript and vendored Tabulator/noUiSlider rather than
 a framework. It calls notes **Findings**, separate from **Event tags**; API and
 storage names remain annotations/notes. Evidence is plaintext, and rendered

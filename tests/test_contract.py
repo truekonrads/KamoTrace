@@ -2478,6 +2478,39 @@ class BrowserContract(unittest.TestCase):
             self.assertEqual((row["end_ms"] - row["start_ms"]) / 3600000, hours)
             self.assertEqual(row["events"], total)
 
+    def test_key_events_mark_existing_evidence_and_respect_histogram_scopes(self):
+        rows = self.call("/api/events", {})[1]["data"]
+        hashes = [r["record_sha256"] for r in rows if r["event_id"] in ("event-0", "event-1", "event-3")]
+        try:
+            status, result = self.call("/api/reviews", {"action": "tag", "slug": "key-event",
+                "color": "#7c3aed", "hashes": hashes})
+            self.assertEqual(status, 200, result)
+            query = {"timezone": "Asia/Jakarta", "start": "2026-10-24T17:00:00Z",
+                "end": "2026-10-25T16:59:59Z", "bucket_minutes": 1440,
+                "pipeline_version": 1, "pipeline": 'event_name = "StartSession" OR event_id = "event-0"'}
+            status, histogram = self.call("/api/histogram", query)
+            self.assertEqual(status, 200, histogram)
+            self.assertEqual(histogram["total"], 1)
+            self.assertEqual(histogram["data"][0]["key_events"], 1)
+            expected_ms = int(datetime(2026, 10, 24, 17, tzinfo=timezone.utc).timestamp() * 1000)
+            self.assertEqual(histogram["data"][0]["key_first_ms"], expected_ms)
+            self.assertEqual(histogram["data"][0]["key_last_ms"], expected_ms)
+            self.assertEqual(histogram["key_positions"], {"positions_ms": [expected_ms], "truncated": False})
+            scoped = self.call("/api/histogram", {**query, "tags": ["key-event"] * 20})
+            self.assertEqual(scoped[0], 200, scoped[1])
+            self.assertEqual(scoped[1]["key_positions"], histogram["key_positions"])
+            self.assertEqual(sum(r["key_events"] for r in histogram["overview"]), 3)
+            overview = self.call("/api/meta", {"timezone": "Asia/Jakarta"})[1]["histogram"]
+            self.assertEqual([r["key_events"] for r in overview], [1, 2, 0])
+            self.assertEqual(overview[1]["key_first_ms"], expected_ms)
+            self.assertEqual(overview[1]["key_last_ms"], expected_ms + 86399000)
+            empty = self.call("/api/histogram", {**query, "search": "not-present"})[1]["data"][0]
+            self.assertEqual((empty["key_events"], empty["key_first_ms"], empty["key_last_ms"]), (0, None, None))
+            self.assertEqual(self.call("/api/events", {"tags": ["key-event"]})[1]["last_row"], 3)
+        finally:
+            self.call("/api/reviews", {"action": "untag", "slug": "key-event", "hashes": hashes})
+        self.assertEqual(sum(r["key_events"] for r in self.call("/api/meta")[1]["histogram"]), 0)
+
     def test_histogram_uses_all_filters_local_buckets_and_zero_fills(self):
         body = {"timezone": "Asia/Jakarta", "start": "2026-10-25T00:00:00+07:00", "end": "2026-10-27T00:00:00+07:00",
                 "bucket_minutes": 1440, "filters": [
@@ -2704,6 +2737,36 @@ class MFAContract(unittest.TestCase):
 class OtherEventsContract(unittest.TestCase):
     call = BrowserContract.call
 
+    def test_dense_key_positions_are_bounded_and_narrowable(self):
+        from kamotrace.other_events import build as import_other
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, database = root / "milestones.jsonl", root / "other.duckdb"
+            start = 1792886400
+            source.write_text("\n".join(json.dumps({"date": datetime.fromtimestamp(start + i, timezone.utc).isoformat(),
+                "content": i}) for i in range(2001)))
+            import_other([source], database, "Synthetic dense milestones")
+            store = Store(database)
+            try:
+                rows = [row for page in range(1, 22) for row in store.query({"page": page, "size": 100})["data"]]
+                last = max(rows, key=lambda r: r["time_local"])
+                hashes = [r["record_sha256"] for r in rows if r["id"] != last["id"]]
+                store.review_write({"action": "tag", "slug": "key-event", "color": "#7c3aed", "hashes": hashes})
+                histogram = store.histogram({})
+                self.assertFalse(histogram["key_positions"]["truncated"])
+                self.assertEqual(len(histogram["key_positions"]["positions_ms"]), 2000)
+                store.review_write({"action": "tag", "slug": "key-event", "color": "#7c3aed", "hashes": [last["record_sha256"]]})
+                histogram = store.histogram({})
+                self.assertEqual(histogram["data"][0]["key_events"], 2001)
+                self.assertEqual(histogram["data"][0]["key_last_ms"], (start + 2000) * 1000)
+                self.assertEqual(histogram["key_positions"], {"positions_ms": [(start + i) * 1000 for i in range(2000)], "truncated": True})
+                narrowed = store.histogram({"start": datetime.fromtimestamp(start + 1999, timezone.utc).isoformat()})
+                self.assertEqual(narrowed["key_positions"], {"positions_ms": [(start + 1999) * 1000, (start + 2000) * 1000], "truncated": False})
+                self.assertTrue(narrowed["overview_key_positions"]["truncated"])
+            finally:
+                store.connection.close()
+                store.reviews.close()
+
     def test_jsonl_validation_batches_and_provenance(self):
         from kamotrace.cli import main
         with tempfile.TemporaryDirectory() as folder:
@@ -2822,6 +2885,19 @@ class OtherEventsContract(unittest.TestCase):
                     amended = await client.call_tool("edit_manual_event", {"id": value["id"], "updated": value["updated"],
                         "record_json": raw.replace("Unauthorised", "Reported"), "origin": "MCP analyst correction"})
                     self.assertFalse(amended.is_error, amended)
+                    existing = rest("/api/events", {})["data"]
+                    hashes = [r["record_sha256"] for r in existing if r["event_type"] != "manual"]
+                    marked = await client.call_tool("tag_events", {"tag": "key-event", "hashes": hashes})
+                    self.assertFalse(marked.is_error, marked)
+                    histogram = await client.call_tool("event_histogram", {"query": {"timezone": "Asia/Singapore"}})
+                    self.assertFalse(histogram.is_error, histogram)
+                    self.assertEqual(sum(r["key_events"] for r in histogram.structured_content["buckets"]), 4)
+                    self.assertEqual(len(histogram.structured_content["key_positions"]["positions_ms"]), 2)
+                    scoped = await client.call_tool("search_events", {"query": {"pipeline_version": 1, "pipeline": 'tag = "key-event"'}})
+                    self.assertFalse(scoped.is_error, scoped)
+                    self.assertEqual(scoped.structured_content["total"], 4)
+                    removed = await client.call_tool("untag_events", {"tag": "key-event", "hashes": hashes})
+                    self.assertFalse(removed.is_error, removed)
             anyio.run(session)
             cleanup.close()  # Reopen after stopping the sole owner of the case and annotations.
             reopened = Store(aws, other_events=[other])

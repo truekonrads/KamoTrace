@@ -923,6 +923,23 @@ main {
 .tabulator-row.ssm-row {
   box-shadow: inset 3px 0 var(--red);
 }
+.tabulator-row.key-event-row {
+  background: color-mix(in srgb, var(--key-event-color) 12%, white);
+  box-shadow: inset 5px 0 var(--key-event-color);
+}
+.tabulator-row.key-event-row .tabulator-cell[tabulator-field="review"] {
+  box-shadow: inset 5px 0 var(--key-event-color);
+}
+.tabulator-row.key-event-row:hover,
+.tabulator-row.key-event-row:has(
+    .tabulator-cell[tabulator-field="review"] input:checked
+  ) {
+  background: color-mix(in srgb, var(--key-event-color) 22%, white);
+}
+.key-event-dot {
+  color: #7c3aed;
+  margin-left: 10px;
+}
 .tabulator-row.inspected {
   background: #fff4d6 !important;
 }

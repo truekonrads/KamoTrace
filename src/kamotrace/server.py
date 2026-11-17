@@ -901,23 +901,43 @@ class Store:
                      REQUEST_ID.get(), operation, (time.monotonic() - started) * 1000, len(rows))
         return rows
 
-    def metadata(self, body=None):
-        zone = query_timezone(body or {})
-        bounds = self.rows("""SELECT count(*) AS total, min(epoch_ms(event_time)) AS start_ms,
-            max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""", operation="metadata.bounds")[0]
+    def key_positions(self, body):
+        # Keep every ordinary milestone visible without unbounded JSON/SVG for mass tagging.
+        _, _, sql, params, _ = build_query(body, self.raw_function)
+        sql = sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS ms, record_sha256", 1)
+        positions = self.rows("SELECT DISTINCT ms FROM (" + sql + ") matching WHERE record_sha256 IN "
+            "(SELECT hash FROM review_tags WHERE slug='key-event') ORDER BY ms LIMIT 2001",
+            params, operation="histogram.key_positions")
+        return {"positions_ms": [r["ms"] for r in positions[:2000]], "truncated": len(positions) > 2000}
+
+    def daily_histogram(self, zone):
         histogram = self.rows("""SELECT strftime(event_time AT TIME ZONE ?, '%Y-%m-%d') AS day,
             count(*) AS total, count(*) FILTER (WHERE event_source='ssm.amazonaws.com'
-            AND event_name IN ('SendCommand','StartSession')) AS ssm
+            AND event_name IN ('SendCommand','StartSession')) AS ssm,
+            count(*) FILTER (WHERE EXISTS (SELECT 1 FROM review_tags r
+                WHERE r.hash=record_sha256 AND r.slug='key-event')) AS key_events,
+            min(epoch_ms(event_time)) FILTER (WHERE EXISTS (SELECT 1 FROM review_tags r
+                WHERE r.hash=record_sha256 AND r.slug='key-event')) AS key_first_ms,
+            max(epoch_ms(event_time)) FILTER (WHERE EXISTS (SELECT 1 FROM review_tags r
+                WHERE r.hash=record_sha256 AND r.slug='key-event')) AS key_last_ms
             FROM browse_events GROUP BY 1 ORDER BY 1""", [zone], operation="metadata.histogram")
         for row in histogram:
             day = datetime.fromisoformat(row["day"]).replace(tzinfo=ZoneInfo(zone))
             row["start_ms"] = int(day.timestamp() * 1000)
             row["end_ms"] = int((day + timedelta(days=1)).timestamp() * 1000)
+        return histogram
+
+    def metadata(self, body=None):
+        zone = query_timezone(body or {})
+        bounds = self.rows("""SELECT count(*) AS total, min(epoch_ms(event_time)) AS start_ms,
+            max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""", operation="metadata.bounds")[0]
+        histogram = self.daily_histogram(zone)
         facets = {field: [r["value"] for r in self.rows(
             f"SELECT DISTINCT {field} AS value FROM browse_events WHERE {field} IS NOT NULL ORDER BY 1",
             operation=f"metadata.facet.{field}")]
             for field in ("event_name", "event_source", "country", "identity_type", "error_code", "document_name")}
-        return {**bounds, "histogram": histogram, "facets": facets, "fields": FIELDS,
+        return {**bounds, "histogram": histogram, "key_positions": self.key_positions({"timezone": zone}),
+                "facets": facets, "fields": FIELDS,
                 "pipeline_fields": PIPELINE_FIELDS,
                 "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
                 "levels": LEVELS, "detections_loaded": self.suzaku_run is not None or self.guardduty_run is not None,
@@ -1048,19 +1068,27 @@ class Store:
         if len(ranges) > 2000:
             raise ValueError("More than 2,000 buckets: choose a larger bucket or a shorter time range")
         sql = """WITH matching AS (
-        """ + count_sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS event_ms", 1) + """
+        """ + count_sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS event_ms, "
+            "EXISTS (SELECT 1 FROM review_tags r WHERE r.hash=record_sha256 AND r.slug='key-event') AS is_key", 1) + """
         ), buckets AS (
             SELECT unnest(?::BIGINT[]) AS start_ms, unnest(?::BIGINT[]) AS end_ms
         )
         SELECT strftime(make_timestamptz(b.start_ms * 1000) AT TIME ZONE ?, '%Y-%m-%d %H:%M:%S') AS bucket_start_local,
-               b.start_ms, b.end_ms, count(m.event_ms) AS events
+               b.start_ms, b.end_ms, count(m.event_ms) AS events,
+               count(m.event_ms) FILTER (WHERE m.is_key) AS key_events,
+               min(m.event_ms) FILTER (WHERE m.is_key) AS key_first_ms,
+               max(m.event_ms) FILTER (WHERE m.is_key) AS key_last_ms
         FROM buckets b LEFT JOIN matching m ON m.event_ms >= b.start_ms AND m.event_ms < b.end_ms
         GROUP BY b.start_ms, b.end_ms ORDER BY b.start_ms"""
         bound = params + [[a for a, _ in ranges], [b for _, b in ranges], zone]
         with self.locked("histogram"):
             rows = self.rows(sql, bound, operation="histogram.buckets")
+            overview = self.daily_histogram(zone)
+            positions = self.key_positions({**body, "start": start, "end": end})
+            overview_positions = self.key_positions({"timezone": zone})
         return {"data": rows, "total": sum(r["events"] for r in rows),
-                "bucket_minutes": minutes, "sql": sql, "params": bound}
+                "bucket_minutes": minutes, "sql": sql, "params": bound, "overview": overview,
+                "key_positions": positions, "overview_key_positions": overview_positions}
 
     def column_values(self, body):
         field = body.get("field")
