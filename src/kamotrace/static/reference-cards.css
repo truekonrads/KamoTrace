@@ -150,3 +150,181 @@
   font-variant-numeric: tabular-nums;
   font-weight: 600;
 }
+
+#computer-imports {
+  margin-block: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+#computer-imports > summary {
+  color: var(--blue-dark);
+  font-size: 14px;
+}
+.computer-help .hint {
+  max-width: 110ch;
+  line-height: 1.5;
+}
+.computer-help {
+  margin-block: 6px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.computer-scope {
+  margin-block: 10px 6px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--context);
+  background: var(--header);
+  font-weight: 600;
+}
+#computer-import-status {
+  margin-block: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+#computer-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 10px;
+  margin-block: 10px;
+}
+.computer-card {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--blue);
+  border-radius: 4px;
+  background: white;
+  overflow-wrap: anywhere;
+}
+.computer-header {
+  margin: -10px -10px 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  border-radius: 3px 3px 0 0;
+  background: var(--header);
+}
+.computer-card h3 {
+  margin: 0 0 3px;
+  font-size: 14px;
+}
+.computer-card p {
+  margin-block: 4px;
+  line-height: 1.5;
+}
+.computer-card .hint {
+  font-size: 11px;
+}
+.computer-card .computer-identity {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 550;
+}
+#computer-imports .computer-warning {
+  padding: 8px 10px;
+  border-left: 3px solid var(--amber);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+#computer-imports :is(.computer-header, .computer-evidence) .computer-warning {
+  padding: 3px 6px;
+}
+.computer-card dl {
+  display: grid;
+  grid-template-columns: 115px minmax(0, 1fr);
+  gap: 0;
+  margin-block: 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.computer-card dt,
+.computer-card dd {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--line);
+}
+.computer-card dt:last-of-type,
+.computer-card dd:last-of-type {
+  border-bottom: 0;
+}
+.computer-card dt {
+  background: var(--header);
+  color: var(--muted);
+  font-weight: 600;
+}
+.computer-card dd {
+  margin: 0;
+  min-width: 0;
+}
+.computer-card dd strong {
+  display: block;
+  margin-bottom: 3px;
+  padding: 2px 4px;
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+.computer-card dd button {
+  padding: 1px 4px;
+  margin: 0 4px 2px 0;
+  max-width: 100%;
+  background: var(--surface);
+  color: var(--blue-dark);
+  white-space: normal;
+  text-align: left;
+  font: inherit;
+}
+.computer-card dd button:hover {
+  background: var(--selected);
+}
+.computer-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+.computer-evidence > button {
+  padding: 3px 6px;
+  font-size: 11px;
+}
+.computer-details > summary,
+.computer-more-values > summary {
+  color: var(--blue-dark);
+  cursor: pointer;
+  font-size: 12px;
+}
+.computer-details[open] {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+.computer-details > details {
+  margin-block: 6px;
+}
+.computer-more-values {
+  margin-top: 4px;
+}
+.computer-extra-warning {
+  color: var(--warn-ink);
+  font-weight: 600;
+}
+.computer-card pre {
+  max-height: 240px;
+  overflow: auto;
+  padding: 12px;
+  background: var(--surface);
+  white-space: pre-wrap;
+}
+.computer-uptime {
+  margin-bottom: 4px;
+}
+.computer-uptime:last-child {
+  margin-bottom: 0;
+}
+.computer-uptime small {
+  display: block;
+}

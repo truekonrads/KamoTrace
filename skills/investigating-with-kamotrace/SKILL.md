@@ -26,6 +26,7 @@ browser on the next refresh, and theirs show up for you.
 - **Leads are not findings.** Suzaku detections and IP geography are leads.
   Tag or annotate only what the raw records support, and in notes, say which
   parts you observed and which you inferred.
+- **Acquired computer context is historical and bounded.** `describe_schema` reports prepared-source coverage, undated counts and read-only registered-import context. Partial/unsupported/omitted sources and interrupted attempts are not absence. Computer cards separate stable host IDs, unverified labels and unattributed observations; acquisition/import time is not historical action time. Use `search_events` with `{"query":{"filters":[{"field":"time_local","op":"missing"}]}}` for undated observations, then `get_event` for original JSON, locators, time alternatives and current reviews. Registry discovery does not prepare, resume or repair inputs. Parsed browser/MCP metadata numbers may round; cite original JSON text for precise evidence values.
 - **IAM inventory is current configuration, not historical or effective access.**
   Browser identity cards can show exported users, roles, groups, inline/customer
   policy documents and AWS-managed policy metadata (no AWS policy documents).

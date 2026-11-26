@@ -560,6 +560,7 @@ def main():
 
                 # Fresh page: API failure is actionable, Retry recovers, absent snapshot is distinct.
                 page.reload()
+                expect(page.locator("#load-status")).to_have_text("5 loaded · all")
                 page.route("**/api/inventory", lambda route: route.fulfill(status=500, body='{"error":"synthetic"}'))
                 page.locator("#inventory-tab").click()
                 expect(page.locator("#inventory-retry")).to_be_visible()
@@ -568,6 +569,7 @@ def main():
                 page.locator("#inventory-retry").click()
                 expect(page.locator("#inventory-content")).to_be_visible()
                 page.reload()
+                expect(page.locator("#load-status")).to_have_text("5 loaded · all")
                 page.route("**/api/inventory", lambda route: route.fulfill(json={"loaded": False}))
                 page.locator("#inventory-tab").click()
                 expect(page.locator("#inventory-status")).to_contain_text("--inventory-export")

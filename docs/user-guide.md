@@ -19,6 +19,7 @@ For implementation responsibilities and rationale, see
 - [Add GuardDuty context](#guardduty-context)
 - [Add offline IP enrichment](#ip-enrichment)
 - [Browse AWS inventory and map](#aws-inventory-and-map)
+- [Inspect acquired computers](#acquired-computer-cards)
 - [Record findings and tag events](#findings-and-event-tags)
 - [Combine other events and editable manual events](#other-events-and-manual-key-events)
 - [Search and inspect CloudTrail events](#cloudtrail-workflow)
@@ -29,6 +30,53 @@ For implementation responsibilities and rationale, see
 - [Fix common problems](#troubleshooting-and-limitations)
 - [Check licences and dependencies](#open-source-components)
 - [Run development checks](#verification)
+
+## Acquired computer cards
+
+Prepared TraceQuarry-compatible generic evidence databases can show **Computers /
+UAC imports** in the investigation view. This release browses existing prepared
+data; it does not run TraceQuarry, prepare archives, register or recover imports.
+TraceQuarry remains an independent tool. Attach prepared databases with the
+existing `serve --other-events` option. When the startup evidence has a
+`<database>.uac.duckdb` registry, the server also discovers its completed entries
+automatically. It opens that registry read-only, verifies its format and primary
+evidence identity, hashes each registered database and attaches it read-only.
+A missing or changed registered database or mismatched registry fails startup;
+the server does not silently ignore, repair or adopt it. Registry writes and
+unfinished-attempt resume are not available here. Restart explicitly to load
+newly prepared data; opening a card never runs preparation.
+
+Expand the cards to inspect one import at a time, four computer/label groups per
+page. The compact default shows hostname, OS, interface addresses and historical
+uptime with its selected observation timestamp. **Details & provenance** retains
+secondary facts, acquisition/import metadata, raw summary and AWS reasoning.
+**More values** exposes additional retained values; conflicts in collapsed
+secondary fields remain flagged. Click a fact for the exact original observation,
+source locator and time alternatives, retaining its Event tags and Findings.
+
+Stable host IDs, unverified label groups and unattributed observations remain
+distinct within each acquisition/collection. Network peer IPs are not host
+interfaces. Missing facts mean unavailable in parsed evidence, not absence.
+Acquisition/import times are not substituted for historical action times.
+The server inspects at most 10,000 observations per selected import, retaining
+eight distinct values per field with explicit overflow. Truncation discloses
+potential missing facts/groups and disables automatic AWS associations.
+AWS links require a stable host ID and one complete exact account/region/instance
+claim; inventory remains a separate snapshot, not incident-time state.
+
+Parser coverage shows the retained run/source ledger, including partial,
+unsupported, failed or omitted sources and interrupted preparation. Processing
+completion does not prove complete collection or coverage. Undated observations
+have a separate **Show only undated events** control and do not appear in dated
+histograms. Native-alert ingestion is not part of this card release.
+
+MCP uses the same Store: `describe_schema` exposes `source_coverage`, `undated`
+and the read-only registry context; `search_events` with a `time_local missing`
+filter finds undated observations; `get_event` returns original JSON, hashes,
+provenance, Event tags and Finding IDs. No new MCP path or registry-write tool is
+exposed. Registry fractional numbers are preserved in HTTP response bytes;
+browser/MCP JSON parsing can round those numbers. Original evidence JSON remains
+unchanged text.
 
 ## AWS inventory and map
 
