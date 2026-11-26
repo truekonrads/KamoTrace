@@ -1903,6 +1903,16 @@ dialog::backdrop {
   color: var(--muted);
   max-width: 200px;
 }
+#parser-coverage,
+#undated-control {
+  margin: 8px 16px;
+  font-size: 12px;
+}
+#parser-coverage pre {
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
 @keyframes duck-visit {
   0%,
   100% {

@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, available_timezones
 
 import duckdb
+import simplejson as precise_json
 
 from .pipeline import FIELDS as PIPELINE_FIELDS, PipelineError, compile_pipeline, describe as describe_pipeline
 from .raw_paths import CONTRACT as RAW_PATH_CONTRACT, fields as raw_fields, scalar as raw_scalar, check_response as check_raw_response
@@ -366,6 +367,10 @@ class Store:
 
     def prepare_other_events(self, database, paths, identity):
         from .other_events import EVENTS_VIEW, FORMAT, MANUAL_BASE, RAW_SCHEMA, manual_rows
+        from .computer_registry import registered
+        self.uac_registry = registered(database)
+        paths = [*paths, *(Path(r["database"]) for r in self.uac_registry["imports"])]
+        paths = list(dict.fromkeys(Path(p).resolve() for p in paths))
         self.case_identity = json.loads(identity)
         self.manual_path = database.with_suffix(".manual.duckdb")
         self.connection.execute(f"CREATE TEMP TABLE manual_raw ({RAW_SCHEMA})")
@@ -376,6 +381,7 @@ class Store:
         primary = f'"{catalog}".main.events'
         info = json.loads(self.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
         self.event_sources = [info]
+        self.computer_cache = {}
         aws_extra = """, 'cloudtrail'::VARCHAR AS event_type, NULL::VARCHAR AS origin,
             NULL::VARCHAR AS generic_identity, NULL::VARCHAR AS content_preview,
             NULL::VARCHAR AS author, NULL::VARCHAR AS created, NULL::VARCHAR AS updated,
@@ -396,6 +402,28 @@ class Store:
             raise ValueError("Too many imported events for exact browser row identifiers")
         selects.append("SELECT *, -1 AS dataset_index FROM (" + EVENTS_VIEW.replace("FROM raw_events", "FROM manual_raw") + ")")
         self.connection.execute("CREATE TEMP VIEW events AS " + " UNION ALL ".join(selects))
+
+    def computers(self, body):
+        from .computers import summarize
+        imports = [{"dataset_index": i, "run_id": s["tracequarry"]["manifest"].get("run_id"),
+                    "collection_id": s["tracequarry"]["manifest"].get("collection_id"),
+                    "acquisition_id": s["tracequarry"]["manifest"].get("settings", {}).get("acquisition_id"),
+                    "records": s["records"], "imported_at": s.get("imported_at")}
+                   for i, s in enumerate(self.event_sources) if s.get("adapter") == "tracequarry-parse-only-v1"]
+        dataset = body.get("dataset_index", imports[0]["dataset_index"] if imports else None)
+        page = body.get("page", 1)
+        if type(page) is not int or page < 1:
+            raise ValueError("page must be a positive integer")
+        if dataset is None and not imports:
+            return {"imports": [], "cards": [], "total": 0, "page": page}
+        if type(dataset) is not int or dataset not in {i["dataset_index"] for i in imports}:
+            raise ValueError("dataset_index must identify an attached UAC dataset")
+        with self.locked("computers.context"):
+            if dataset not in self.computer_cache:
+                self.computer_cache[dataset] = summarize(self.connection, dataset, self.event_sources[dataset], self.inventory)
+            result = self.computer_cache[dataset]
+            return {**result, "imports": imports, "page": page, "total": len(result["cards"]),
+                    "cards": result["cards"][(page - 1) * 4:page * 4]}
 
     def manual_write(self, body):
         from .other_events import save_manual
@@ -905,7 +933,7 @@ class Store:
         # Keep every ordinary milestone visible without unbounded JSON/SVG for mass tagging.
         _, _, sql, params, _ = build_query(body, self.raw_function)
         sql = sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS ms, record_sha256", 1)
-        positions = self.rows("SELECT DISTINCT ms FROM (" + sql + ") matching WHERE record_sha256 IN "
+        positions = self.rows("SELECT DISTINCT ms FROM (" + sql + ") matching WHERE ms IS NOT NULL AND record_sha256 IN "
             "(SELECT hash FROM review_tags WHERE slug='key-event') ORDER BY ms LIMIT 2001",
             params, operation="histogram.key_positions")
         return {"positions_ms": [r["ms"] for r in positions[:2000]], "truncated": len(positions) > 2000}
@@ -920,7 +948,7 @@ class Store:
                 WHERE r.hash=record_sha256 AND r.slug='key-event')) AS key_first_ms,
             max(epoch_ms(event_time)) FILTER (WHERE EXISTS (SELECT 1 FROM review_tags r
                 WHERE r.hash=record_sha256 AND r.slug='key-event')) AS key_last_ms
-            FROM browse_events GROUP BY 1 ORDER BY 1""", [zone], operation="metadata.histogram")
+            FROM browse_events WHERE event_time IS NOT NULL GROUP BY 1 ORDER BY 1""", [zone], operation="metadata.histogram")
         for row in histogram:
             day = datetime.fromisoformat(row["day"]).replace(tzinfo=ZoneInfo(zone))
             row["start_ms"] = int(day.timestamp() * 1000)
@@ -929,7 +957,8 @@ class Store:
 
     def metadata(self, body=None):
         zone = query_timezone(body or {})
-        bounds = self.rows("""SELECT count(*) AS total, min(epoch_ms(event_time)) AS start_ms,
+        bounds = self.rows("""SELECT count(*) AS total, count(*) FILTER (WHERE event_time IS NULL) AS undated,
+            min(epoch_ms(event_time)) AS start_ms,
             max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""", operation="metadata.bounds")[0]
         histogram = self.daily_histogram(zone)
         facets = {field: [r["value"] for r in self.rows(
@@ -943,7 +972,15 @@ class Store:
                 "levels": LEVELS, "detections_loaded": self.suzaku_run is not None or self.guardduty_run is not None,
                 "enrichment": self.enrichment_run,
                 "timezone": zone, "timezones": TIMEZONES, "database": "events.duckdb", "read_only": True,
-                "manual_events_writable": True}
+                "manual_events_writable": True,
+                "source_coverage": self.source_coverage(), "uac": self.uac_registry}
+
+    def source_coverage(self):
+        return [{"origin": source["origin"], "records": source["records"], "undated": source["undated"],
+                 "manifest": source["tracequarry"]["manifest"],
+                 "sources": source["tracequarry"]["source_index"]["sources"],
+                 "identity_policy": source["identity_policy"]}
+                for source in self.event_sources if source.get("adapter") == "tracequarry-parse-only-v1"]
 
     def timezone_metadata(self, body):
         with self.locked("metadata"):
@@ -954,6 +991,7 @@ class Store:
         def instant(ms):
             return datetime.fromtimestamp(ms / 1000, ZoneInfo(zone)).isoformat() if ms is not None else None
         return {"events": self.meta["total"], "timezone": zone,
+            "undated": self.meta["undated"], "source_coverage": self.source_coverage(), "uac": self.uac_registry,
             "first_event": instant(self.meta["start_ms"]), "end_exclusive": instant(self.meta["end_ms"]),
             "evidence_read_only": True, "annotations_writable": True, "manual_events_writable": True,
             "fields": FIELDS, "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS),
@@ -1026,8 +1064,7 @@ class Store:
             for row in rows:
                 row["raw_fields"] = {field: {"value": row.pop(paths[field]), "json_type": row.pop(paths[field] + "_type")}
                                      for field in dict.fromkeys(body.get("raw_fields", []))}
-                row["tags"] = [dict(r) for r in self.reviews.execute("SELECT t.* FROM tags t JOIN event_tags e USING(slug) WHERE e.hash=? ORDER BY slug", (row["record_sha256"],))]
-                row["annotations"] = [r[0] for r in self.reviews.execute("SELECT annotation_id FROM annotation_events WHERE hash=?", (row["record_sha256"],))]
+                row.update(self.row_reviews(row["record_sha256"]))
                 row["detections"] = found.get(row["id"], [])
         result = {"data": rows, "last_page": max(1, math.ceil(total / size)), "last_row": total,
                   "sql": sql, "params": params, "elapsed_ms": round((time.monotonic() - started) * 1000)}
@@ -1041,6 +1078,11 @@ class Store:
         if not str(width).isdigit() or not 1 <= int(width) <= 525600:
             raise ValueError("Bucket width must be 1 to 525,600 whole minutes")
         minutes = int(width)
+        if self.meta["start_ms"] is None and not (body.get("start") and body.get("end")):
+            build_query(body, self.raw_function)  # Empty evidence does not bypass query validation.
+            return {"data": [], "total": 0, "bucket_minutes": minutes, "sql": "", "params": [],
+                    "overview": [], "key_positions": {"positions_ms": [], "truncated": False},
+                    "overview_key_positions": {"positions_ms": [], "truncated": False}}
         start = body.get("start") or datetime.fromtimestamp(self.meta["start_ms"] / 1000, timezone.utc).isoformat()
         end = body.get("end") or datetime.fromtimestamp(self.meta["end_ms"] / 1000, timezone.utc).isoformat()
         _, _, count_sql, params, _ = build_query({**body, "start": start, "end": end}, self.raw_function)
@@ -1127,6 +1169,12 @@ class Store:
             check_raw_response(result)
         return result
 
+    def row_reviews(self, digest):
+        return {"tags": [dict(r) for r in self.reviews.execute(
+                    "SELECT t.* FROM tags t JOIN event_tags e USING(slug) WHERE e.hash=? ORDER BY slug", (digest,))],
+                "annotations": [r[0] for r in self.reviews.execute(
+                    "SELECT annotation_id FROM annotation_events WHERE hash=?", (digest,))]}
+
     def detail(self, record):
         with self.locked("event.detail"):
             rows = self.rows("""SELECT event_id, record_sha256, raw_event::VARCHAR AS raw_json,
@@ -1135,6 +1183,7 @@ class Store:
                              [record], operation="event.detail")
             if rows:
                 row = rows[0]
+                row.update(self.row_reviews(row["record_sha256"]))
                 row["provenance"] = {k: row[k] for k in ("event_type", "origin", "author", "created", "updated", "source_file", "source_ordinal")}
                 dataset = row.pop("dataset_index")
                 row["provenance"]["imports"] = [self.event_sources[dataset]] if dataset >= 0 else []
@@ -1204,7 +1253,7 @@ class Handler(SimpleHTTPRequestHandler):
                 elif route.startswith("/api/exports/"):
                     route = "/api/exports/:id"
                 elif route not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values",
-                                   "/api/reviews", "/api/detections", "/api/inventory", "/api/reference",
+                                   "/api/reviews", "/api/detections", "/api/inventory", "/api/reference", "/api/computers",
                                    "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event",
                                    "/api/ssm-log", "/api/ssm-log-review", "/mcp"):
                     route = "static-or-unknown"
@@ -1242,7 +1291,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def respond(self, value, status=200):
         started = time.monotonic()
-        body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        body = precise_json.dumps(value, use_decimal=True, ensure_ascii=False).encode("utf-8")
         logger.debug("response request_id=%s serialize_ms=%.3f bytes=%d",
                      REQUEST_ID.get(), (time.monotonic() - started) * 1000, len(body))
         self.send_response(status)
@@ -1345,7 +1394,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
+        if self.path not in ("/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1357,6 +1406,7 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("Expected a JSON object")
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
                          "/api/manual-events": self.store.manual_write,
+                         "/api/computers": self.store.computers,
                          "/api/schema": self.store.schema, "/api/notes": self.store.notes_read,
                          "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,

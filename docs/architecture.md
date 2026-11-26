@@ -23,6 +23,7 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `suzaku.py`, `guardduty.py`, `enrich.py` | Build evidence-bound derived sidecars and load them read-only for investigation. |
 | `get_suzaku.py`, `get_dbip.py` | Download and verify optional external tools/data, separately from the application distribution. |
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
+| `computers.py`, `computer_registry.py` | Summarize bounded historical computer facts from attached prepared ECS datasets; discover evidence-bound registered acquisitions read-only without owning preparation, registration or recovery. |
 | `server.py`, `pipeline.py` | Own investigation state and REST validation/query execution; parse and compile the versioned filter language. |
 | `ssm.py` | Load JSON-backed command/output data, preserve system/plugin structure and link exact command identities to CloudTrail. |
 | `mcp_server.py` | Map MCP tools to the running server's REST API, without owning evidence or annotations. |

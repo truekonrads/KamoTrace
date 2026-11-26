@@ -1082,7 +1082,264 @@
     },
     true,
   );
+  function computerImports(request, openRecord, formatTime) {
+    const root = document.getElementById("computer-imports");
+    const select = document.getElementById("computer-import-select");
+    const status = document.getElementById("computer-import-status");
+    const cards = document.getElementById("computer-cards");
+    const prev = document.getElementById("computer-prev");
+    const next = document.getElementById("computer-next");
+    let page = 1,
+      generation = 0;
+    const labels = {
+      hostname: "Host name / label",
+      host_id: "Host ID",
+      host_basis: "Host basis",
+      host_ip: "Host IPs",
+      uptime_seconds: "Uptime",
+      os_name: "OS",
+      os_version: "OS version",
+      os_kernel: "Kernel",
+      architecture: "Architecture",
+      type: "Host type",
+      cloud_identity: "Acquired cloud identity",
+    };
+    function duration(seconds) {
+      let remaining = Math.floor(seconds);
+      const parts = [];
+      for (const [unit, size] of [
+        ["d", 86400],
+        ["h", 3600],
+        ["m", 60],
+        ["s", 1],
+      ]) {
+        const count = Math.floor(remaining / size);
+        remaining %= size;
+        if (count) parts.push(`${count}${unit}`);
+      }
+      return parts.join(" ") || "0s";
+    }
+    async function load() {
+      const token = ++generation;
+      cards.replaceChildren();
+      prev.disabled = next.disabled = true;
+      status.classList.remove("computer-warning");
+      status.textContent = "Loading acquired computer context…";
+      try {
+        const data = await request("/api/computers", {
+          ...(select.value ? { dataset_index: Number(select.value) } : {}),
+          page,
+        });
+        if (token !== generation) return;
+        select.replaceChildren();
+        for (const entry of data.imports) {
+          const option = line(
+            select,
+            "option",
+            `Import ${entry.dataset_index + 1} · ${entry.acquisition_id || entry.collection_id || entry.run_id || "Unknown collection"} · ${formatTime(entry.imported_at)} · ${entry.records} observations`,
+          );
+          option.value = entry.dataset_index;
+        }
+        select.value = data.dataset_index;
+        status.textContent = `${data.total} computer / label groups · ${data.scanned} / ${data.records} observations inspected${data.truncated ? " · PARTIAL: scan limit reached; later computers/facts may be missing, automatic AWS links disabled" : ""} · Page ${page}`;
+        status.classList.toggle("computer-warning", Boolean(data.truncated));
+        for (const computer of data.cards) {
+          const section = line(cards, "section", "", "computer-card");
+          const header = line(section, "header", "", "computer-header");
+          line(header, "h3", computer.identity || "Computer unknown");
+          line(
+            header,
+            "p",
+            computer.identity_basis === "id"
+              ? `Acquired host ID · ${computer.observations} observations`
+              : computer.identity_basis === "label"
+                ? "Unverified label · may represent multiple computers"
+                : "Unbound observations · not attributed to a computer",
+            computer.identity_basis === "label"
+              ? "computer-identity computer-warning"
+              : "computer-identity",
+          );
+          const basics = line(section, "dl", "", "computer-basics");
+          const details = line(section, "details", "", "computer-details");
+          const detailsSummary = line(
+            details,
+            "summary",
+            "Details & provenance",
+          );
+          line(
+            details,
+            "p",
+            `Acquisition: ${computer.acquisition_id || "Unavailable"} · Collection: ${computer.collection_id || "Unavailable"} · ${computer.observations} observations`,
+            "hint",
+          );
+          line(
+            details,
+            "p",
+            `Acquired: ${formatTime(computer.acquisition_time)} (${computer.acquisition_basis || "basis unavailable"}) · Imported: ${formatTime(data.imported_at)}`,
+            "hint",
+          );
+          if (computer.collection_label)
+            line(
+              details,
+              "p",
+              `Caller collection label: ${computer.collection_label}`,
+              "hint",
+            );
+          const extra = line(details, "dl", "");
+          let secondaryConflicts = false;
+          for (const [field, label] of Object.entries(labels)) {
+            const fact = computer.facts[field];
+            const basic = [
+              "hostname",
+              "host_ip",
+              "uptime_seconds",
+              "os_name",
+            ].includes(field);
+            if (!fact && !basic) continue;
+            const list = basic ? basics : extra;
+            line(list, "dt", label);
+            const value = line(list, "dd", "");
+            if (!fact) {
+              value.textContent = "Unavailable in parsed evidence";
+              continue;
+            }
+            if (
+              fact.values.length > 1 &&
+              !["host_ip", "uptime_seconds"].includes(field)
+            ) {
+              line(value, "strong", "Multiple / conflicting values: ");
+              if (!basic) secondaryConflicts = true;
+            }
+            let samples = value;
+            for (const [index, sample] of fact.values.entries()) {
+              if (index === 2) {
+                const more = line(value, "details", "", "computer-more-values");
+                line(
+                  more,
+                  "summary",
+                  `More values (${fact.values.length - 2})`,
+                );
+                samples = line(more, "div", "");
+              }
+              const target =
+                field === "uptime_seconds"
+                  ? line(samples, "div", "", "computer-uptime")
+                  : samples;
+              const button = line(
+                target,
+                "button",
+                field === "uptime_seconds"
+                  ? duration(sample.value)
+                  : typeof sample.value === "object"
+                    ? JSON.stringify(sample.value)
+                    : sample.value,
+              );
+              button.type = "button";
+              button.title = `Open original observation ${sample.provenance.record}; ${formatTime(sample.provenance.timestamp)}; time basis: ${sample.provenance.time_basis || "unknown"}`;
+              if (field === "uptime_seconds")
+                button.title = `${sample.value} seconds · ${button.title}`;
+              button.onclick = () => openRecord(sample.provenance.record);
+              if (field === "uptime_seconds")
+                line(
+                  target,
+                  "small",
+                  `${sample.provenance.timestamp ? formatTime(sample.provenance.timestamp) : "Unknown observation time"} · ${(sample.provenance.time_basis || "unknown time basis").replaceAll("_", " ")}`,
+                  "hint",
+                );
+            }
+            if (fact.overflow)
+              line(value, "span", " More values omitted (sample limit).");
+          }
+          if (!extra.childElementCount) extra.remove();
+          if (secondaryConflicts)
+            line(
+              detailsSummary,
+              "span",
+              " · Additional conflicting values",
+              "computer-extra-warning",
+            );
+          const aws = computer.aws;
+          const footer = line(section, "footer", "", "computer-evidence");
+          line(
+            details,
+            "p",
+            `AWS: ${aws.status} — ${aws.reason}`,
+            aws.status === "ambiguous" ? "computer-warning" : "hint",
+          );
+          const awsStatus = line(
+            footer,
+            "span",
+            `AWS: ${aws.status}`,
+            aws.status === "ambiguous"
+              ? "computer-aws computer-warning"
+              : "computer-aws hint",
+          );
+          awsStatus.title = aws.reason;
+          if (aws.status === "matched") {
+            const instance = line(
+              footer,
+              "button",
+              `Inventory snapshot: ${aws.instance}`,
+            );
+            instance.type = "button";
+            attach(instance, {
+              kind: "machine",
+              value: aws.instance,
+              account: aws.account,
+              region: aws.region,
+            });
+          }
+          if (computer.sample_record) {
+            const original = line(footer, "button", "Open sample observation");
+            original.type = "button";
+            original.onclick = () => openRecord(computer.sample_record);
+          }
+          const provenance = line(details, "details", "");
+          line(provenance, "summary", "Raw value provenance");
+          line(
+            provenance,
+            "pre",
+            JSON.stringify(
+              {
+                dataset_index: data.dataset_index,
+                manifest_sha256: data.manifest_sha256,
+                run_id: computer.run_id,
+                facts: computer.facts,
+              },
+              null,
+              2,
+            ),
+          );
+        }
+        prev.disabled = page === 1;
+        next.disabled = page * 4 >= data.total;
+      } catch (error) {
+        if (token === generation)
+          status.textContent = `Computer context unavailable: ${error.message}. Close and reopen to retry.`;
+      }
+    }
+    root.addEventListener("toggle", () => {
+      if (root.open) load();
+    });
+    select.onchange = () => {
+      page = 1;
+      load();
+    };
+    prev.onclick = () => {
+      page--;
+      load();
+    };
+    next.onclick = () => {
+      page++;
+      load();
+    };
+    return () => {
+      if (root.open) load();
+    };
+  }
+
   window.kamotraceReference = {
+    computerImports,
     attach,
     close,
     iamDetails,

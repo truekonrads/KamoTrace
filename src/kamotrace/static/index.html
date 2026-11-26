@@ -487,6 +487,49 @@
           </div>
         </section>
 
+        <details id="computer-imports" hidden>
+          <summary>Computers / UAC imports</summary>
+          <p class="computer-scope">
+            Historical observations · not live state · Select a value for
+            original evidence
+          </p>
+          <details class="computer-help">
+            <summary>How to interpret these cards</summary>
+            <p class="hint">
+              Host labels may be caller supplied. Missing facts are unavailable,
+              not absent. Network peers are not computer interface addresses.
+              Facts are not necessarily acquisition-time snapshots. Details
+              &amp; provenance retains acquisition context and time candidates.
+            </p>
+          </details>
+          <label
+            >Import
+            <select id="computer-import-select"></select
+          ></label>
+          <p id="computer-import-status" role="status"></p>
+          <div id="computer-cards"></div>
+          <button id="computer-prev" type="button">
+            Previous computer groups
+          </button>
+          <button id="computer-next" type="button">Next computer groups</button>
+        </details>
+        <details id="parser-coverage" hidden>
+          <summary>
+            TraceQuarry parser coverage — analysis not run; timestamps are
+            selected claim times, not necessarily activity
+          </summary>
+          <p>
+            Processing complete does not mean all sources were parsed or
+            collected. Undated observations are separate from the dated
+            timeline. Original records, time candidates and exact locators
+            remain in event JSON.
+          </p>
+          <pre id="parser-coverage-json"></pre>
+        </details>
+        <label id="undated-control" hidden
+          ><input type="checkbox" id="undated-events" /> Show only undated
+          events (no time range; histogram excludes these)</label
+        >
         <div id="query-bar" aria-label="Query and selection">
           <form id="query-form" class="query-row">
             <button
@@ -1121,7 +1164,7 @@
             ← Prev
           </button>
           <button id="detail-next" title="Next loaded event (J)">Next →</button>
-          <button id="close-detail" aria-label="Close event details">
+          <button id="close-detail" aria-label="Close event details" autofocus>
             Close
           </button>
         </span>

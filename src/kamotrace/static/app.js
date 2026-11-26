@@ -86,9 +86,11 @@ const epoch = (value) => {
 };
 const inputTime = (ms) => {
   if (epoch(local(ms)) === ms) return shown(ms);
-  const offset = (Date.parse(local(ms) + "Z") - ms) / 60000;
+  const offset =
+    (Date.parse(local(ms) + "Z") - Math.floor(ms / 1000) * 1000) / 60000;
   return (
     shown(ms) +
+    (ms % 1000 ? "." + String(ms % 1000).padStart(3, "0") : "") +
     (offset < 0 ? "-" : "+") +
     String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0") +
     ":" +
@@ -102,7 +104,7 @@ const displayTime = (value) =>
 // Explicit offsets also allow selecting either occurrence of a repeated DST hour.
 const parseInput = (value) => {
   if (
-    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})$/.test(
+    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(
       value.trim(),
     )
   )
@@ -143,7 +145,8 @@ let applied = null,
   editingFilter = null,
   expandedNotes = new Set(),
   noteScope = null,
-  detailRow = null;
+  detailRow = null,
+  refreshComputers = null;
 const queryHistory = [];
 let historyPos = -1;
 const noteEvents = new Map();
@@ -166,8 +169,10 @@ function normalize(state) {
     end = Number(s.end);
   return {
     timezone: meta.timezones.includes(s.timezone) ? s.timezone : meta.timezone,
-    start: Number.isFinite(start) ? start : meta.start_ms,
-    end: Number.isFinite(end) ? end : meta.end_ms,
+    start: Number.isFinite(start) ? start : (meta.start_ms ?? 0),
+    end: Number.isFinite(end) ? end : (meta.end_ms ?? 1000),
+    undated:
+      s.undated === true || (s.undated === undefined && meta.start_ms === null),
     search: typeof s.search === "string" ? s.search : "",
     pipeline: typeof s.pipeline === "string" ? s.pipeline : null,
     pipeline_version: s.pipeline_version ?? 1,
@@ -227,6 +232,7 @@ async function apply(state, push = true, guardDraft = false) {
       const result = await request("/api/meta", { timezone: next.timezone });
       if (requestId !== latestApply) return;
       meta = result;
+      refreshComputers?.();
     } catch (e) {
       if (requestId !== latestApply) return;
       setLoading();
@@ -243,8 +249,7 @@ async function apply(state, push = true, guardDraft = false) {
   $("timezone").value = meta.timezone;
   $("start").setAttribute("aria-label", `From (inclusive), ${meta.timezone}`);
   $("end").setAttribute("aria-label", `Until (exclusive), ${meta.timezone}`);
-  $("coverage").textContent =
-    `${number(meta.total)} events · ${local(meta.start_ms).slice(0, 10)} to ${local(meta.end_ms).slice(0, 10)} ${meta.timezone}`;
+  renderCoverage();
   timeline();
   if (push && JSON.stringify(next) !== JSON.stringify(applied)) {
     queryHistory.splice(historyPos + 1);
@@ -274,15 +279,21 @@ function go(step) {
 function query() {
   return {
     timezone: applied.timezone,
-    start: new Date(applied.start).toISOString(),
-    end: new Date(applied.end).toISOString(),
+    ...(!applied.undated
+      ? {
+          start: new Date(applied.start).toISOString(),
+          end: new Date(applied.end).toISOString(),
+        }
+      : {}),
     search: applied.search,
     tags: applied.tags,
     annotation_id: applied.annotation_id,
     rules: applied.rules,
     min_level: applied.min_level,
     command_key: applied.command_key,
-    filters: applied.filters,
+    filters: applied.undated
+      ? [...applied.filters, { field: "time_local", op: "missing" }]
+      : applied.filters,
     raw_fields: applied.raw_fields,
     ...(applied.pipeline !== null
       ? {
@@ -298,8 +309,13 @@ function syncInputs() {
   $("search").value = applied.pipeline ?? applied.search;
   pipelinePresentation();
   pipelineError("");
-  $("start").value = inputTime(applied.start);
-  $("end").value = inputTime(applied.end);
+  $("start").value = applied.undated ? "" : inputTime(applied.start);
+  $("end").value = applied.undated ? "" : inputTime(applied.end);
+  $("undated-events").checked = applied.undated;
+  $("undated-events").disabled = meta.start_ms === null;
+  $("start").disabled = $("end").disabled = applied.undated;
+  $("time-slider").hidden = applied.undated;
+  $("time-slider").toggleAttribute("disabled", applied.undated);
   updating = true;
   $("time-slider").noUiSlider.set([applied.start, applied.end]);
   updating = false;
@@ -321,8 +337,8 @@ function draft() {
     ...(pipeline && applied.pipeline === null
       ? { filters: [], tags: [], rules: [] }
       : {}),
-    start: parseInput($("start").value),
-    end: parseInput($("end").value),
+    start: applied.undated ? applied.start : parseInput($("start").value),
+    end: applied.undated ? applied.end : parseInput($("end").value),
   };
 }
 
@@ -414,18 +430,28 @@ function renderScopes() {
   const s = applied,
     out = [];
   const full = s.start === meta.start_ms && s.end === meta.end_ms;
-  out.push(
-    chip(`${shown(s.start)} → ${shown(s.end)} ${meta.timezone}`, {
-      kind: "time",
-      title: full
-        ? "Whole export. Click to adjust the time range."
-        : "Time range [from, until). Click to adjust; × resets to the whole export.",
-      onClick: () => $("start").focus(),
-      onRemove: full
-        ? null
-        : () => apply({ ...s, start: meta.start_ms, end: meta.end_ms }),
-    }),
-  );
+  if (s.undated)
+    out.push(
+      chip("Undated observations · no time range", {
+        kind: "time",
+        title:
+          "No selected timestamp. Acquisition/import time is not substituted.",
+        onClick: () => $("undated-events").focus(),
+      }),
+    );
+  else
+    out.push(
+      chip(`${shown(s.start)} → ${shown(s.end)} ${meta.timezone}`, {
+        kind: "time",
+        title: full
+          ? "Whole export. Click to adjust the time range."
+          : "Time range [from, until). Click to adjust; × resets to the whole export.",
+        onClick: () => $("start").focus(),
+        onRemove: full
+          ? null
+          : () => apply({ ...s, start: meta.start_ms, end: meta.end_ms }),
+      }),
+    );
   if (s.search)
     out.push(
       chip(`Search “${s.search}”`, {
@@ -3133,7 +3159,11 @@ function renderNoteMenu() {
 }
 
 function scopeSummary(s) {
-  const parts = [`${shown(s.start)} → ${shown(s.end)}`];
+  const parts = [
+    s.undated
+      ? "Undated observations · no time range"
+      : `${shown(s.start)} → ${shown(s.end)}`,
+  ];
   if (s.pipeline !== null)
     parts.push(`pipeline v${s.pipeline_version}: ${s.pipeline}`);
   if (s.search) parts.push(`search “${s.search}”`);
@@ -3281,18 +3311,20 @@ function range(start, end) {
     error("Choose a valid time range: start must be before the exclusive end.");
     return;
   }
-  apply({ ...applied, start, end });
+  apply({ ...applied, start, end, undated: false });
 }
 
 function paintSelection() {
   const start = parseInput($("start").value),
     end = parseInput($("end").value);
   const hours = (end - start) / 3600000;
-  $("range-duration").textContent = !Number.isFinite(hours)
-    ? "Invalid time"
-    : hours >= 48
-      ? `${(hours / 24).toFixed(1)} days`
-      : `${hours.toFixed(1)} hours`;
+  $("range-duration").textContent = applied?.undated
+    ? "Undated observations · no time range"
+    : !Number.isFinite(hours)
+      ? "Invalid time"
+      : hours >= 48
+        ? `${(hours / 24).toFixed(1)} days`
+        : `${hours.toFixed(1)} hours`;
   document.querySelectorAll("#timeline .bar").forEach((bar) => {
     const ms = Number(bar.dataset.ms);
     bar.style.opacity =
@@ -3509,9 +3541,20 @@ function detailFindings() {
 async function detail(row) {
   try {
     const data = await request(`/api/events/${row.id}`);
-    detailRow = row.record_sha256
-      ? { ...row, guardduty_findings: data.guardduty_findings }
-      : null;
+    const loaded = table
+      .getRows()
+      .find((item) => item.getData().id === row.id)
+      ?.getData();
+    row = {
+      ...loaded,
+      ...row,
+      record_sha256: data.record_sha256,
+      tags: data.tags,
+      annotations: data.annotations,
+      detections: data.detections,
+      guardduty_findings: data.guardduty_findings,
+    };
+    detailRow = row;
     $("detail-title").textContent =
       data.event_type === "manual"
         ? "Investigator-entered manual event"
@@ -3536,11 +3579,7 @@ async function detail(row) {
     }
     $("detail-id").textContent =
       `${data.event_id || data.event_type} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
-    const loaded = table
-      .getRows()
-      .find((item) => item.getData().id === row.id)
-      ?.getData();
-    showReference({ ...loaded, ...row }, $("detail-id").parentElement);
+    showReference(row, $("detail-id").parentElement);
     eventCommandLinks(data.ssm_commands);
     // Format using token-aware whitespace only: do not parse/stringify numeric evidence in JavaScript.
     let indent = 0,
@@ -3591,6 +3630,7 @@ function step(delta) {
   if (!$("detail").open || !detailRow) return;
   const rows = table.getRows();
   const index = rows.findIndex((r) => r.getData().id === detailRow.id);
+  if (index < 0) return;
   const next = rows[index + delta];
   if (!next) return;
   table.scrollToRow(next, "nearest", false);
@@ -4128,6 +4168,14 @@ function noteCell(cell) {
   return wrap;
 }
 
+function renderCoverage() {
+  $("coverage").textContent =
+    `${number(meta.total)} events · ${number(meta.undated)} undated · ` +
+    (meta.start_ms === null
+      ? "No selected timestamps"
+      : `${local(meta.start_ms).slice(0, 10)} to ${local(meta.end_ms).slice(0, 10)} ${meta.timezone}`);
+}
+
 async function init() {
   meta = await request("/api/meta");
   const preferred = localStorage.getItem("timezone");
@@ -4493,12 +4541,34 @@ async function init() {
       $("review-error").hidden = false;
     }
   };
-  $("coverage").textContent =
-    `${number(meta.total)} events · ${local(meta.start_ms).slice(0, 10)} to ${local(meta.end_ms).slice(0, 10)} ${meta.timezone}`;
+  renderCoverage();
+  $("undated-control").hidden = !meta.undated;
+  for (const id of ["all-time", "last-week", "last-three-days"])
+    $(id).disabled = meta.start_ms === null;
+  $("undated-events").onchange = () =>
+    apply({ ...applied, undated: $("undated-events").checked });
+  $("parser-coverage").hidden =
+    !meta.source_coverage?.length && !meta.uac?.attempts.length;
+  $("parser-coverage-json").textContent = JSON.stringify(
+    { sources: meta.source_coverage, preparation: meta.uac },
+    null,
+    2,
+  );
+  $("computer-imports").hidden = !meta.source_coverage?.length;
+  refreshComputers = window.kamotraceReference.computerImports(
+    request,
+    (id) => detail({ id }),
+    (value) => {
+      const ms = value ? Date.parse(value) : NaN;
+      return Number.isFinite(ms)
+        ? `${local(ms)} ${meta.timezone}`
+        : "Unavailable";
+    },
+  );
   timeline();
   noUiSlider.create($("time-slider"), {
-    start: [meta.start_ms, meta.end_ms],
-    range: { min: meta.start_ms, max: meta.end_ms },
+    start: [meta.start_ms ?? 0, meta.end_ms ?? 1000],
+    range: { min: meta.start_ms ?? 0, max: meta.end_ms ?? 1000 },
     connect: true,
     behaviour: "drag-tap",
     step: 1000,

@@ -61,6 +61,7 @@ jobs:
           mkdir -p test-results
           set -o pipefail
           uv run --locked --with playwright==1.64.1 python tests/browser_smoke.py 2>&1 | tee test-results/browser.log
+          uv run --locked --with playwright==1.64.1 python tests/browser_computers.py 2>&1 | tee test-results/computers.log
       - name: Build Docker image
         run: docker build -t kamotrace:ci .
       - uses: actions/upload-artifact@v7.0.2
