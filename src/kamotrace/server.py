@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import tempfile
 import threading
 import time
 from urllib.parse import urlsplit
@@ -234,10 +235,18 @@ def build_query(body, scalar_function):
 class Store:
     def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=()):
         with ExitStack() as startup:
+            # Disposable disk storage, never an index or a write to original evidence.
+            self.selection_directory = tempfile.TemporaryDirectory(prefix="kamotrace-selection-")
+            startup.callback(self.selection_directory.cleanup)
+            self.selection_key = None
             logger.info("Opening evidence database (read-only): %s", database)
-            self.connection = duckdb.connect(str(database), read_only=True)
+            # An independent coordinator avoids sharing mutable catalogs/security settings
+            # with another Store opening the same read-only evidence in this process.
+            self.connection = duckdb.connect(str(Path(self.selection_directory.name) / "selection.duckdb"))
             startup.callback(self.connection.close)
             self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
+            self.connection.execute(f"ATTACH '{str(database).replace(chr(39), chr(39)*2)}' AS evidence (READ_ONLY)")
+            self.connection.execute("USE evidence")
             # DuckDB's JSON numbers use doubles. This scalar accessor keeps exact numeric
             # lexemes; SQL still owns selection/grouping. Function catalogs are shared by
             # connections, so each Store owns a distinct application-generated function name.
@@ -429,6 +438,7 @@ class Store:
         from .other_events import save_manual
         with self.locked("manual.write"):
             row = save_manual(self.manual_path, self.case_identity, body)
+            self.selection_key = None
             self.connection.execute("DELETE FROM manual_raw WHERE source_record=?", [row[0]])
             self.connection.execute("INSERT INTO manual_raw VALUES (?,?,?,?,?,?,?,?,?,?)", row)
             self.meta = self.metadata()
@@ -706,6 +716,7 @@ class Store:
     def bump_log_revision(self, hashes=None):
         """Advance the log selection revision after analyst content changed (entry reviews, or event
         tags/findings on evidence linked to log entries). Caller holds the lock."""
+        self.selection_key = None
         prefix, count = self.annotation_revision.rsplit("-", 1)
         self.annotation_revision = f"{prefix}-{int(count) + 1}"
         if hashes is None or not self.commands.log_hashes.isdisjoint(hashes):
@@ -929,9 +940,26 @@ class Store:
                      REQUEST_ID.get(), operation, (time.monotonic() - started) * 1000, len(rows))
         return rows
 
-    def key_positions(self, body):
+    def selected_count(self, count_sql, params):
+        """Reuse one validated membership for counts/histograms. Caller holds the Store lock."""
+        key = (count_sql, tuple(params), self.annotation_revision)
+        if key != self.selection_key:
+            self.selection_key = None  # A failed replacement must never reuse the previous selection.
+            self.connection.execute("DROP TABLE IF EXISTS selection.matches")
+            started = time.monotonic()
+            self.connection.execute("CREATE TABLE selection.matches AS " + count_sql.replace(
+                "SELECT count(*)", "SELECT id, event_time, record_sha256", 1), params)
+            self.connection.execute("CHECKPOINT selection")
+            self.selection_key = key
+            logger.debug("query request_id=%s operation=selection.build elapsed_ms=%.3f",
+                         REQUEST_ID.get(), (time.monotonic() - started) * 1000)
+        return "SELECT count(*) FROM selection.matches"
+
+    def key_positions(self, body, *, count_sql=None, params=None):
         # Keep every ordinary milestone visible without unbounded JSON/SVG for mass tagging.
-        _, _, sql, params, _ = build_query(body, self.raw_function)
+        if count_sql is None:
+            _, _, count_sql, params, _ = build_query(body, self.raw_function)
+        sql = count_sql
         sql = sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS ms, record_sha256", 1)
         positions = self.rows("SELECT DISTINCT ms FROM (" + sql + ") matching WHERE ms IS NOT NULL AND record_sha256 IN "
             "(SELECT hash FROM review_tags WHERE slug='key-event') ORDER BY ms LIMIT 2001",
@@ -1056,7 +1084,7 @@ class Store:
         started = time.monotonic()
         with self.locked("events"):
             counted = time.monotonic()
-            total = self.connection.execute(count_sql, count_params).fetchone()[0]
+            total = self.connection.execute(self.selected_count(count_sql, count_params)).fetchone()[0]
             logger.debug("query request_id=%s operation=events.count elapsed_ms=%.3f",
                          REQUEST_ID.get(), (time.monotonic() - counted) * 1000)
             rows = self.rows(sql, params, operation="events.page")
@@ -1085,7 +1113,9 @@ class Store:
                     "overview_key_positions": {"positions_ms": [], "truncated": False}}
         start = body.get("start") or datetime.fromtimestamp(self.meta["start_ms"] / 1000, timezone.utc).isoformat()
         end = body.get("end") or datetime.fromtimestamp(self.meta["end_ms"] / 1000, timezone.utc).isoformat()
-        _, _, count_sql, params, _ = build_query({**body, "start": start, "end": end}, self.raw_function)
+        _, _, count_sql, params, _ = build_query(body, self.raw_function)
+        if parse_time(start) >= parse_time(end):
+            raise ValueError("Start must be before end (the end is exclusive)")
         if (parse_time(end) - parse_time(start)).total_seconds() / (minutes * 60) > 2000:
             raise ValueError("More than 2,000 buckets: choose a larger bucket or a shorter time range")
         # Enumerate wall-clock boundaries, retaining both folds and skipping nonexistent times.
@@ -1109,7 +1139,12 @@ class Store:
                   if a < until.timestamp() * 1000 and b > first.timestamp() * 1000]
         if len(ranges) > 2000:
             raise ValueError("More than 2,000 buckets: choose a larger bucket or a shorter time range")
-        sql = """WITH matching AS (
+        with self.locked("histogram"):
+            # Keep implicit display bounds out of cache identity so an events request and
+            # its full-history histogram share membership, including undated event counts.
+            count_sql = self.selected_count(count_sql, params) + " WHERE event_time >= ?::TIMESTAMPTZ AND event_time < ?::TIMESTAMPTZ"
+            params = [start, end]
+            sql = """WITH matching AS (
         """ + count_sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS event_ms, "
             "EXISTS (SELECT 1 FROM review_tags r WHERE r.hash=record_sha256 AND r.slug='key-event') AS is_key", 1) + """
         ), buckets AS (
@@ -1122,11 +1157,10 @@ class Store:
                max(m.event_ms) FILTER (WHERE m.is_key) AS key_last_ms
         FROM buckets b LEFT JOIN matching m ON m.event_ms >= b.start_ms AND m.event_ms < b.end_ms
         GROUP BY b.start_ms, b.end_ms ORDER BY b.start_ms"""
-        bound = params + [[a for a, _ in ranges], [b for _, b in ranges], zone]
-        with self.locked("histogram"):
+            bound = params + [[a for a, _ in ranges], [b for _, b in ranges], zone]
             rows = self.rows(sql, bound, operation="histogram.buckets")
             overview = self.daily_histogram(zone)
-            positions = self.key_positions({**body, "start": start, "end": end})
+            positions = self.key_positions(body, count_sql=count_sql, params=params)
             overview_positions = self.key_positions({"timezone": zone})
         return {"data": rows, "total": sum(r["events"] for r in rows),
                 "bucket_minutes": minutes, "sql": sql, "params": bound, "overview": overview,
@@ -1517,6 +1551,7 @@ def main(argv=None):
             store.exports.close()
         store.reviews.close()
         store.connection.close()
+        store.selection_directory.cleanup()
 
 
 if __name__ == "__main__":

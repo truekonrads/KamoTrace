@@ -117,6 +117,17 @@ contexts are inert query data, revalidated when reopened, never stored executabl
 SQL. Tag/note writes patch loaded rows in place so investigators keep their
 selection and scroll; refreshing filtered membership/counts is explicit.
 
+Store retains one validated selection in a disposable disk-backed DuckDB relation
+containing only row IDs, timestamps and review hashes. Events count and filtered
+histogram buckets/key positions reuse it under the existing Store lock; page
+retrieval and the unfiltered overview keep their existing query paths. Compiler
+SQL, bound parameters and the annotation revision identify membership, not page
+number or bucket width. A different selection replaces it, and annotation/manual
+writes invalidate it. Each Store owns a private coordinator database with evidence
+attached read-only; filesystem access is disabled after startup as before. This
+is runtime reuse, not a persistent search index, and dense selections cost disk
+space proportional to matching rows without loading all payloads into Python.
+
 Key-event prominence is the existing `key-event` tag, independent of provenance/type. Histogram queries use the shared selection compiler and aggregate the tagged count and exact first/last epoch-millisecond positions per bucket; the daily overview is deliberately unfiltered. Both charts show distinct tagged timestamps as diamonds, capped at 2,000 positions per selection/overview with explicit truncation warnings and endpoint spans for dense buckets. Counts always include all matching events. Tag writes patch rows and refresh review marks only, retaining applied counts/membership until an explicit rerun. No evidence or storage schema changes are needed for prominence.
 
 The frontend uses static JavaScript and vendored Tabulator/noUiSlider rather than

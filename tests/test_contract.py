@@ -1,6 +1,7 @@
 """HTTP, MCP and Suzaku contract tests with a disposable, real CloudTrail DuckDB database."""
 from datetime import datetime, timezone
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import gc
 import base64
@@ -2511,6 +2512,35 @@ class BrowserContract(unittest.TestCase):
             self.call("/api/reviews", {"action": "untag", "slug": "key-event", "hashes": hashes})
         self.assertEqual(sum(r["key_events"] for r in self.call("/api/meta")[1]["histogram"]), 0)
 
+    def test_histogram_selection_concurrency_and_review_invalidation(self):
+        selection = {"search": "sEnDcOmMaNd", "timezone": "Asia/Jakarta"}
+        scoped = {**selection, "start": "2026-10-24T16:59:59Z", "end": "2026-10-25T16:59:59Z"}
+        queries = [(selection, 3), (scoped, 2), ({"pipeline_version": 1,
+            "pipeline": 'search "StartSession" OR search "SendCommand"',
+            "start": scoped["start"], "end": scoped["end"]}, 3)]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            pending = [(route, expected, pool.submit(self.call, route, body))
+                       for body, expected in queries for route in ("/api/events", "/api/histogram")]
+            for route, expected, response in pending:
+                status, result = response.result()
+                self.assertEqual(status, 200, result)
+                self.assertEqual(result["last_row" if route == "/api/events" else "total"], expected)
+        row = self.call("/api/events", scoped)[1]["data"][0]
+        selected = {**scoped, "tags": ["histogram-reuse"]}
+        self.assertEqual(self.call("/api/histogram", selected)[1]["total"], 0)
+        try:
+            status, result = self.call("/api/reviews", {"action": "tag", "slug": "histogram-reuse",
+                "color": "#7c3aed", "hashes": [row["record_sha256"]]})
+            self.assertEqual(status, 200, result)
+            self.assertEqual(self.call("/api/events", selected)[1]["last_row"], 1)
+            self.assertEqual(self.call("/api/histogram", selected)[1]["total"], 1)
+            # Reuse is independent of pagination and bucket width, not the time/filter scope.
+            self.assertEqual(self.call("/api/events", {**selected, "page": 2, "size": 25})[1]["data"], [])
+            self.assertEqual(self.call("/api/histogram", {**selected, "bucket_minutes": 60})[1]["total"], 1)
+        finally:
+            self.call("/api/reviews", {"action": "untag", "slug": "histogram-reuse", "hashes": [row["record_sha256"]]})
+        self.assertEqual(self.call("/api/histogram", selected)[1]["total"], 0)
+
     def test_histogram_uses_all_filters_local_buckets_and_zero_fills(self):
         body = {"timezone": "Asia/Jakarta", "start": "2026-10-25T00:00:00+07:00", "end": "2026-10-27T00:00:00+07:00",
                 "bucket_minutes": 1440, "filters": [
@@ -2846,13 +2876,20 @@ class OtherEventsContract(unittest.TestCase):
             self.assertEqual(rest("/api/events", selection)["last_row"], 2)
             self.assertEqual(rest("/api/histogram", selection)["total"], 2)
             raw = '{"date":"2026-10-25T00:00:00+08:00","content":{"description":"Unauthorised payment <script>neverRun()</script>","amount":9007199254740993,"fraction":0.123456789012345678901}}'
+            manual_search = {"search": "Unauthorised payment"}
+            self.assertEqual(rest("/api/histogram", manual_search)["total"], 0)
             new = rest("/api/manual-events", {"record_json": raw, "origin": "Statement review", "author": "Analyst one"})
+            self.assertEqual(rest("/api/events", manual_search)["last_row"], 1)
+            self.assertEqual(rest("/api/histogram", manual_search)["total"], 1)
             rest("/api/reviews", {"action": "tag", "hashes": [new["record_sha256"]], "slug": "key-event", "color": "#c45436"})
             note = rest("/api/reviews", {"action": "annotate", "hashes": [new["record_sha256"]], "body": "Synthetic finding"})
+            self.assertEqual(rest("/api/histogram", manual_search)["total"], 1)
             changed = {"id": new["id"], "updated": new["updated"], "record_json": raw.replace("Unauthorised payment", "Corrected payment"),
                        "origin": "Statement review, corrected", "author": "Analyst two"}
             edit = rest("/api/manual-events", changed)
             self.assertEqual(edit["record_sha256"], new["record_sha256"])
+            self.assertEqual(rest("/api/histogram", manual_search)["total"], 0)
+            self.assertEqual(rest("/api/events", {"search": "Corrected payment"})["last_row"], 1)
             rest("/api/manual-events", changed, status=409)
             rest("/api/manual-events", {**changed, "id": 2}, status=400)
             detail = rest(f"/api/events/{new['id']}")
