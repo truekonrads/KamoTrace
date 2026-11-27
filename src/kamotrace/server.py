@@ -1146,7 +1146,7 @@ class Store:
             params = [start, end]
             sql = """WITH matching AS (
         """ + count_sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS event_ms, "
-            "EXISTS (SELECT 1 FROM review_tags r WHERE r.hash=record_sha256 AND r.slug='key-event') AS is_key", 1) + """
+            "record_sha256 IN (SELECT hash FROM review_tags WHERE slug='key-event') AS is_key", 1) + """
         ), buckets AS (
             SELECT unnest(?::BIGINT[]) AS start_ms, unnest(?::BIGINT[]) AS end_ms
         )
