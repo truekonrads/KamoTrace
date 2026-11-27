@@ -379,8 +379,15 @@ class Store:
     def prepare_other_events(self, database, paths, identity):
         from .other_events import EVENTS_VIEW, FORMAT, MANUAL_BASE, RAW_SCHEMA, manual_rows
         from .computer_registry import registered
+        from .datasets import read as dataset_bindings
         self.uac_registry = registered(database)
-        paths = [*paths, *(Path(r["database"]) for r in self.uac_registry["imports"])]
+        binding = dataset_bindings(database)
+        saved = [Path(r["database"]).resolve() for r in binding["datasets"]]
+        discovered = [Path(p).resolve() for p in (*paths, *(r["database"] for r in self.uac_registry["imports"]))]
+        if saved and set(discovered) - set(saved):
+            raise ValueError("New datasets must be registered with kamotrace auto before reopening this bound case; "
+                             "startup never changes saved dataset order")
+        paths = [*saved, *discovered]
         paths = list(dict.fromkeys(Path(p).resolve() for p in paths))
         self.case_identity = json.loads(identity)
         self.manual_path = database.with_suffix(".manual.duckdb")

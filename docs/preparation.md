@@ -66,6 +66,119 @@ silently dropping that root. Existing history checkpoints, including those from
 before S3 support, retain their original source on resume; use a new destination
 to collect a different source.
 
+#### AWS-only EKS context and existing logs
+
+EKS is opt-in and never connects to a Kubernetes API endpoint, node or pod.
+`kamotrace eks` collects current cluster configuration (including Auto Mode
+compute settings), access entries/associated policies, Pod Identity associations,
+managed nodegroups, Fargate profiles, add-ons and identity-provider configurations.
+These are collection-time observations, not incident-time state, effective access
+or an enumeration of Kubernetes workloads/RBAC/aws-auth. Log-group retention,
+storage class, KMS metadata and stream metadata are also retained. Group discovery
+is independent of current clusters, so conventional groups for deleted clusters
+can still be read.
+
+```powershell
+# Current context only; no log bodies:
+kamotrace eks --output C:\cases\example\eks-context --regions ap-southeast-3
+# Existing conventional /aws/eks/*/cluster logs, start inclusive / end EXCLUSIVE:
+kamotrace eks --output C:\cases\example\eks --regions ap-southeast-3 --start 2026-10-01T00:00:00Z --end 2026-10-02T00:00:00Z --database C:\cases\example\eks.duckdb
+# An explicitly named existing workload group can be added with:
+# --log-group ap-southeast-3:/aws/containerinsights/example/application
+# Verified offline import, no AWS calls (new database required):
+kamotrace eks --from-export C:\cases\example\eks --database C:\cases\example\eks-offline.duckdb
+kamotrace serve --database C:\cases\example\case.duckdb --other-events C:\cases\example\eks.duckdb
+# Auto collects/imports/attaches it; EKS bounds are separate from CloudTrail bounds:
+kamotrace auto C:\cases\new-example --collect-eks --eks-start 2026-10-01T00:00:00Z --eks-end 2026-10-02T00:00:00Z
+# Or attach an existing EKS export without collecting EKS again:
+kamotrace auto C:\cases\offline --source C:\exports\cloudtrail.json --eks-export C:\cases\example\eks --skip-inventory --skip-enrich --skip-suzaku
+```
+
+Without both EKS bounds, only current metadata is collected. Existing workload
+logs hosted by CloudWatch can be read without node access, but are not discovered
+automatically: name them explicitly. All existing streams in a selected group are
+eligible; no logging is enabled and no IAM changes are made. Only Standard groups
+use `FilterLogEvents`; other storage classes are reported as unsupported, not empty.
+No S3 archive bodies, Config history or CloudTrail are collected by this command;
+existing CloudTrail collection remains separate. No future logging setting can
+recreate absent historical logs.
+
+Before reading log bodies, `eks` (including collection through `auto`) warns on
+stderr when selected groups in a region report at least **1 GB (1,000,000,000
+bytes)** of combined CloudWatch `storedBytes`. This is current group-wide
+storage, **not** a requested-window or download-size estimate. Missing size
+metadata and undiscovered groups are not counted; no warning does not establish
+that the window is small. The warning is retained in the export manifest and
+coverage observation. Inventory-only runs do not warn. Collection continues
+with the existing limits, without a confirmation prompt or extra AWS requests.
+See AWS's [log-group metadata contract](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_LogGroup.html).
+
+The initial global limits are 2,000 EKS/Logs API requests, 100,000 imported log
+events and 100 MiB of log-message bytes (`--max-calls`, `--max-events`,
+`--max-bytes`; prefix with `--eks-` in auto). Identity/region discovery and SDK
+retries are additional requests. Raw acquisition can exceed the byte budget by
+one CloudWatch page (up to 1 MiB), plus JSON/metadata overhead. Raw and imported
+copies both use disk. Responses are streamed to files, not accumulated as a log
+history in memory. Groups/regions are processed in sorted order: a global limit
+can leave later sources unread. Adjust explicit limits in a **new export/target**
+when broader acquisition is needed. Retrieval/list operations and any denied,
+unsupported, token-loop or budget-limited results remain in `manifest.json` and
+in a searchable coverage observation. An empty retrieved window does not prove
+logging was enabled or delivery complete throughout it. Current storage figures
+are group-wide, not estimates for the selected window. Read APIs may incur AWS
+request/data charges; this collector does not issue Logs Insights queries or exports.
+
+Exports contain hashed `raw.jsonl` API envelopes and `events.jsonl`, published
+atomically to a new folder. Interruptions before publication discard private
+staging; rerun to recollect, not to resume an expired page token. A published
+partial-coverage snapshot is immutable. Auto verifies hashes and request scope
+before reusing it without AWS calls, imports `case.eks.duckdb` separately from
+CloudTrail, and passes `--other-events` to serve. `--skip-download` forbids online
+EKS collection; use `--eks-export` instead. `--no-serve` prints the attachment flag
+needed when starting later. Existing viewers do not reload attachments live.
+Auto also accepts repeatable `--other-events` paths to register any immutable
+import-other dataset. It records `case.datasets.json`, bound to the primary
+evidence identity, with source paths, SHA256s, row counts and physical offsets.
+Existing bindings retain their positions; later EKS, UAC or other datasets append
+without shifting existing row IDs. **EKS has no permanently last position.**
+Registered acquisition arrivals are included using the same append rule. Paths
+are deduplicated; missing/changed sources or a wrong-evidence binding stop startup
+rather than silently dropping or replacing data. There is no implicit removal.
+`serve --database` reads these saved bindings at startup without preparing or
+modifying them; it does not hot-reload a running viewer. Once a binding exists,
+new explicit or UAC-discovered sources must first be registered through auto;
+startup refuses transient additions whose order could be lost on a later reopen.
+Auto reports the ordered
+rows/offsets and keeps earlier bindings even if their original flags are omitted.
+When first recording a case, carry forward all existing manual `--other-events`
+flags in their current order: it cannot infer an already-running viewer's command.
+Keep the binding file with the case. Existing enrichment, annotation and primary
+evidence bindings must not be replaced merely to add data.
+
+The timeline calls these records **other** events with origin
+`AWS EKS context and CloudWatch logs (AWS APIs only)`. Current API observations
+use acquisition time; log rows use the CloudWatch event timestamp, retaining
+event ID, stream, ingestion time and opaque original message. JSON inside a log
+message stays text, preserving its numbers and audit stages without guessed
+CloudTrail links. Check both the original message's timestamps/identity and the
+envelope before drawing conclusions. Messages may contain sensitive workload data.
+
+Required read actions are `sts:GetCallerIdentity`, `ec2:DescribeRegions` (only
+with `all`), EKS `ListClusters`, `DescribeCluster`, `ListAccessEntries`,
+`DescribeAccessEntry`, `ListAssociatedAccessPolicies`,
+`ListPodIdentityAssociations`, `DescribePodIdentityAssociation`,
+`ListNodegroups`, `DescribeNodegroup`, `ListFargateProfiles`,
+`DescribeFargateProfile`, `ListAddons`, `DescribeAddon`,
+`ListIdentityProviderConfigs`, `DescribeIdentityProviderConfig`, plus
+`logs:DescribeLogGroups`, `logs:DescribeLogStreams`, and `logs:FilterLogEvents`
+when reading bodies. The command does not request `eks:AccessKubernetesApi` or
+log unmasking. Review any needed permissions with your AWS administrator; the
+existing combined `kamotrace policy` template does not yet include this opt-in
+collector. See the official [EKS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_eks.html),
+[EKS control-plane logging](https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html),
+[FilterLogEvents pagination and original messages](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_FilterLogEvents.html),
+and [CloudWatch log classes](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatch_Logs_Log_Classes.html).
+
 #### Current AWS network inventory
 
 ```powershell

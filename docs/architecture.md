@@ -17,9 +17,11 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | --- | --- |
 | `cli.py`, `auto.py` | Dispatch commands and orchestrate recoverable preparation; reuse stage implementations rather than reimplementing them. |
 | `download.py` | Checkpointed collection of selected CloudTrail, SSM, GuardDuty and inventory data using an existing AWS login. |
+| `eks.py` | Opt-in AWS-only EKS current context and bounded existing CloudWatch log collection, hashed immutable exports and shared other-event import; no Kubernetes access. |
 | `trailcheck.py`, `ssmcheck.py`, `aws_policy.py` | Audit collection configuration/coverage and generate reviewable permission templates; never grant permissions or change AWS configuration. |
 | `importer.py` | Stream CloudTrail JSON into evidence DuckDB, verify canonical hashes and provenance, and provide output locking/staging/publication helpers. |
 | `other_events.py` | Stream provider-neutral JSONL into immutable DuckDB datasets and publish revisioned investigator-entered manual events separately. |
+| `datasets.py` | Persist evidence-bound append-only dataset startup bindings; preserve source order/offsets as EKS, UAC or other inputs arrive. |
 | `suzaku.py`, `guardduty.py`, `enrich.py` | Build evidence-bound derived sidecars and load them read-only for investigation. |
 | `get_suzaku.py`, `get_dbip.py` | Download and verify optional external tools/data, separately from the application distribution. |
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
@@ -72,6 +74,19 @@ Browser and MCP writes go through that Store, including optimistic note-edit
 checks. Sidecars and exports are loaded at startup, not live-watched.
 
 `other_events.py` uses the same event-column contract for immutable JSONL datasets, with explicit `other` labels, origin manifests, exact JSON numbers and namespaced review keys. Store attaches additional datasets read-only, then builds one temporary `events`/`browse_events` projection used by the shared query compiler, tag/Findings joins, histograms, exports and MCP. AWS linkage loaders run against the primary dataset before this union, so generic events cannot acquire guessed SSM or detection links. A generic import can also be the primary dataset of an AWS-free case.
+
+`auto` records additional immutable inputs in `<database stem>.datasets.json`
+under the shared lock/staging/publication discipline. The binding keeps the primary
+evidence identity and each source's path, file hash, record count and physical
+offset. Existing entries remain in order; only new paths append, independent of
+source type. Store reads and verifies this binding first; new explicit or UAC-discovered
+paths must be registered through auto before a bound case can reopen. Legacy cases
+without bindings retain their existing startup order. Startup never registers or
+repairs data. Auto persists new registrations; missing or changed
+bound sources fail rather than disappearing. This preserves existing row IDs as
+new datasets arrive without changing content-addressed review identities. New
+sources invalidate the derived event cache normally; active viewers still need
+a coordinated restart, not an implicit live rebind.
 
 The immutable normalized columns (excluding `raw_event`) live in a derived
 `<database stem>.event-index.duckdb` cache. The first startup uses one set-based

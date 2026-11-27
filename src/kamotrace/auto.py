@@ -1,7 +1,7 @@
 """Full-auto case preparation: tools, AWS collection, import, enrichment and detections, then the UI.
 
 Stages run in dependency order and reuse the other commands' code: get-suzaku, get-dbip, download,
-import, enrich, suzaku, guardduty, inventory, serve. Rerun the same command after a failure or interruption: each stage
+import, enrich, suzaku, guardduty, inventory, eks, serve. Rerun the same command after a failure or interruption: each stage
 keeps verified completed work and redoes only what is missing or partial.
 """
 import argparse
@@ -16,13 +16,13 @@ import duckdb
 import ijson
 from botocore.exceptions import BotoCoreError, ClientError
 
-from . import download, get_dbip, get_suzaku, guardduty, inventory, server
+from . import computer_registry, datasets, download, eks, get_dbip, get_suzaku, guardduty, inventory, server
 from .enrich import SCHEMA as ENRICH_SCHEMA, Source, build as enrich, read_geolite2
 from .importer import build as import_evidence, expand, in_staging, lock_path, sha256, write_lock
 from .suzaku import (LEVELS, SCHEMA as SUZAKU_SCHEMA, evidence_identity, identify_sidecar, import_timeline,
                      run_options, run_suzaku)
 
-STAGES = ("get-suzaku", "get-dbip", "download", "import", "enrich", "suzaku", "guardduty", "inventory", "serve")
+STAGES = ("get-suzaku", "get-dbip", "download", "import", "enrich", "suzaku", "guardduty", "inventory", "eks", "serve")
 
 
 class StageError(Exception):
@@ -177,6 +177,17 @@ def parser():
     inputs.add_argument("--ssm-export", type=Path, help="Existing SSM export to show in the UI (with --source/--skip-download)")
     inputs.add_argument("--inventory-export", type=Path, help="Existing network and IAM inventory snapshot (read-only; no AWS calls)")
     inputs.add_argument("--skip-inventory", action="store_true", help="Do not collect or show network/IAM inventory (also omit inventory from --services)")
+    inputs.add_argument("--other-events", type=Path, action="append", default=[], help="Register another immutable dataset; repeatable. Previously registered order/offsets remain stable")
+    eks_options = parser.add_argument_group("optional AWS-only EKS collection and import")
+    eks_mode = eks_options.add_mutually_exclusive_group()
+    eks_mode.add_argument("--collect-eks", action="store_true", help="Collect current EKS context; existing logs only with both --eks-start/--eks-end")
+    eks_mode.add_argument("--eks-export", type=Path, help="Existing verified EKS export; import without AWS calls")
+    eks_options.add_argument("--eks-start", help="CloudWatch start inclusive (ISO timestamp with timezone)")
+    eks_options.add_argument("--eks-end", help="CloudWatch end EXCLUSIVE; independent of CloudTrail's inclusive --end")
+    eks_options.add_argument("--eks-log-group", action="append", default=[], metavar="REGION:NAME")
+    eks_options.add_argument("--eks-max-calls", type=int, default=2000)
+    eks_options.add_argument("--eks-max-events", type=int, default=100000)
+    eks_options.add_argument("--eks-max-bytes", type=int, default=100 * 1024 * 1024)
     enrichment = parser.add_argument_group("IP enrichment (kamotrace get-dbip / enrich)")
     enrichment.add_argument("--skip-enrich", action="store_true", help="No IP enrichment")
     enrichment.add_argument("--geolite2", dest="sources", action=Source, metavar="FOLDER",
@@ -222,7 +233,11 @@ def main(argv=None):
         options.error("--skip-inventory cannot be combined with --inventory-export")
     if args.skip_inventory and "inventory" in args.services:
         options.error("--skip-inventory cannot be combined with --services inventory")
-    for path in (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules, args.guardduty_findings,
+    if args.skip_download and args.collect_eks:
+        options.error("--skip-download is offline; use --eks-export instead of --collect-eks")
+    if not args.collect_eks and (args.eks_start or args.eks_end or args.eks_log_group):
+        options.error("EKS log collection options require --collect-eks")
+    for path in (*(args.source or []), *args.other_events, args.ssm_export, args.inventory_export, args.eks_export, args.suzaku, args.timeline, args.rules, args.guardduty_findings,
                  *(p for _, p in args.sources or [])):
         if path is not None and not path.exists():
             options.error(f"not found: {path}")
@@ -230,6 +245,8 @@ def main(argv=None):
         for value, end in ((args.start, False), (args.end, True)):
             if value:
                 download.timestamp(value, end)
+        eks_scope = eks.scope(args.regions, args.profile, args.eks_start, args.eks_end, args.eks_log_group,
+                              args.eks_max_calls, args.eks_max_events, args.eks_max_bytes)
     except ValueError as error:
         options.error(str(error))
 
@@ -243,13 +260,25 @@ def main(argv=None):
     published = (database, database.with_suffix(".enrichment.duckdb"), database.with_suffix(".detections.duckdb"),
                  database.with_suffix(".guardduty.duckdb"))
     outputs = {*published, *map(lock_path, published)}
+    binding_output = database.with_suffix(".datasets.json")
+    outputs.update((binding_output, lock_path(binding_output)))
+    eks_database = database.with_suffix(".eks.duckdb") if args.collect_eks or args.eks_export else None
+    eks_output = target / "eks"
+    if eks_database:
+        outputs.update((eks_database, lock_path(eks_database)))
     inputs = (*(args.source or []), args.ssm_export, args.inventory_export, args.suzaku, args.timeline, args.rules,
-              args.guardduty_findings, *(p for _, p in args.sources or []))
+              args.guardduty_findings, args.eks_export, *args.other_events, *(p for _, p in args.sources or []))
     for path in inputs:
         if path is not None and path.resolve() in outputs:
             options.error(f"{path} is an input but also a path this run writes; choose another --database or TARGET")
     if args.inventory_export and any(path.is_relative_to(args.inventory_export.resolve()) for path in outputs):
         options.error("The database and its sidecars/locks must be outside the original --inventory-export")
+    if args.eks_export and any(path.is_relative_to(args.eks_export.resolve()) for path in outputs):
+        options.error("The database and its sidecars/locks must be outside the original --eks-export")
+    if args.collect_eks:
+        for path in (*inputs, *outputs, folder, tools):
+            if path is not None and (path.resolve().is_relative_to(eks_output) or path.resolve() == lock_path(eks_output)):
+                options.error(f"{path} overlaps the EKS output; choose another TARGET")
     if not args.source and "inventory" in set(args.services + (collection(folder) or {}).get("services", [])):
         snapshot = folder / "inventory"
         for path in (*outputs, tools):
@@ -479,19 +508,51 @@ def main(argv=None):
                     say(stage, f"collecting current configuration into {inventory_export}")
                     inventory.build(inventory_export, profile=args.profile, regions=args.regions, lock=False)
 
-        # 9. UI: serve's defaults pick up the sidecars beside the database.
+        # 9. EKS stays separate from original CloudTrail, through the shared other-event importer.
         stage = STAGES[8]
+        if eks_database:
+            eks_export = args.eks_export or eks_output
+            if args.collect_eks:
+                if eks_export.exists():
+                    if eks.read_export(eks_export)["scope"] != eks_scope:
+                        raise StageError("Existing EKS export has different scope; use a new TARGET")
+                    say(stage, f"reusing verified {eks_export}; no AWS calls")
+                else:
+                    say(stage, f"collecting bounded AWS-only EKS context into {eks_export}")
+                    eks.build(eks_export, profile=args.profile, regions=args.regions,
+                              start=args.eks_start, end=args.eks_end, log_groups=args.eks_log_group,
+                              max_calls=args.eks_max_calls, max_events=args.eks_max_events, max_bytes=args.eks_max_bytes)
+            eks.prepare_import(eks_export, eks_database)
+            info = eks.read_export(eks_export)
+            gaps = sum(op["status"] != "retrieved" for op in info["operations"])
+            say(stage, f"{info['log_events']} log events, {gaps} coverage gaps; attached {eks_database}")
+        else:
+            say(stage, "skipped; opt in with --collect-eks or --eks-export")
+
+        # 10. UI: serve's defaults pick up the original AWS sidecars beside the database.
+        stage = STAGES[9]
+        other_events = list(args.other_events)
+        if other_events or eks_database or binding_output.exists():
+            other_events.extend(Path(entry["database"]) for entry in computer_registry.registered(database)["imports"])
+            if eks_database:
+                other_events.append(eks_database)
+            binding = datasets.append(database, other_events)
+            other_events = [Path(item["database"]) for item in binding["datasets"]]
+            for index, item in enumerate(binding["datasets"], 1):
+                say(stage, f"attachment {index}: {item['database']}; rows={item['records']}; source_record offset={item['offset']}")
         if args.no_serve:
             say(stage, f"skipped; start later with: kamotrace serve --database {database}"
                 + (f" --ssm-export {ssm_export}" if ssm_export else "")
-                + (f" --inventory-export {inventory_export}" if inventory_export else ""))
+                + (f" --inventory-export {inventory_export}" if inventory_export else "")
+                + "".join(f" --other-events {path}" for path in other_events))
             return 0
         locks.close()  # Preparation is done; the server only reads the database and sidecars.
         say(stage, "starting the local browser UI (Ctrl+C to stop)")
         run_command(server.main, ["--database", str(database), "--port", str(args.port),
                                  "--mcp-transport", args.mcp_transport] +
                     (["--ssm-export", str(ssm_export)] if ssm_export else []) +
-                    (["--inventory-export", str(inventory_export)] if inventory_export else []), "serve")
+                    (["--inventory-export", str(inventory_export)] if inventory_export else []) +
+                    [arg for path in other_events for arg in ("--other-events", str(path))], "serve")
         return 0
     except KeyboardInterrupt:
         print(f"kamotrace auto interrupted during {stage}; rerun the same command to resume.", file=sys.stderr)
