@@ -426,6 +426,27 @@ The server never calls external services. Suzaku, GuardDuty and IP enrichment
 sidecars beside the database are picked up automatically. Changing a sidecar,
 the inventory snapshot or the SSM export requires restarting the server.
 
+Startup automatically creates `<database stem>.event-index.duckdb`, a disposable
+cache of normalized fields from the primary database and its ordered additional
+datasets. The first build performs set-based normalization; subsequent starts
+validate and query the persistent cache read-only instead of normalizing again.
+Validation still hashes the complete source files and scans cached fields in
+physical-ID order with SHA256 and explicit dataset-membership checks, so restart
+cost is not zero. Old v1 caches using XOR checksums are automatically rebuilt.
+Source content, membership/order, producer definitions,
+schema or DuckDB version changes invalidate the cache. Raw originals remain in
+the read-only evidence databases; manual events, Findings and Event tags remain
+separate and live. The cache is not a raw-text search index.
+
+Allow space beside the evidence for this derived file and its private build,
+plus runtime temporary/spill storage on the system temporary filesystem.
+Startup logs distinguish `event_index_built` from `event_index_reused` timings.
+After stopping the server, you may remove only the derived event-index cache to
+force a fresh build; never remove evidence or investigator sidecars. An unknown
+or unreadable file at that path is refused, not overwritten: inspect/move it
+yourself before retrying. As with other prepared sidecars, keep one server owner
+per case and do not change attached source databases while serving them.
+
 Only code, synthetic tests and third-party browser assets belong in this
 repository. Databases, `event_history*.json`, enrichment JSONL, `.mmdb` files and
 the `data/` directory are gitignored; keep evidence outside the repository.

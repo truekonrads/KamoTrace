@@ -25,6 +25,7 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
 | `computers.py`, `computer_registry.py` | Summarize bounded historical computer facts from attached prepared ECS datasets; discover evidence-bound registered acquisitions read-only without owning preparation, registration or recovery. |
 | `server.py`, `pipeline.py` | Own investigation state and REST validation/query execution; parse and compile the versioned filter language. |
+| `event_index.py` | Build and validate a disposable persistent normalized-field cache; never own raw originals or investigator state. |
 | `ssm.py` | Load JSON-backed command/output data, preserve system/plugin structure and link exact command identities to CloudTrail. |
 | `mcp_server.py` | Map MCP tools to the running server's REST API, without owning evidence or annotations. |
 | `static/app.js`, `index.html`, `app.css` | Event and SSM workspaces, query state, Findings and Event tags. |
@@ -71,6 +72,36 @@ Browser and MCP writes go through that Store, including optimistic note-edit
 checks. Sidecars and exports are loaded at startup, not live-watched.
 
 `other_events.py` uses the same event-column contract for immutable JSONL datasets, with explicit `other` labels, origin manifests, exact JSON numbers and namespaced review keys. Store attaches additional datasets read-only, then builds one temporary `events`/`browse_events` projection used by the shared query compiler, tag/Findings joins, histograms, exports and MCP. AWS linkage loaders run against the primary dataset before this union, so generic events cannot acquire guessed SSM or detection links. A generic import can also be the primary dataset of an AWS-free case.
+
+The immutable normalized columns (excluding `raw_event`) live in a derived
+`<database stem>.event-index.duckdb` cache. The first startup uses one set-based
+`INSERT SELECT` per source, preserving physical occurrences and offset row IDs,
+and verifies the exact source-record/hash/file/ordinal multiset against raw tables.
+The cache identity binds the ordered source paths, complete source-file SHA256s
+(including metadata and producer view definitions), normalization SELECTs, column
+names/types, cache schema version and DuckDB version. Source hashes are rechecked
+before atomic publication. Cache schema v2 records a row count and SHA256 of
+fixed-size SHA256 row digests in physical-ID order, not an XOR aggregate. Fields
+are cast to text before JSON-array encoding, preserving JSON numeric lexemes and
+distinguishing SQL NULL from empty strings or the string `null`. Reuse verifies
+the schema, scans/hashes every normalized field and checks every physical ID and
+its expected dataset range. Python fetches IDs and 32-byte digests in bounded
+1,000-row batches; DuckDB performs the ordered scan/sort and may spill. This is
+not a bound on total query RSS or spill volume. DuckDB also checks pages as read.
+This detects accidental damage, not a malicious writer forging the cache and its
+manifest. An unreadable/unrecognized file is never automatically overwritten;
+an identifiable stale/incomplete cache is rebuilt under the existing output lock,
+private staging and publication discipline. Integrity validation is real work:
+reuse still reads/hashes source files and scans cached columns, not just a lazy
+attachment. Old v1 XOR-signature caches are rebuilt rather than reused. Neither
+cache existence nor attachment alone proves readiness.
+
+Store attaches the published cache `READ_ONLY` and queries it directly, without
+copying it into a TEMP table. A temporary `event_raw` union reads original JSON
+from the source databases and joins on exact global `source_record`, not hashes,
+times or addresses. Manual events stay in their separate live branch; reviews,
+tags, enrichment, detections and external exports are not cached by this feature.
+Request-time external file access remains disabled after startup.
 
 Manual key events persist in `<database stem>.manual.duckdb`, bound to the primary import identity. Create/edit validates a record, holds the existing output lock, copies a positively identified manual dataset into private staging, retains the old revision and atomically publishes the replacement. Store updates its temporary manual snapshot under the query lock. Manual events use stable namespaced review keys, separate from changing `content_sha256`; imported records remain immutable. Edits require the current `updated` stamp. Revision authors are self-reported. The small investigator-authored dataset is copied per write; large external datasets use streamed immutable imports, not this write path. One Store/server must own the case. See the [public contract](user-guide.md#other-events-and-manual-key-events).
 

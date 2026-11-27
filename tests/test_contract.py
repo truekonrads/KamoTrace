@@ -2767,6 +2767,132 @@ class MFAContract(unittest.TestCase):
 class OtherEventsContract(unittest.TestCase):
     call = BrowserContract.call
 
+    def test_persistent_index_reuse_invalidation_and_read_only_originals(self):
+        from kamotrace.other_events import EVENTS_VIEW, build as import_other
+        from kamotrace.importer import sha256, write_lock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, database = root / "source.jsonl", root / "events.duckdb"
+            raw = '{"date":"2026-10-25T00:00:00.123456Z","content":{"n":9007199254740993,"d":0.123456789012345678901234567890,"text":"日本語"}}'
+            source.write_text(raw + "\n" + raw, encoding="utf-8")
+            import_other([source], database, "Synthetic repeated observations")
+            second = root / "second.duckdb"
+            source.write_text('{"date":"2026-10-26T00:00:00Z","content":"asymmetric second source"}')
+            import_other([source], second, "Synthetic second source")
+            cache = database.with_suffix(".event-index.duckdb")
+            before = {p: sha256(p) for p in (database, second)}
+
+            def open_store(paths=()):
+                store = Store(database, other_events=paths)
+                self.addCleanup(store.selection_directory.cleanup)
+                return store
+
+            def close(store):
+                store.connection.close()
+                store.reviews.close()
+
+            store = open_store([second])
+            try:
+                self.assertEqual(store.event_index_status, "built")
+                expected = [store.detail(i) for i in (1, 2, 3)]
+                self.assertEqual(expected[0]["record_sha256"], expected[1]["record_sha256"])
+                self.assertEqual([d["source_ordinal"] for d in expected], [1, 2, 1])
+                self.assertIn("0.123456789012345678901234567890", expected[0]["raw_json"])
+                self.assertIn("9007199254740993", expected[0]["raw_json"])
+                for table in ("evidence.raw_events", "normalized_cache.event_index"):
+                    with self.assertRaises(duckdb.Error):
+                        store.connection.execute("DELETE FROM " + table)
+                manual = store.manual_write({"record_json": '{"date":"2026-10-27T00:00:00Z","content":"live manual"}', "origin": "Investigator"})
+            finally:
+                close(store)
+            cache_hash = sha256(cache)
+            store = open_store([second])
+            try:
+                self.assertEqual(store.event_index_status, "reused")
+                self.assertEqual([store.detail(i) for i in (1, 2, 3)], expected)
+                self.assertEqual(store.meta["total"], 4)
+                self.assertEqual(store.detail(manual["id"])["event_type"], "manual")
+                self.assertEqual(sha256(cache), cache_hash)
+            finally:
+                close(store)
+            # Changing membership must not reuse a cache with obsolete global ID offsets.
+            store = open_store()
+            try:
+                self.assertEqual(store.event_index_status, "built")
+                self.assertEqual(store.meta["total"], 3)
+                self.assertIsNone(store.detail(3))
+            finally:
+                close(store)
+            # An even-row association change used to cancel out of the XOR checksum.
+            with duckdb.connect(str(cache)) as connection:
+                connection.execute("UPDATE event_index SET dataset_index=99")
+            store = open_store()
+            try:
+                self.assertEqual(store.event_index_status, "built")
+                self.assertEqual([store.detail(i) for i in (1, 2)], expected[:2])
+                self.assertEqual(store.meta["total"], 3)
+            finally:
+                close(store)
+            # Cache v1 used the unsafe XOR signature and must never be reused as v2.
+            with duckdb.connect(str(cache)) as connection:
+                run = json.loads(connection.execute("SELECT metadata FROM index_run").fetchone()[0])
+                run["schema_version"] = run["identity"]["schema_version"] = 1
+                connection.execute("UPDATE index_run SET metadata=?", [json.dumps(run)])
+            store = open_store()
+            try:
+                self.assertEqual(store.event_index_status, "built")
+                self.assertEqual([store.detail(i) for i in (1, 2)], expected[:2])
+            finally:
+                close(store)
+            # A same-size dataset change must invalidate even unchanged build_info metadata.
+            with duckdb.connect(str(database)) as connection:
+                connection.execute("CREATE OR REPLACE VIEW events AS SELECT * REPLACE ('changed producer' AS origin) FROM (" +
+                    EVENTS_VIEW + ")")
+            before[database] = sha256(database)
+            store = open_store()
+            try:
+                self.assertEqual(store.event_index_status, "built")
+                self.assertEqual(store.detail(1)["origin"], "changed producer")
+            finally:
+                close(store)
+            # An identifiable but damaged/incomplete derived cache can be rebuilt safely.
+            with duckdb.connect(str(cache)) as connection:
+                connection.execute("UPDATE event_index SET origin='damaged'")
+            store = open_store()
+            try:
+                self.assertEqual(store.event_index_status, "built")
+                self.assertEqual(store.detail(2)["origin"], "changed producer")
+            finally:
+                close(store)
+            for path, digest in before.items():
+                self.assertEqual(sha256(path), digest)
+            with duckdb.connect(str(cache)) as connection:
+                run = json.loads(connection.execute("SELECT metadata FROM index_run").fetchone()[0])
+                run["complete"] = False
+                connection.execute("UPDATE index_run SET metadata=?", [json.dumps(run)])
+            store = open_store()
+            try:
+                self.assertEqual(store.event_index_status, "built")
+                self.assertEqual(store.meta["total"], 3)
+            finally:
+                close(store)
+            cache_hash = sha256(cache)
+            # A failed rebuild must leave the previous completed cache byte-for-byte intact.
+            with duckdb.connect(str(database)) as connection:
+                connection.execute("CREATE OR REPLACE VIEW events AS " + EVENTS_VIEW + " UNION ALL " + EVENTS_VIEW)
+            with self.assertRaisesRegex(ValueError, "preserve source occurrences"):
+                open_store()
+            self.assertEqual(sha256(cache), cache_hash)
+            self.assertFalse(list(root.glob(".events.event-index.duckdb.*.staging")))
+            # A competing preparation writer and an unrecognized file must fail closed.
+            with write_lock(cache), self.assertRaises(BlockingIOError):
+                open_store()
+            cache.unlink()
+            cache.write_bytes(b"not a cache; do not overwrite")
+            with self.assertRaisesRegex(ValueError, "refusing to replace"):
+                open_store()
+            self.assertEqual(cache.read_bytes(), b"not a cache; do not overwrite")
+
     def test_dense_key_positions_are_bounded_and_narrowable(self):
         from kamotrace.other_events import build as import_other
         with tempfile.TemporaryDirectory() as folder:

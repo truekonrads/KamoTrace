@@ -396,6 +396,8 @@ class Store:
             NULL::VARCHAR AS author, NULL::VARCHAR AS created, NULL::VARCHAR AS updated,
             record_sha256 AS content_sha256"""
         selects = ["SELECT *" + ("" if info.get("format") == FORMAT else aws_extra) + ", 0 AS dataset_index FROM " + primary]
+        raw_selects = [f'SELECT source_record, raw_event, record_sha256, source_file, source_ordinal FROM "{catalog}".main.raw_events']
+        sources = [(database, selects[0], raw_selects[0], int(info["records"]), 0)]
         offset = int(info["records"])
         for index, path in enumerate(paths):
             alias = f"other_{index}"
@@ -406,11 +408,19 @@ class Store:
                 raise ValueError("--other-events requires a dataset built by import-other")
             self.event_sources.append(metadata)
             selects.append(f"SELECT * REPLACE (source_record + {offset} AS source_record), {index + 1} AS dataset_index FROM {alias}.events")
+            raw_selects.append(f"SELECT source_record + {offset} AS source_record, raw_event, record_sha256, source_file, source_ordinal FROM {alias}.raw_events")
+            sources.append((path, selects[-1], raw_selects[-1], int(metadata["records"]), offset))
             offset += int(metadata["records"])
         if offset >= MANUAL_BASE:
             raise ValueError("Too many imported events for exact browser row identifiers")
-        selects.append("SELECT *, -1 AS dataset_index FROM (" + EVENTS_VIEW.replace("FROM raw_events", "FROM manual_raw") + ")")
-        self.connection.execute("CREATE TEMP VIEW events AS " + " UNION ALL ".join(selects))
+        from .event_index import bind
+        stage_started = time.monotonic()
+        self.event_index_status = bind(self.connection, database, sources)
+        self.startup_timing("event_index_" + self.event_index_status, stage_started)
+        self.connection.execute("CREATE TEMP VIEW event_raw AS " + " UNION ALL ".join(raw_selects))
+        manual = "SELECT * EXCLUDE(raw_event), -1 AS dataset_index, raw_event FROM (" + EVENTS_VIEW.replace("FROM raw_events", "FROM manual_raw") + ")"
+        self.connection.execute("CREATE TEMP VIEW events AS SELECT i.*, r.raw_event FROM normalized_cache.event_index i "
+            "JOIN event_raw r USING(source_record) UNION ALL " + manual)
 
     def computers(self, body):
         from .computers import summarize

@@ -251,7 +251,8 @@ class AutoContract(unittest.TestCase):
 
         # A complete case reruns without AWS (no stubs are queued), downloads or rewriting any file.
         before = {p.name: digest(p) for p in target.glob("case.*duckdb")}
-        self.assertEqual(sorted(before), ["case.detections.duckdb", "case.duckdb", "case.enrichment.duckdb"])
+        self.assertEqual(sorted(before), ["case.detections.duckdb", "case.duckdb", "case.enrichment.duckdb",
+                                         "case.event-index.duckdb"])
         _, log = self.run_auto(target)
         self.assertIn("reused without contacting AWS", log)
         self.assertEqual({p.name: digest(p) for p in target.glob("case.*duckdb")}, before)
