@@ -87,12 +87,28 @@ kamotrace eks --output C:\cases\example\eks --regions ap-southeast-3 --start 202
 # --log-group ap-southeast-3:/aws/containerinsights/example/application
 # Verified offline import, no AWS calls (new database required):
 kamotrace eks --from-export C:\cases\example\eks --database C:\cases\example\eks-offline.duckdb
-kamotrace serve --database C:\cases\example\case.duckdb --other-events C:\cases\example\eks.duckdb
+kamotrace serve --database C:\cases\example\case.duckdb --other-events C:\cases\example\eks.duckdb --eks-export C:\cases\example\eks
 # Auto collects/imports/attaches it; EKS bounds are separate from CloudTrail bounds:
 kamotrace auto C:\cases\new-example --collect-eks --eks-start 2026-10-01T00:00:00Z --eks-end 2026-10-02T00:00:00Z
 # Or attach an existing EKS export without collecting EKS again:
 kamotrace auto C:\cases\offline --source C:\exports\cloudtrail.json --eks-export C:\cases\example\eks --skip-inventory --skip-enrich --skip-suzaku
 ```
+
+`auto --collect-eks` and `auto --eks-export` also supply the verified export to
+the existing AWS inventory and map. For manual startup, `serve --eks-export FOLDER`
+adds current EKS context, alongside optional `--inventory-export NETWORK_FOLDER`.
+The context overlay is offline and read-only; neither source snapshot is rewritten.
+Clusters, managed node groups, Fargate profiles and add-ons are map resources,
+linked by exact account/region/cluster configuration. Cluster details retain
+access-entry, access-policy, Pod Identity and other collected EKS observations.
+ARNs, API operations, acquisition timestamps and source hashes remain inspectable.
+Network and EKS collection times are shown separately; different accounts are
+rejected. Without network inventory, EKS still displays, but VPC/subnet/SG details
+remain uncollected. Public/private endpoint flags and configured CIDRs are shown
+as configuration, never verified reachability or effective access. EKS resources
+remain `Unknown` in the exposure assessment; links do not assert pod placement
+or traffic. `--eks-export` alone does not attach timeline logs: retain the
+`--other-events` import for those. Context changes take effect only at startup.
 
 Without both EKS bounds, only current metadata is collected. Existing workload
 logs hosted by CloudWatch can be read without node access, but are not discovered
@@ -162,6 +178,15 @@ event ID, stream, ingestion time and opaque original message. JSON inside a log
 message stays text, preserving its numbers and audit stages without guessed
 CloudTrail links. Check both the original message's timestamps/identity and the
 envelope before drawing conclusions. Messages may contain sensitive workload data.
+
+The inventory inspector's **Pod observations** search derives historical context
+offline from attached EKS logs without rewriting their messages. It separates
+authenticated `user.extra` caller pod credentials from named `objectRef` targets
+and explicit structured workload metadata. Namespace-only list/watch records do
+not enumerate named pods; SubjectAccessReview subject fields are not caller
+identity. Retained coverage rows supply collection bounds and gaps. No manifest
+means unknown coverage, not complete history. See the
+[analyst workflow](user-guide.md#aws-inventory-and-map).
 
 Required read actions are `sts:GetCallerIdentity`, `ec2:DescribeRegions` (only
 with `all`), EKS `ListClusters`, `DescribeCluster`, `ListAccessEntries`,

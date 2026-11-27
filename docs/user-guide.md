@@ -114,6 +114,58 @@ CloudTrail time range. Select a system to inspect its addresses, assigned IAM
 roles, security groups, and exposure assessment. Collection failures remain
 visible as coverage gaps; a denied read does not mean the resource is absent.
 
+With a verified `--eks-export`, cluster inspectors also show configured access
+entries/policies, Pod Identity associations and their retrieval status. These
+are configured references, not effective access or proof that a pod used a role.
+`CONFIG_MAP` authentication prevents AWS access-entry API reads; that gap does
+not imply an IAM denial or no Kubernetes access. **Show configured components**
+opens a cluster/component scope with a control to restore the previous filters.
+EKS exposure and load-balancer associations remain **not assessed**.
+
+Select a cluster and **Pod observations (explicit search)** to inspect attached
+EKS logs. Opening the view does not scan history. Run **Search attached pod
+observations** with optional start-inclusive/end-exclusive timestamps (explicit
+timezone offsets) and exact namespace, pod name or UID filters. Results show
+historical observations, newest first, not current pod inventory. Times display
+in the selected application timezone. **View pod activity** prepares a narrower
+query; run Search explicitly. Missing UIDs leave name reuse unresolved. Each
+observation links to the original event and exposes its hash, dataset and
+CloudWatch provenance. Editing filters clears old results; errors never turn
+into an empty successful search.
+The **Identity contexts** panel beside activity shows up to 50 names/UIDs with
+observation counts and first/last times across the full filtered selection,
+independent of the current results page. Different roles and UIDs stay separate.
+Selecting a context prepares the exact filters and focuses Search; it does not
+run a query or filter by observation role. Activity includes all roles matching
+the applied namespace/name/UID filters. The compact coverage strip keeps partial
+coverage and measured log extent visible; expand **Collection details** for
+manifests and gaps. Row details retain credential context, original hashes and
+CloudWatch provenance without filling the activity table with raw metadata.
+
+**Authenticated caller** identifies `user.extra` pod credentials, with namespace
+derived only from an explicit service-account username. Credential node context
+does not establish current placement. **Target pod** identifies a named audit
+object reference or matching Pod response; namespace-only list/watch records
+do not identify named targets. SubjectAccessReview `spec.extra` describes a
+reviewed subject and is not used as caller identity. **Workload metadata** uses
+explicit structured Kubernetes log fields; it needs an explicit cluster label
+or a conventional EKS group path. Group-path attribution does not establish the
+current cluster incarnation. Audit stages and API response codes remain separate
+observations, not deduplicated request counts or proof of runtime success.
+Source coverage is expandable; partial, failed, missing and not-searched data
+are distinct from no matches. The visible observed log extent measures attached
+messages within the selected cluster and time bounds, independent of pod filters;
+it is neither the requested acquisition window nor proof of continuous coverage.
+Original coverage labels remain supported without rebuilding evidence.
+Combined imports retain each collection's coverage separately, including earlier
+caps, warnings and failed operations. Collection details link each coverage
+record to its original event and hash; a later successful collection does not
+erase earlier gaps.
+No result establishes that no pods exist. The
+view makes no AWS/Kubernetes calls and does not infer nodes, containers, runtime
+state or effective access. Unrecognized formats remain available as original
+events rather than being guessed into pod observations.
+
 The **IAM** view browses global users, roles, IAM groups and policies independently
 of the network filters. Users include group membership; users, roles and groups
 include inline policies and managed-policy attachments. Roles include trust

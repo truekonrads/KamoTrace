@@ -18,6 +18,7 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `cli.py`, `auto.py` | Dispatch commands and orchestrate recoverable preparation; reuse stage implementations rather than reimplementing them. |
 | `download.py` | Checkpointed collection of selected CloudTrail, SSM, GuardDuty and inventory data using an existing AWS login. |
 | `eks.py` | Opt-in AWS-only EKS current context and bounded existing CloudWatch log collection, hashed immutable exports and shared other-event import; no Kubernetes access. |
+| `eks_pods.py` | Explicit offline historical pod-context extraction from attached EKS logs; separates caller credentials, named targets and workload metadata without changing evidence. |
 | `trailcheck.py`, `ssmcheck.py`, `aws_policy.py` | Audit collection configuration/coverage and generate reviewable permission templates; never grant permissions or change AWS configuration. |
 | `importer.py` | Stream CloudTrail JSON into evidence DuckDB, verify canonical hashes and provenance, and provide output locking/staging/publication helpers. |
 | `other_events.py` | Stream provider-neutral JSONL into immutable DuckDB datasets and publish revisioned investigator-entered manual events separately. |
@@ -196,6 +197,26 @@ Markdown uses the existing sanitizer.
 calls, DNS lookups or network probes. A permitted network path describes current
 configuration, not observed traffic or incident-time reachability. IAM review
 signals are leads, not an effective-access calculation or a declaration of safety.
+At startup, optional `serve --eks-export` verifies and overlays current EKS
+observations onto this same resource/relationship model, without modifying either
+export. Auto supplies its selected EKS export for map context as well as the
+separate timeline import. EKS timestamps/provenance and coverage remain separate
+from the network snapshot; mismatched accounts fail. Cluster/component links are
+configured relationships, not workload discovery, and EKS exposure stays Unknown.
+
+`POST /api/eks-pods` is an explicit historical query, independent of inventory
+filters. Account, region and cluster are required; namespace/name/UID equality
+and inclusive-start/exclusive-end time bounds narrow the selection. Pages contain
+50 observations, newest first, with totals over the full selection. On the first
+valid explicit request, `eks_pods.py` streams attached EKS raw records in bounded
+batches into disposable coordinator TEMP tables; startup and reference cards do
+not scan logs. The original evidence stays read-only, including messages, stages
+and source hashes. One audit event can yield separate caller and target rows,
+each linking to its original global row ID. Namespace-only list/watch requests
+and SubjectAccessReview subject copies never manufacture target/caller pods.
+Source manifests and unsupported/unattributed message counts retain coverage
+limitations. Conventional log-group labels do not identify cluster incarnations,
+and caller credential node fields are not current pod placement.
 
 Associating a current IAM user or role with historical activity requires its ARN
 and stable identity ID (session-issuer fields for roles), protecting against name

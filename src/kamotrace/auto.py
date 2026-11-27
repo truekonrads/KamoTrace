@@ -544,6 +544,7 @@ def main(argv=None):
             say(stage, f"skipped; start later with: kamotrace serve --database {database}"
                 + (f" --ssm-export {ssm_export}" if ssm_export else "")
                 + (f" --inventory-export {inventory_export}" if inventory_export else "")
+                + (f" --eks-export {eks_export}" if eks_database else "")
                 + "".join(f" --other-events {path}" for path in other_events))
             return 0
         locks.close()  # Preparation is done; the server only reads the database and sidecars.
@@ -552,6 +553,7 @@ def main(argv=None):
                                  "--mcp-transport", args.mcp_transport] +
                     (["--ssm-export", str(ssm_export)] if ssm_export else []) +
                     (["--inventory-export", str(inventory_export)] if inventory_export else []) +
+                    (["--eks-export", str(eks_export)] if eks_database else []) +
                     [arg for path in other_events for arg in ("--other-events", str(path))], "serve")
         return 0
     except KeyboardInterrupt:

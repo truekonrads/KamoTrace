@@ -763,6 +763,77 @@ def analyze(metadata, regions, iam=None):
     return report
 
 
+def add_eks(report, folder):
+    """Overlay verified current EKS observations without changing either source export."""
+    from . import eks
+
+    info = eks.read_export(folder)
+    account = info["identity"]["Account"]
+    if report["metadata"] and report["metadata"]["account"] != account:
+        raise ValueError("EKS and network inventory must belong to the same AWS account")
+    if not report["metadata"]:
+        report["metadata"] = {"account": account, "started_at_utc": info["started_at"],
+                              "completed_at_utc": info["finished_at"], "regions": info["regions"],
+                              "limitations": ["Network/IAM inventory was not supplied; missing VPC, subnet and security-group evidence is unknown."]}
+    report["metadata"]["eks"] = {key: info[key] for key in ("identity", "regions", "started_at", "finished_at", "scope", "files")}
+    report["metadata"]["limitations"] = [*report["metadata"].get("limitations", []), *eks.LIMITATIONS,
+        "EKS map relationships describe AWS configuration, not pod placement or traffic. Endpoint public/private settings are not reachability or effective-access assessments."]
+    report["eks_coverage"] = [op for op in info["operations"] if op.get("service") == "eks"]
+    report["errors"].extend({**op, "error": op.get("error", "EKS inventory collection incomplete")}
+                            for op in report["eks_coverage"] if op["status"] != "retrieved")
+    observations, clusters = [], {}
+    with (Path(folder) / "raw.jsonl").open(encoding="utf-8") as source:
+        for line in source:
+            page = json.loads(line)
+            if page["service"] != "eks":
+                continue
+            observations.append(page)
+            if page["operation"] == "describe_cluster" and page["response"].get("cluster"):
+                cluster = page["response"]["cluster"]
+                clusters[page["region"], cluster["name"]] = cluster
+    for page in observations:
+        key, kind = {"describe_cluster": ("cluster", "EKS cluster"),
+                     "describe_nodegroup": ("nodegroup", "EKS node group"),
+                     "describe_fargate_profile": ("fargateProfile", "EKS Fargate profile"),
+                     "describe_addon": ("addon", "EKS add-on")}.get(page["operation"], (None, None))
+        record = page["response"].get(key)
+        if not record:
+            continue
+        cluster_name = record.get("clusterName", record.get("name"))
+        cluster = clusters.get((page["region"], cluster_name), {})
+        network = cluster.get("resourcesVpcConfig", {})
+        arn = record[{"cluster": "arn", "nodegroup": "nodegroupArn", "fargateProfile": "fargateProfileArn", "addon": "addonArn"}[key]]
+        name = record[{"cluster": "name", "nodegroup": "nodegroupName", "fargateProfile": "fargateProfileName", "addon": "addonName"}[key]]
+        roles = [record[field] for field in ("roleArn", "nodeRole", "podExecutionRoleArn", "serviceAccountRoleArn") if record.get(field)]
+        groups = network.get("securityGroupIds", []) + ([network["clusterSecurityGroupId"]] if network.get("clusterSecurityGroupId") else []) if key == "cluster" else []
+        details = {"aws": record, "cluster_name": cluster_name,
+                   "source": {"export": str(Path(folder).resolve()), "raw_sha256": info["files"]["raw.jsonl"],
+                              "operation": page["operation"], "parameters": page["parameters"],
+                              "acquired_at": page["acquired_at"]}}
+        if key == "cluster":
+            details["observations"] = [p for p in observations if p["region"] == page["region"]
+                                       and p["parameters"].get("clusterName") == cluster_name]
+        resource = {"id": arn, "name": name, "kind": kind, "account": account, "region": page["region"],
+                    "vpc_id": network.get("vpcId", ""), "subnet_ids": network.get("subnetIds", []) if key == "cluster" else record.get("subnets", []),
+                    "state": record.get("status", "Unknown"), "addresses": [record["endpoint"]] if record.get("endpoint") else [],
+                    "security_groups": list(dict.fromkeys(groups)), "details": details, "observed_at": page["acquired_at"],
+                    "iam_instance_profile": "", "iam_roles": [role.rsplit("/", 1)[-1] for role in roles],
+                    "iam_role_arns": roles, "iam_role_status": "Configured role references; not effective access",
+                    "status": "Unknown", "direct_status": "Unknown", "indirect_status": "None", "paths": [],
+                    "via_load_balancers": [], "forwarding_paths": [],
+                    "summary": "Current AWS EKS configuration only; network reachability, Kubernetes workloads and effective access are not assessed."}
+        report["resources"].append(resource)
+        if key != "cluster" and cluster.get("arn"):
+            report["relationships"].append({"source": cluster["arn"], "target": arn, "region": page["region"],
+                                             "label": "Configured EKS component; not workload placement or traffic",
+                                             "observed_at": page["acquired_at"]})
+    for group in report["security_groups"]:
+        group["resources"] = [r["id"] for r in report["resources"]
+                              if r["region"] == group["region"] and group["id"] in r["security_groups"]]
+    from collections import Counter
+    report["counts"] = dict(Counter(r["status"] for r in report["resources"]))
+
+
 def render(out, report):
     write_json(out / "report.json", report)
     columns = ["region", "kind", "id", "name", "state", "vpc_id", "subnet_ids", "addresses", "security_groups",

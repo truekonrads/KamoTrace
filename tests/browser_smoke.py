@@ -1,10 +1,18 @@
 """CI-only browser check; run with `uv run --with playwright==1.64.1 python tests/browser_smoke.py`."""
 import copy
+from contextlib import ExitStack
+from functools import partial
+from http.server import ThreadingHTTPServer
+import json
 from pathlib import Path
+import threading
 
 from playwright.sync_api import expect, sync_playwright
 
 from test_contract import BrowserContract, MFAContract
+from test_eks import EKSContract, REGION, START
+from kamotrace import eks, other_events
+from kamotrace.server import Handler, Store
 
 
 def event_grid_response(response):
@@ -13,6 +21,91 @@ def event_grid_response(response):
     return (response.url == BrowserContract.url + "/api/events"
             and response.request.method == "POST"
             and response.request.post_data_json.get("page") == 1)
+
+
+def eks_browser_check(browser, results):
+    """Real offline imports/HTTP: combined coverage and source detail above the explorer."""
+    with ExitStack() as stack:
+        fixture = EKSContract()
+        fixture.setUp()
+        stack.callback(fixture.doCleanups)
+        export, _ = fixture.collect()  # AWS SDK responses are stubbed by the shared fixture.
+        first, second = fixture.root / "first.jsonl", fixture.root / "second.jsonl"
+        message = {"kind": "Event", "apiVersion": "audit.k8s.io/v1", "verb": "get",
+                   "objectRef": {"resource": "pods", "namespace": "payments", "name": "synthetic-pod", "uid": "pod-uid"}}
+        first.write_text("\n".join(json.dumps({"date": START, "content": content}) for content in [
+            {"kind": "CloudWatch log event", "account": "123456789012", "region": REGION,
+             "log_group": "/aws/eks/current/cluster", "event": {"message": json.dumps(message)}},
+            {"kind": "kamotrace-eks-v1", "complete": True,
+             "operations": [{"operation": "log_retrieval", "status": "log_limit"}]},
+        ]))
+        second.write_text(json.dumps({"date": START, "content": {
+            "kind": "EKS collection coverage (not historical completeness)",
+            "operations": [{"operation": "log_retrieval", "status": "retrieved"}]}}))
+        database = fixture.root / "pods.duckdb"
+        other_events.build([first, second], database, eks.ORIGIN)
+        store = Store(database, eks_export=export)
+        stack.callback(store.selection_directory.cleanup)
+        stack.callback(store.connection.close)
+        stack.callback(store.reviews.close)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+        stack.callback(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        stack.callback(thread.join)
+        stack.callback(server.shutdown)
+        context = browser.new_context(viewport={"width": 1440, "height": 1000}, device_scale_factor=2)
+        stack.callback(context.close)
+        page = context.new_page()
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(f"http://127.0.0.1:{server.server_port}")
+        expect(page.locator("#load-status")).to_have_text("3 loaded · all")
+        page.locator("#inventory-tab").click()
+        page.get_by_role("button", name="current, EKS cluster, Unknown. Inspect evidence.", exact=True).click()
+        page.get_by_role("button", name="Pod observations (explicit search)", exact=True).click()
+        page.locator("#inventory-pods-namespace").fill("payments")
+        page.get_by_role("button", name="Search attached pod observations", exact=True).click()
+        source = page.get_by_role("button", name="Open original source event", exact=True)
+        expect(source).to_have_count(1)
+        explorer, detail = page.locator("#inventory-explorer"), page.locator("#detail")
+        for already_open in (False, True):
+            if already_open:
+                source.click()
+                expect(detail).to_be_visible()
+                assert not detail.evaluate("e => e.matches(':modal')")
+            page.locator("#inventory-open-explorer").focus()
+            page.keyboard.press("Enter")
+            expect(explorer).to_be_visible()
+            source.click()
+            expect(detail).to_be_visible()
+            expect(page.locator("#detail:modal")).to_be_visible()
+            expect(page.locator("#raw-event")).to_contain_text("synthetic-pod")
+            page.locator("#close-detail").focus()
+            expect(page.locator("#close-detail")).to_be_focused()
+            page.screenshot(path=str(results / f"eks-explorer-source-{already_open}.png"))
+            page.locator("#close-detail").click()
+            expect(detail).not_to_be_visible()
+            expect(explorer).to_be_visible()
+            expect(page.locator("#inventory-pods-namespace")).to_have_value("payments")
+            expect(source).to_have_count(1)
+            page.locator("#inventory-close-explorer").click()
+        coverage = page.locator("#inventory-pods-coverage")
+        expect(coverage.locator("summary").first).to_contain_text("1 operation gap(s)")
+        coverage.locator("summary").first.click()
+        expect(coverage).to_contain_text("log_limit")
+        expect(coverage).to_contain_text("retrieved")
+        expect(coverage.locator("h5")).to_have_count(2)
+        page.locator("#inventory-open-explorer").click()
+        coverage.locator("h5").first.evaluate("e => e.scrollIntoView({block: 'start'})")
+        page.screenshot(path=str(results / "eks-combined-coverage.png"))
+        coverage.get_by_role("button", name="Open original coverage event", exact=True).first.click()
+        expect(page.locator("#raw-event")).to_contain_text("log_limit")
+        assert detail.evaluate("e => e.matches(':modal')")
+        page.locator("#close-detail").click()
+        page.locator("#inventory-close-explorer").click()
+        assert not errors, f"EKS browser JavaScript errors: {errors}"
+        print("PASS: combined EKS coverage retains earlier gaps; source detail is usable above explorer, including an already-open inspector; filters/results preserved.")
 
 
 def main():
@@ -636,6 +729,7 @@ def main():
                 expect(page.locator("#frequency-summary")).to_contain_text("0 key events")
                 expect(page.locator("#timeline .key-event-marker")).to_have_count(0)
                 expect(page.locator("#selected-count")).to_have_text("6 selected")
+                eks_browser_check(browser, results)
                 assert not errors, f"Browser JavaScript errors: {errors}"
                 print("PASS: event search/timezone/history, hybrid pipeline scopes, shortcut draft races, autocomplete/newlines, reference cards, inventory map/tables/coverage, tab state, error/retry and no-snapshot; no JavaScript errors.")
             except Exception:

@@ -12,15 +12,18 @@ COLLECTIONS = ("resources", "vpcs", "security_groups", "relationships", "forward
 
 
 class Inventory:
-    def __init__(self, folder=None):
+    def __init__(self, folder=None, eks_export=None):
         self.report = {"loaded": False, "metadata": None, "counts": {}, **{key: [] for key in COLLECTIONS}}
         self.index = {}
         self.networks = []
-        if folder is None:
+        if folder is None and eks_export is None:
             return
-        path = Path(folder) / "report.json"
+        path = Path(folder) / "report.json" if folder is not None else None
         try:
-            report = json.loads(path.read_text(encoding="utf-8"))
+            report = json.loads(path.read_text(encoding="utf-8")) if path else self.report
+            if eks_export is not None:
+                from .inventory import add_eks
+                add_eks(report, eks_export)
             if (not isinstance(report, dict) or not isinstance(report.get("metadata"), dict)
                     or not isinstance(report["metadata"].get("account"), str)
                     or any(not isinstance(report.get(key), list) for key in COLLECTIONS)

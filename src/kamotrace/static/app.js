@@ -3509,7 +3509,11 @@ async function saveManual(event) {
 }
 
 function openDetail() {
-  if (!$("detail").open) $("detail").show();
+  const dialog = $("detail");
+  if ($("inventory-explorer").open) {
+    if (dialog.open && !dialog.matches(":modal")) dialog.close();
+    if (!dialog.open) dialog.showModal();
+  } else if (!dialog.open) dialog.show();
 }
 
 function detailFindings() {
@@ -4631,6 +4635,16 @@ async function init() {
     2,
   );
   $("computer-imports").hidden = !meta.source_coverage?.length;
+  window.kamotraceInventory.setEventOpener(
+    (id) => detail({ id }),
+    () => meta.timezone,
+    (value) => {
+      const ms = value ? Date.parse(value) : NaN;
+      return Number.isFinite(ms)
+        ? `${local(ms)} ${meta.timezone}`
+        : "Unavailable";
+    },
+  );
   refreshComputers = window.kamotraceReference.computerImports(
     request,
     (id) => detail({ id }),

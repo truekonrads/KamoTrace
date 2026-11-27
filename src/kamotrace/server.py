@@ -233,7 +233,7 @@ def build_query(body, scalar_function):
 
 
 class Store:
-    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=()):
+    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=(), eks_export=None):
         with ExitStack() as startup:
             # Disposable disk storage, never an index or a write to original evidence.
             self.selection_directory = tempfile.TemporaryDirectory(prefix="kamotrace-selection-")
@@ -346,9 +346,10 @@ class Store:
                             (row[0], json.dumps(self.commands.log_sources[row[0]], ensure_ascii=False)))
             self.startup_timing("ssm", stage_started)
             from .inventory_store import Inventory
-            logger.info("Loading current-configuration inventory: %s", inventory_export or "none (no export supplied)")
+            logger.info("Loading current-configuration inventory: %s; EKS: %s",
+                        inventory_export or "none", eks_export or "none")
             stage_started = time.monotonic()
-            self.inventory = Inventory(inventory_export)
+            self.inventory = Inventory(inventory_export, eks_export)
             self.startup_timing("inventory", stage_started)
             # Suzaku detections come from a derived sidecar written by `kamotrace suzaku`; only rows the
             # CLI linked to exactly one evidence record are queryable. Missing sidecar = no detections.
@@ -400,6 +401,7 @@ class Store:
         info = json.loads(self.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
         self.event_sources = [info]
         self.computer_cache = {}
+        self.eks_pod_sources = None
         aws_extra = """, 'cloudtrail'::VARCHAR AS event_type, NULL::VARCHAR AS origin,
             NULL::VARCHAR AS generic_identity, NULL::VARCHAR AS content_preview,
             NULL::VARCHAR AS author, NULL::VARCHAR AS created, NULL::VARCHAR AS updated,
@@ -459,6 +461,14 @@ class Store:
             result = self.computer_cache[dataset]
             return {**result, "imports": imports, "page": page, "total": len(result["cards"]),
                     "cards": result["cards"][(page - 1) * 4:page * 4]}
+
+    def eks_pods(self, body):
+        from .eks_pods import prepare, query, validate
+        scope, page, bounds = validate(body)
+        with self.locked("eks.pod_observations"):
+            if self.eks_pod_sources is None:
+                self.eks_pod_sources = prepare(self.connection, self.event_sources)
+            return query(self.connection, self.eks_pod_sources, scope, page, bounds)
 
     def manual_write(self, body):
         from .other_events import save_manual
@@ -1354,7 +1364,7 @@ class Handler(SimpleHTTPRequestHandler):
                 elif route.startswith("/api/exports/"):
                     route = "/api/exports/:id"
                 elif route not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values",
-                                   "/api/reviews", "/api/detections", "/api/inventory", "/api/reference", "/api/computers",
+                                   "/api/reviews", "/api/detections", "/api/inventory", "/api/reference", "/api/computers", "/api/eks-pods",
                                    "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event",
                                    "/api/ssm-log", "/api/ssm-log-review", "/mcp"):
                     route = "static-or-unknown"
@@ -1495,7 +1505,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
+        if self.path not in ("/api/eks-pods", "/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1508,6 +1518,7 @@ class Handler(SimpleHTTPRequestHandler):
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
                          "/api/manual-events": self.store.manual_write,
                          "/api/computers": self.store.computers,
+                         "/api/eks-pods": self.store.eks_pods,
                          "/api/schema": self.store.schema, "/api/notes": self.store.notes_read,
                          "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,
@@ -1552,6 +1563,8 @@ def main(argv=None):
     parser.add_argument("--ssm-export", type=Path, help="Local ssm_command_session_activity[.enriched].json export")
     parser.add_argument("--inventory-export", type=Path,
                         help="AWS inventory export folder containing report.json; current configuration, not historical evidence")
+    parser.add_argument("--eks-export", type=Path,
+                        help="Verified local EKS export for current inventory/map context; no AWS calls (attach its imported database separately for timeline logs)")
     parser.add_argument("--detections", type=Path,
                         help="Suzaku detections from `kamotrace suzaku` (default: <database>.detections.duckdb if present)")
     parser.add_argument("--guardduty", type=Path,
@@ -1578,10 +1591,13 @@ def main(argv=None):
             parser.error(f"--{name.replace('_', '-')} not found: {path}")
     if args.inventory_export is not None and not args.inventory_export.is_dir():
         parser.error(f"--inventory-export folder not found: {args.inventory_export}")
+    if args.eks_export is not None and not args.eks_export.is_dir():
+        parser.error(f"--eks-export folder not found: {args.eks_export}")
     try:
         store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
                       args.ssm_export, args.detections and args.detections.resolve(), inventory_export=args.inventory_export,
-                      guardduty=args.guardduty and args.guardduty.resolve(), other_events=args.other_events)
+                      guardduty=args.guardduty and args.guardduty.resolve(), other_events=args.other_events,
+                      eks_export=args.eks_export)
     except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
         parser.error(str(error))
     logger.info("Binding HTTP server to %s:%s", args.bind, args.port)

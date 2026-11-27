@@ -90,6 +90,198 @@
     !q || JSON.stringify(r).toLowerCase().includes(q);
   const clip = (value, max = 34) =>
     str(value).length > max ? str(value).slice(0, max - 1) + "…" : str(value);
+  const isEks = (r) => str(r.kind).startsWith("EKS ");
+  const stamp = (value) => {
+    const date = new Date(value);
+    return value && Number.isFinite(date.getTime())
+      ? date.toISOString().replace("T", " ").replace(".000Z", " UTC")
+      : display(value);
+  };
+  let componentScope = null;
+  let openEvent = null;
+  let podTimezone = () => "UTC",
+    formatPodTime = stamp;
+  function eksOperations(cluster) {
+    return list(data.eks_coverage).filter(
+      (op) =>
+        op.region === cluster.region &&
+        (op.parameters?.clusterName === cluster.details?.cluster_name ||
+          (op.operation === "describe_cluster" &&
+            op.parameters?.name === cluster.details?.cluster_name)),
+    );
+  }
+  function operationStatus(host, op, cluster) {
+    host.append(
+      el(
+        "p",
+        `${display(op.operation)} · ${display(op.status)} · ${display(op.pages)} page(s)`,
+        op.status === "retrieved" ? "hint" : "inventory-warning",
+      ),
+    );
+    if (
+      op.operation === "list_access_entries" &&
+      op.status === "error" &&
+      cluster?.details?.aws?.accessConfig?.authenticationMode ===
+        "CONFIG_MAP" &&
+      /InvalidRequestException/.test(str(op.error)) &&
+      /authentication mode|API_AND_CONFIG_MAP|must be.*API/i.test(str(op.error))
+    ) {
+      host.append(
+        el(
+          "p",
+          "ListAccessEntries is incompatible with this cluster’s configured CONFIG_MAP authentication mode. Access entries were not retrieved; this is not evidence of no access. ConfigMap contents and effective Kubernetes access are not assessed. No authentication change is required or recommended by this view.",
+          "inventory-warning",
+        ),
+      );
+    }
+    raw(
+      host,
+      `${display(op.operation)} — retrieval details / original exception`,
+      op,
+    );
+  }
+  function eksAccess(host, cluster) {
+    const pages = list(cluster.details?.observations);
+    const operations = eksOperations(cluster);
+    host.append(
+      el("h3", "Cluster access entries and associated policies"),
+      el(
+        "p",
+        "Configured AWS access references only; not effective access, ConfigMap/RBAC evaluation or historical permissions. Partial pages remain visible when retrieval fails.",
+        "hint",
+      ),
+    );
+    for (const [heading, names, renderRow] of [
+      [
+        "Access entries / policies",
+        [
+          "list_access_entries",
+          "describe_access_entry",
+          "list_associated_access_policies",
+        ],
+        (response, page) => {
+          list(response.accessEntries).forEach((principal) =>
+            facts(host, [["Principal ARN", principal]]),
+          );
+          if (response.accessEntry)
+            facts(host, Object.entries(response.accessEntry));
+          list(response.associatedAccessPolicies).forEach((policy) =>
+            facts(host, [
+              ["Principal ARN", page.parameters?.principalArn],
+              ["Policy ARN", policy.policyArn],
+              ["Configured access scope", policy.accessScope],
+              ["Associated", stamp(policy.associatedAt)],
+            ]),
+          );
+        },
+      ],
+      [
+        "Pod Identity associations",
+        ["list_pod_identity_associations", "describe_pod_identity_association"],
+        (response) => {
+          [
+            ...list(response.associations),
+            ...(response.association ? [response.association] : []),
+          ].forEach((association) =>
+            facts(host, [
+              ["Association", association.associationId],
+              ["Namespace", association.namespace],
+              ["Service account", association.serviceAccount],
+              [
+                "Role ARN",
+                association.roleArn ||
+                  "Not in this response; see describe retrieval status",
+              ],
+              ["Association ARN", association.associationArn],
+            ]),
+          );
+        },
+      ],
+    ]) {
+      host.append(el("h4", heading));
+      const ops = operations.filter((op) => names.includes(op.operation));
+      if (!ops.length)
+        host.append(
+          el(
+            "p",
+            "Not collected / no operation status recorded. Not assessed.",
+            "hint",
+          ),
+        );
+      ops.forEach((op) => operationStatus(host, op, cluster));
+      const matching = pages.filter((page) => names.includes(page.operation));
+      matching.forEach((page) => {
+        host.append(
+          el(
+            "p",
+            `${page.operation} · acquired ${stamp(page.acquired_at)}`,
+            "hint",
+          ),
+        );
+        renderRow(page.response || {}, page);
+        raw(host, "Source: original AWS API observation page", page);
+      });
+      if (!matching.length)
+        host.append(
+          el(
+            "p",
+            "No API response pages attached to this section; consult retrieval gaps above. Not an effective-access or absence finding.",
+            "hint",
+          ),
+        );
+    }
+    raw(host, "EKS snapshot source", cluster.details?.source);
+  }
+  function relatedComponents(host, item) {
+    const relationships = list(data.relationships).filter(
+      (r) =>
+        r.region === item.region &&
+        (r.source === item.id || r.target === item.id),
+    );
+    const components = list(data.resources).filter(
+      (r) =>
+        r.region === item.region &&
+        r.id !== item.id &&
+        relationships.some(
+          (edge) => edge.source === r.id || edge.target === r.id,
+        ),
+    );
+    host.append(
+      el("h3", "Related components"),
+      el(
+        "p",
+        "Configured EKS components — not traffic or pod placement",
+        "hint",
+      ),
+    );
+    components.forEach((r) =>
+      link(host, `${r.kind}: ${title(r)}`, () => selectResource(r)),
+    );
+    if (!components.length)
+      host.append(
+        el(
+          "p",
+          "No related component references recorded in this snapshot; collection may be incomplete.",
+          "hint",
+        ),
+      );
+    if (item.kind === "EKS cluster") {
+      link(host, "Show configured components", () => {
+        if (!componentScope)
+          componentScope = {
+            values: filterIds.map((id) => $(id).value),
+            view,
+            cluster: item,
+            ids: new Set(),
+          };
+        componentScope.cluster = item;
+        componentScope.ids = new Set([item, ...components].map(resourceKey));
+        $("filters").reset();
+        setView("systems");
+      });
+      link(host, "Pod observations (explicit search)", () => openPods(item));
+    }
+  }
   function facts(host, entries) {
     const dl = el("dl", null, "inventory-facts");
     entries.forEach(([label, value]) => {
@@ -149,6 +341,14 @@
     );
     heading.append(icon, label);
     host.replaceChildren(heading);
+    if (kind === "resource")
+      host.append(
+        el(
+          "p",
+          `Selected: ${display(item.kind)} · ${display(item.region)} · ${display(item.account || data.metadata?.account)}`,
+          "inventory-selection-context",
+        ),
+      );
     if (kind === "iam") {
       if (item.identity && item.id) {
         const reference = el("span", item.id);
@@ -195,17 +395,71 @@
           "VPC / subnets",
           `${display(item.vpc_id)} / ${display(item.subnet_ids)}`,
         ],
-        ["State", item.state],
-        ["Addresses", item.addresses],
-        ["Direct assessment", item.direct_status],
-        ["Via load balancer", item.indirect_status],
-        ["Load balancers", item.via_load_balancers],
+        [isEks(item) ? "Configured state" : "State", item.state],
+        [
+          "Addresses",
+          isEks(item) && !list(item.addresses).length
+            ? "Not applicable / not collected for this component"
+            : item.addresses,
+        ],
+        [
+          "Direct assessment",
+          isEks(item) ? "Exposure Unknown — not assessed" : item.direct_status,
+        ],
+        [
+          "Via load balancer",
+          isEks(item) ? "Unknown — not assessed" : item.indirect_status,
+        ],
+        [
+          "Load balancers",
+          isEks(item) ? "Not assessed" : item.via_load_balancers,
+        ],
         ["IAM lookup status", item.iam_role_status],
-        ["IAM roles", item.iam_roles],
-        ["Role ARNs", item.iam_role_arns],
-        ["Instance profile", item.iam_instance_profile],
+        [
+          "IAM roles",
+          isEks(item) && !list(item.iam_roles).length
+            ? "No role reference in this component response"
+            : item.iam_roles,
+        ],
+        [
+          "Role ARNs",
+          isEks(item) && !list(item.iam_role_arns).length
+            ? "Not recorded in this component response"
+            : item.iam_role_arns,
+        ],
+        ...(!isEks(item)
+          ? [["Instance profile", item.iam_instance_profile]]
+          : []),
         ["Assessment", item.summary],
       ]);
+      if (item.kind?.startsWith("EKS ")) {
+        const aws = item.details?.aws || {},
+          network = aws.resourcesVpcConfig || {};
+        host.append(el("h3", "Current EKS configuration"));
+        facts(host, [
+          ["Observed (UTC)", stamp(item.observed_at)],
+          ["Cluster", item.details?.cluster_name],
+          ["Version", aws.version || aws.addonVersion],
+          ...(item.kind === "EKS cluster"
+            ? [
+                ["Public endpoint configured", network.endpointPublicAccess],
+                ["Private endpoint configured", network.endpointPrivateAccess],
+                ["Public endpoint CIDRs", network.publicAccessCidrs],
+                ["Authentication mode", aws.accessConfig?.authenticationMode],
+                ["Auto Mode compute", aws.computeConfig?.enabled],
+              ]
+            : []),
+        ]);
+        host.append(
+          el(
+            "p",
+            "AWS configuration only, not incident-time state, workload placement or verified network/effective access. Component VPC context comes from its cluster; configured subnets are not observed pod placement.",
+            "hint",
+          ),
+        );
+        relatedComponents(host, item);
+        if (item.kind === "EKS cluster") eksAccess(host, item);
+      }
       for (const arn of list(item.iam_role_arns)) {
         const reference = el("p", arn);
         window.kamotraceReference?.attach(reference, {
@@ -244,6 +498,14 @@
           ),
         );
       host.append(el("h3", "Load balancer paths"));
+      if (isEks(item))
+        host.append(
+          el(
+            "p",
+            "Exposure Unknown — load balancer paths and direct network reachability have not been assessed for EKS.",
+            "hint",
+          ),
+        );
       routesFor(item).forEach((p) =>
         link(
           host,
@@ -253,7 +515,9 @@
       );
       raw(
         host,
-        "Direct paths: security groups, routes and ACLs",
+        isEks(item)
+          ? "Direct paths — not assessed (raw collected field)"
+          : "Direct paths: security groups, routes and ACLs",
         item.paths || [],
         list(item.paths).length > 0,
       );
@@ -371,7 +635,20 @@
       placeholder:
         "No matching collected records. Clear filters or review coverage.",
       columnDefaults: {
-        formatter: (cell) => el("span", display(cell.getValue())),
+        formatter: (cell) => {
+          const row = cell.getRow().getData(),
+            field = cell.getField();
+          let value = cell.getValue();
+          if (isEks(row)) {
+            if (["indirect_status", "direct_status"].includes(field))
+              value = "Unknown — not assessed";
+            if (field === "addresses" && !list(value).length)
+              value = "Not applicable / not collected";
+            if (field === "iam_roles" && !list(value).length)
+              value = "Not recorded in component response";
+          }
+          return el("span", display(value));
+        },
         headerSort: true,
         minWidth: 110,
       },
@@ -420,6 +697,13 @@
       ["Account", m.account],
       ["Started (UTC)", m.started_at_utc],
       ["Completed (UTC)", m.completed_at_utc],
+      ...(m.eks
+        ? [
+            ["EKS started (UTC)", m.eks.started_at],
+            ["EKS completed (UTC)", m.eks.finished_at],
+            ["EKS regions", m.eks.regions],
+          ]
+        : []),
       ["Regions requested", m.regions],
       [
         "Collected records",
@@ -447,6 +731,26 @@
           "hint",
         ),
       );
+    if (m.eks) {
+      host.append(el("h3", "EKS per-operation retrieval / gaps"));
+      list(data.eks_coverage).forEach((op) => {
+        const cluster = list(data.resources).find(
+          (r) =>
+            r.kind === "EKS cluster" &&
+            r.region === op.region &&
+            r.details?.cluster_name ===
+              (op.parameters?.clusterName || op.parameters?.name),
+        );
+        host.append(
+          el(
+            "h4",
+            `${display(op.region)} / ${display(op.parameters?.clusterName || op.parameters?.name || "regional scope")}`,
+          ),
+        );
+        operationStatus(host, op, cluster);
+      });
+      raw(host, "EKS AWS API collection coverage", data.eks_coverage);
+    }
     host.append(el("h3", "Limitations"));
     if (list(m.limitations).length) {
       const ul = el("ul");
@@ -662,12 +966,17 @@
   }
   function render() {
     if (!data?.loaded) return;
+    $("component-context").hidden = !componentScope || view === "pods";
+    if (componentScope)
+      $("component-context-label").textContent =
+        `Scope changed: ${title(componentScope.cluster)} — configured EKS components, not traffic or pod placement. Prior filters are saved; inventory filters now narrow this component scope.`;
     const q = $("search").value.trim().toLowerCase(),
       region = $("region").value,
       kind = $("kind").value,
       status = $("assessment").value,
       exposure = $("exposure").value;
     const scope = (r) =>
+      (!componentScope || componentScope.ids.has(resourceKey(r))) &&
       (!region || str(r.region) === region) &&
       (!kind || str(r.kind) === kind) &&
       (!status || statusOf(r) === status) &&
@@ -989,7 +1298,9 @@
         svgEl(
           "text",
           { x: 14, y: 73, class: "inventory-node-sub" },
-          clip(display(r.addresses), 38),
+          isEks(r) && !list(r.addresses).length
+            ? "Configured component · exposure unknown"
+            : clip(display(r.addresses), 38),
         ),
         svgEl(
           "text",
@@ -1048,13 +1359,15 @@
     canvas.scrollTo(left * zoom - x, top * zoom - y);
   }
   function setView(next) {
+    if (view === "pods" && next !== "pods") ++podGeneration;
     view = next;
+    $("panel").classList.toggle("inventory-pods-active", view === "pods");
     $("views")
       .querySelectorAll("button")
       .forEach((b) =>
         b.setAttribute("aria-pressed", String(b.dataset.view === view)),
       );
-    ["map", "systems", "routes", "groups", "iam", "coverage"].forEach(
+    ["map", "systems", "routes", "groups", "iam", "coverage", "pods"].forEach(
       (key) => ($(`${key}-view`).hidden = key !== view),
     );
     render();
@@ -1089,7 +1402,8 @@
         "Current configuration, not observed traffic. Coverage gaps are unknown.";
       const m = data.metadata || {};
       $("metadata").textContent =
-        `Account: ${display(m.account)} · Collected (UTC): ${display(m.completed_at_utc)}`;
+        `Account: ${display(m.account)} · Collected: ${stamp(m.completed_at_utc)}` +
+        (m.eks ? ` · EKS: ${stamp(m.eks.finished_at)}` : "");
       $("metadata").title =
         `Collection started (UTC): ${display(m.started_at_utc)}`;
       const errors = list(data.errors).length,
@@ -1155,6 +1469,478 @@
   }
   function hide() {
     $("panel").hidden = true;
+  }
+  // Historical pod observations stay separate from configuration-map nodes.
+  const podView = el("section");
+  podView.id = "inventory-pods-view";
+  podView.hidden = true;
+  podView.setAttribute("aria-label", "Historical EKS pod observations");
+  $("coverage-view").before(podView);
+  const componentContext = el("div", null, "inventory-warning");
+  componentContext.id = "inventory-component-context";
+  componentContext.hidden = true;
+  const componentLabel = el("span");
+  componentLabel.id = "inventory-component-context-label";
+  componentContext.append(componentLabel);
+  link(componentContext, "Return to prior filters / view", () => {
+    const prior = componentScope;
+    componentScope = null;
+    if (prior) {
+      filterIds.forEach((id, index) => {
+        $(id).value = prior.values[index];
+      });
+      setView(prior.view);
+      inspect("resource", prior.cluster);
+    }
+  });
+  $("views").after(componentContext);
+  let podGeneration = 0;
+  function openPods(cluster) {
+    ++podGeneration;
+    const previousView = view === "pods" ? "systems" : view;
+    const scope = {
+      account: str(cluster.account || data.metadata?.account),
+      region: str(cluster.region),
+      cluster: str(cluster.details?.cluster_name || cluster.name),
+    };
+    const form = el("form", null, "inventory-toolbar"),
+      inputs = {};
+    form.id = "inventory-pods-filters";
+    for (const [key, label, placeholder] of [
+      [
+        "start",
+        `Start inclusive (ISO with offset; display ${podTimezone()})`,
+        "2026-01-01T00:00:00Z",
+      ],
+      [
+        "end",
+        `End exclusive (ISO with offset; display ${podTimezone()})`,
+        "2026-01-02T00:00:00Z",
+      ],
+      ["namespace", "Namespace (exact)", "All namespaces"],
+      ["pod", "Pod name (exact)", "All names"],
+      ["uid", "Pod UID (exact)", "All UIDs"],
+    ]) {
+      const labelNode = el("label", label),
+        input = el("input");
+      input.id = `inventory-pods-${key}`;
+      input.placeholder = placeholder;
+      input.autocomplete = "off";
+      labelNode.append(input);
+      inputs[key] = input;
+      form.append(labelNode);
+    }
+    const submit = el("button", "Search attached pod observations");
+    submit.type = "submit";
+    form.append(submit);
+    const state = el(
+      "p",
+      "Not searched — opening this view does not scan logs. Attached source coverage is checked only on explicit search.",
+      "inventory-empty",
+    );
+    state.id = "inventory-pods-status";
+    state.setAttribute("role", "status");
+    const coverage = el("details"),
+      results = el("div"),
+      pager = el("div", null, "inventory-pod-pager");
+    coverage.id = "inventory-pods-coverage";
+    coverage.hidden = true;
+    results.id = "inventory-pods-results";
+    const warning = el(
+      "p",
+      "Historical observations, not current pod inventory. Authenticated caller is credential context, not the action target or current placement. Counts are observations, not requests; an API response does not prove runtime success.",
+      "inventory-warning",
+    );
+    const back = el("div");
+    link(back, "Back to selected cluster / prior inventory view", () => {
+      ++podGeneration;
+      setView(previousView);
+      inspect("resource", cluster);
+    });
+    podView.replaceChildren(
+      el("h3", `Historical pod observations · cluster “${scope.cluster}”`),
+      el(
+        "p",
+        `${scope.account} / ${scope.region} · explicit historical search; inventory filters above do not constrain this view.`,
+        "hint",
+      ),
+      back,
+      warning,
+      form,
+      state,
+      coverage,
+      results,
+    );
+    setView("pods");
+    let appliedScope = null;
+    const invalidate = () => {
+      ++podGeneration;
+      appliedScope = null;
+      results.replaceChildren();
+      pager.replaceChildren();
+      coverage.replaceChildren();
+      coverage.hidden = true;
+      state.textContent =
+        "Not searched for current filters — prior results cleared. Run Search explicitly.";
+    };
+    Object.values(inputs).forEach((input) =>
+      input.addEventListener("input", invalidate),
+    );
+    function prepareActivity(row) {
+      inputs.namespace.value = row.namespace ?? "";
+      inputs.pod.value = row.pod;
+      inputs.uid.value = row.uid ?? "";
+      invalidate();
+      state.textContent = row.uid
+        ? "Pod activity scope prepared — run Search explicitly."
+        : "Name-scoped activity prepared — distinct pod instances may be included; run Search explicitly.";
+      submit.focus();
+    }
+    async function search(page = 1, savedScope = null) {
+      const generation = ++podGeneration;
+      results.replaceChildren();
+      coverage.replaceChildren();
+      coverage.hidden = true;
+      pager.replaceChildren();
+      state.textContent =
+        "Searching attached historical observations… prior results cleared.";
+      try {
+        const query = savedScope || { ...scope };
+        if (!savedScope)
+          for (const [key, input] of Object.entries(inputs)) {
+            if (!input.value) continue;
+            if (key === "start" || key === "end") {
+              if (
+                !/(Z|[+-]\d{2}:\d{2})$/.test(input.value) ||
+                !Number.isFinite(Date.parse(input.value))
+              )
+                throw new Error(
+                  `${key}: enter an ISO 8601 timestamp with explicit Z or numeric timezone offset`,
+                );
+              query[key] = new Date(input.value).toISOString();
+            } else query[key] = input.value;
+          }
+        if (query.start && query.end && query.start >= query.end)
+          throw new Error(
+            "Start must be before end (start inclusive / end exclusive).",
+          );
+        const response = await request("/api/eks-pods", { ...query, page });
+        if (generation !== podGeneration) return;
+        if (response.searched !== true || !Array.isArray(response.data))
+          throw new Error("Invalid pod observations response");
+        appliedScope = query;
+        const cov = response.coverage || {},
+          datasets = list(cov.datasets);
+        const gaps = datasets.flatMap((dataset) =>
+          list(dataset.coverage_records).flatMap((record) =>
+            list(record.manifest.operations).filter(
+              (op) => op.status !== "retrieved",
+            ),
+          ),
+        );
+        coverage.hidden = false;
+        coverage.open = false;
+        const partial =
+          gaps.length ||
+          datasets.some((dataset) => !list(dataset.coverage_records).length);
+        coverage.classList.toggle("inventory-pod-coverage-partial", !!partial);
+        const coverageSummary = el("summary");
+        coverageSummary.append(
+          el(
+            "strong",
+            `${partial ? "Partial / unknown coverage" : "Source coverage — completeness not established"} · ${datasets.length} dataset(s) · ${gaps.length} operation gap(s)`,
+          ),
+          el("span", "Collection details", "inventory-pod-coverage-action"),
+        );
+        if (cov.first_log_time && cov.last_log_time)
+          coverageSummary.append(
+            el(
+              "span",
+              `Observed source extent: ${formatPodTime(cov.first_log_time)} → ${formatPodTime(cov.last_log_time)} · selected cluster / time bounds, not continuous coverage`,
+              "inventory-pod-extent",
+            ),
+          );
+        coverage.append(
+          coverageSummary,
+          el(
+            "p",
+            "Matching observations are not a complete pod history. Measured log extent is independent of namespace, pod and UID filters and is not the requested acquisition window or proof of complete logs.",
+            "hint",
+          ),
+        );
+        state.textContent = !datasets.length
+          ? "Not collected — no attached EKS log sources in this scope. This does not mean no pods exist."
+          : cov.log_events === 0
+            ? "No collected log events reported for this scope — source datasets are attached, but pod activity is not established. Review manifests for uncollected, partial or failed log retrieval; this does not mean no pods exist."
+            : response.total
+              ? `${response.total} matching historical observations · page ${response.page} · newest first. Not current pod inventory.`
+              : "No matching observations in the attached sources and selected bounds. This does not mean no pods exist; review collection coverage and gaps.";
+        if (!query.uid)
+          coverage.append(
+            el(
+              "p",
+              "No UID scope: name-scoped observations may include distinct pod instances. Missing UID cannot establish pod identity.",
+              "inventory-warning",
+            ),
+          );
+        raw(coverage, "Applied historical search scope", response.scope);
+        coverage.append(
+          el(
+            "h4",
+            "Attached source coverage — independent of matching observations",
+          ),
+        );
+        facts(coverage, [
+          ["Datasets", datasets.length],
+          ["Log events", cov.log_events],
+          ["Pod observations", cov.pod_observations],
+          ["Malformed messages", cov.malformed_messages],
+          [
+            "Messages without a supported named pod context",
+            cov.unrecognized_messages,
+          ],
+          [
+            "Unresolved cluster context (account / region, all times)",
+            cov.unresolved_cluster_events,
+          ],
+        ]);
+        list(cov.limitations).forEach((value) =>
+          coverage.append(el("p", str(value), "inventory-warning")),
+        );
+        datasets.forEach((dataset) => {
+          coverage.append(
+            el(
+              "h4",
+              `Dataset ${dataset.dataset_index} · ${display(dataset.origin)}`,
+            ),
+          );
+          facts(coverage, [
+            ["Records", dataset.records],
+            ["Source SHA256", dataset.source_sha256],
+          ]);
+          coverage.append(
+            el(
+              "p",
+              list(dataset.coverage_records).length
+                ? "Manifest collection scope and per-operation statuses below may be partial or failed; matching rows do not prove complete collection."
+                : "No manifest attached — collection completeness unknown.",
+              "hint",
+            ),
+          );
+          list(dataset.coverage_records).forEach((record) => {
+            const manifest = record.manifest;
+            coverage.append(el("h5", `Coverage record ${record.id}`));
+            facts(coverage, [
+              ["Record SHA256", record.record_sha256],
+              ["Record time (UTC)", stamp(record.time)],
+            ]);
+            if (openEvent)
+              link(coverage, "Open original coverage event", () =>
+                openEvent(record.id),
+              );
+            facts(coverage, [
+              ["Started (UTC)", stamp(manifest.started_at)],
+              ["Finished (UTC)", stamp(manifest.finished_at)],
+              [
+                "Status",
+                manifest.status || "Not recorded; consult operation statuses",
+              ],
+              [
+                "Settings / collection bounds",
+                manifest.scope || manifest.settings,
+              ],
+            ]);
+            list(manifest.limitations).forEach((value) =>
+              coverage.append(el("p", str(value), "inventory-warning")),
+            );
+            list(manifest.warnings).forEach((value) =>
+              coverage.append(el("p", str(value), "inventory-warning")),
+            );
+            list(manifest.operations).forEach((op) => {
+              coverage.append(
+                el(
+                  "p",
+                  `${display(op.region)} / ${display(op.operation)} · ${display(op.status)} · ${display(op.pages)} pages`,
+                  op.status === "retrieved" ? "hint" : "inventory-warning",
+                ),
+              );
+              raw(coverage, "Operation scope / retrieval details", op);
+            });
+          });
+          raw(coverage, "Attached dataset and raw coverage manifests", dataset);
+        });
+        const identities = el("section", null, "inventory-pod-identities"),
+          contextList = el("div", null, "inventory-pod-context-list"),
+          activity = el("section", null, "inventory-pod-activity");
+        identities.id = "inventory-pod-contexts";
+        identities.setAttribute("aria-label", "Observed pod identity contexts");
+        activity.setAttribute("aria-label", "Historical pod activity");
+        identities.append(
+          el("h4", `Identity contexts (${response.total_contexts ?? 0})`),
+          el(
+            "p",
+            `Showing ${list(response.contexts).length} of ${response.total_contexts ?? 0} across the full filtered selection. Select an identity to prepare filters, then press Search.`,
+            "hint",
+          ),
+          el(
+            "p",
+            "Roles and UIDs stay separate. Missing UIDs leave name reuse unresolved.",
+            "hint",
+          ),
+          contextList,
+        );
+        list(response.contexts).forEach((context) => {
+          const button = el("button", null, "inventory-pod-context");
+          button.type = "button";
+          button.setAttribute(
+            "aria-label",
+            `${context.observation_role} · ${display(context.namespace)} / ${context.pod} · UID ${display(context.uid)} · ${context.observations} observations`,
+          );
+          button.title = "Prepare activity filters; run Search explicitly";
+          button.append(
+            el("strong", context.observation_role, "inventory-pod-role"),
+            el(
+              "span",
+              `${display(context.namespace)} / ${context.pod}`,
+              "inventory-pod-name",
+            ),
+            el("span", `UID: ${display(context.uid)}`, "hint"),
+            el(
+              "span",
+              `${context.observations} observations`,
+              "inventory-pod-context-count",
+            ),
+            el(
+              "span",
+              `${formatPodTime(context.first_seen)} → ${formatPodTime(context.last_seen)}`,
+              "hint",
+            ),
+          );
+          button.addEventListener("click", () => prepareActivity(context));
+          contextList.append(button);
+        });
+        activity.append(
+          el("h4", "Activity"),
+          el(
+            "p",
+            `${response.total} observations · page ${response.page} · newest first. All roles matching the applied filters are shown.`,
+            "hint",
+          ),
+          pager,
+        );
+        results.append(identities, activity);
+        const grid = el("table", null, "inventory-pod-table"),
+          head = el("thead"),
+          header = el("tr"),
+          body = el("tbody");
+        [
+          `Time (${podTimezone()})`,
+          "Identity / observation role",
+          "Actor",
+          "Action / target / subresource / stage",
+          "Outcome / status",
+          "Source / actions",
+        ].forEach((label) => header.append(el("th", label)));
+        head.append(header);
+        list(response.data).forEach((row) => {
+          const tr = el("tr"),
+            identity = el("td"),
+            source = el("td"),
+            identityDetails = el("details");
+          identityDetails.append(
+            el("summary", "Identity details"),
+            el("p", `Namespace basis: ${display(row.namespace_basis)}`, "hint"),
+          );
+          identity.append(
+            el("strong", display(row.observation_role), "inventory-pod-role"),
+            el("p", `${display(row.namespace)} / ${row.pod}`),
+            el("p", `UID: ${display(row.uid)}`),
+            identityDetails,
+          );
+          if (row.node || row.node_uid)
+            identityDetails.append(
+              el(
+                "p",
+                `Credential node context (not scheduled/current node): ${display(row.node)} · UID ${display(row.node_uid)}`,
+                "hint",
+              ),
+            );
+          if (!row.uid)
+            identityDetails.append(
+              el(
+                "p",
+                "UID missing — name scope may include distinct pod instances",
+                "hint",
+              ),
+            );
+          link(identityDetails, "View pod activity", () =>
+            prepareActivity(row),
+          );
+          if (openEvent)
+            link(source, "Open original source event", () => openEvent(row.id));
+          else
+            source.append(
+              el(
+                "p",
+                "Original event detail is unavailable in this window; return to the main application.",
+                "hint",
+              ),
+            );
+          raw(source, "Source provenance", {
+            record_sha256: row.record_sha256,
+            dataset_index: row.dataset_index,
+            source_type: row.source_type,
+            ...row.source,
+            cluster_basis: row.cluster_basis,
+          });
+          raw(source, "Derived observation details", {
+            observation_role: row.observation_role,
+            namespace_basis: row.namespace_basis,
+            pod: row.pod,
+            uid: row.uid,
+            actor: row.actor,
+            credential_node_context: { name: row.node, uid: row.node_uid },
+            target_resource: row.target_resource,
+            target_namespace: row.target_namespace,
+            status_code: row.status_code,
+            stage: row.stage,
+            outcome: row.outcome,
+          });
+          tr.append(
+            el("td", formatPodTime(row.time)),
+            identity,
+            el("td", display(row.actor)),
+            el(
+              "td",
+              `${display(row.action)} / target ${display(row.target_resource)} in ${display(row.target_namespace)} / ${display(row.subresource)} / ${display(row.stage)}`,
+            ),
+            el("td", display(row.outcome)),
+            source,
+          );
+          body.append(tr);
+        });
+        grid.append(head, body);
+        const scroll = el("div", null, "inventory-pod-activity-scroll");
+        scroll.append(grid);
+        activity.append(scroll);
+        if (response.page > 1)
+          link(pager, "Previous page", () =>
+            search(response.page - 1, appliedScope),
+          );
+        if (response.page * response.page_size < response.total)
+          link(pager, "Next page", () =>
+            search(response.page + 1, appliedScope),
+          );
+      } catch (error) {
+        if (generation !== podGeneration) return;
+        appliedScope = null;
+        state.textContent = `Search failed — no current results. ${error.message}. Correct filters or retry Search; no absence conclusion is supported.`;
+      }
+    }
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      search();
+    });
   }
   // Keep this optional collection view self-contained; older exports remain usable.
   const iamButton = el("button", "IAM");
@@ -1318,5 +2104,15 @@
     $("fit-all").after($("clear"));
     document.title = "AWS map · KamoTrace";
   }
-  window.kamotraceInventory = { show, hide, selectResource, popout };
+  window.kamotraceInventory = {
+    show,
+    hide,
+    selectResource,
+    popout,
+    setEventOpener: (callback, timezone = "UTC", formatter = stamp) => {
+      openEvent = callback;
+      podTimezone = typeof timezone === "function" ? timezone : () => timezone;
+      formatPodTime = formatter;
+    },
+  };
 })();
