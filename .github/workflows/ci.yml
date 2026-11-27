@@ -55,7 +55,11 @@ jobs:
       - run: uv build
       - run: git diff --check
       - name: Install test-only Chromium
-        run: uv run --locked --with playwright==1.64.1 python -m playwright install --with-deps chromium
+        run: |
+          # Chromium needs Ubuntu packages, not the runner's Microsoft feed.
+          # A feed outage must not block apt update for browser dependencies.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          uv run --locked --with playwright==1.64.1 python -m playwright install --with-deps chromium
       - name: Verify rendered events and search; capture screenshots
         run: |
           mkdir -p test-results
