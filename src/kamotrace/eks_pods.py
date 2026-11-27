@@ -1,4 +1,5 @@
 """Derived historical pod observations from attached EKS logs, never live inventory."""
+from itertools import islice
 import re
 
 import simplejson as json
@@ -153,11 +154,20 @@ def prepare(connection, sources):
 
 
 def validate(body):
-    allowed = {"account", "region", "cluster", "start", "end", "namespace", "pod", "uid", "page"}
+    options = {"page", "size", "projection", "coverage_page"}
+    allowed = {"account", "region", "cluster", "start", "end", "namespace", "pod", "uid", *options}
     if body.keys() - allowed:
         raise ValueError("Unknown pod-observation query fields")
+    if body.get("projection", "full") not in ("full", "summary"):
+        raise ValueError("Pod projection must be full or summary")
+    if type(body.get("size", 50)) is not int or not 1 <= body.get("size", 50) <= 50:
+        raise ValueError("Pod size must be an integer from 1 to 50")
+    if type(body.get("coverage_page", 1)) is not int or not 1 <= body.get("coverage_page", 1) <= 1000000:
+        raise ValueError("coverage_page must be an integer from 1 to 1000000")
+    if body.get("projection", "full") == "full" and body.get("coverage_page", 1) != 1:
+        raise ValueError("coverage_page requires summary projection")
     scope = {}
-    for key in allowed - {"page"}:
+    for key in allowed - options:
         value = body.get(key)
         if key in ("account", "region", "cluster") and (not isinstance(value, str) or not value):
             raise ValueError("Pod observations require account, region and cluster")
@@ -173,7 +183,7 @@ def validate(body):
     return scope, page, bounds
 
 
-def query(connection, datasets, scope, page, bounds):
+def query(connection, datasets, scope, page, bounds, size=50, summary=False, coverage_page=1):
     conditions, params = ["account=?", "region=?", "cluster=?"], [scope["account"], scope["region"], scope["cluster"]]
     for key, operator in (("start", ">="), ("end", "<")):
         if key in bounds:
@@ -186,23 +196,45 @@ def query(connection, datasets, scope, page, bounds):
             params.append(scope[key])
     predicate = " AND ".join(conditions)
     total = connection.execute("SELECT count(*) FROM eks_pod_observations WHERE " + predicate, params).fetchone()[0]
-    cursor = connection.execute("SELECT * REPLACE(time::VARCHAR AS time) FROM eks_pod_observations WHERE " + predicate + " ORDER BY time DESC, id DESC, observation_role LIMIT 50 OFFSET ?", [*params, (page - 1) * 50])
+    cursor = connection.execute("SELECT * REPLACE(time::VARCHAR AS time) FROM eks_pod_observations WHERE " + predicate + " ORDER BY time DESC, id DESC, observation_role LIMIT ? OFFSET ?", [*params, size, (page - 1) * size])
     data = [dict(zip([column[0] for column in cursor.description], row)) for row in cursor.fetchall()]
     for row in data:
         row["source"] = json.loads(row["source"], use_decimal=True)
     cursor = connection.execute("""SELECT observation_role, namespace, pod, uid, count(*) AS observations,
         min(time)::VARCHAR AS first_seen, max(time)::VARCHAR AS last_seen, count(*) OVER() AS total_contexts
         FROM eks_pod_observations WHERE """ + predicate + """ GROUP BY observation_role, namespace, pod, uid
-        ORDER BY max(time) DESC, observation_role, namespace, pod, uid LIMIT 50""", params)
+        ORDER BY max(time) DESC, observation_role, namespace, pod, uid LIMIT ?""", [*params, size if summary else 50])
     contexts = [dict(zip([column[0] for column in cursor.description], row)) for row in cursor.fetchall()]
     total_contexts = contexts[0]["total_contexts"] if contexts else 0
     for context in contexts:
         context.pop("total_contexts")
     logs, malformed, unrecognized, first_log, last_log = connection.execute("SELECT count(*), count(*) FILTER(WHERE malformed), count(*) FILTER(WHERE unrecognized), min(time)::VARCHAR, max(time)::VARCHAR FROM eks_pod_log_counts WHERE " + log_predicate, log_params).fetchone()
     unresolved = connection.execute("SELECT count(*) FROM eks_pod_log_counts WHERE account=? AND region=? AND cluster IS NULL", [scope["account"], scope["region"]]).fetchone()[0]
-    return {"searched": True, "scope": scope, "total": total, "page": page, "page_size": 50, "data": data,
+    result = {"searched": True, "scope": scope, "total": total, "page": page, "page_size": size, "data": data,
             "contexts": contexts, "total_contexts": total_contexts,
             "coverage": {"datasets": datasets, "log_events": logs, "malformed_messages": malformed,
                          "first_log_time": first_log, "last_log_time": last_log,
                          "unrecognized_messages": unrecognized, "unresolved_cluster_events": unresolved,
                          "pod_observations": total, "limitations": LIMITATIONS}}
+    if summary:
+        coverage = result["coverage"]
+        del coverage["datasets"]
+        records_total = sum(len(dataset["coverage_records"]) for dataset in datasets)
+        records = ((dataset, record) for dataset in datasets for record in dataset["coverage_records"])
+        links = []
+        for dataset, record in islice(records, (coverage_page - 1) * 10, coverage_page * 10):
+            operations = record["manifest"].get("operations")
+            warnings = record["manifest"].get("warnings")
+            links.append({"dataset_index": dataset["dataset_index"],
+                **{key: record[key] for key in ("id", "record_sha256", "time")},
+                "operations_total": len(operations) if isinstance(operations, list) else None,
+                "operations_with_gaps": sum(not isinstance(op, dict) or op.get("status") != "retrieved" for op in operations) if isinstance(operations, list) else None,
+                "warnings_total": len(warnings) if isinstance(warnings, list) else None})
+        coverage.update(datasets_total=len(datasets), datasets_without_coverage=sum(not dataset["coverage_records"] for dataset in datasets),
+            coverage_records_total=records_total, coverage_records=links, coverage_page=coverage_page,
+            coverage_page_size=10, coverage_next_page=coverage_page + 1 if coverage_page * 10 < records_total else None,
+            coverage_scope="All attached EKS collections, not filtered to the selected cluster or time. Read coverage records with get_event; missing manifests mean unknown coverage.")
+        result.update(next_page=page + 1 if page * size < total else None, response_limit_bytes=24000)
+        if len(json.dumps(result, use_decimal=True, ensure_ascii=True).encode("utf-8")) > 24000:
+            raise ValueError("Pod response exceeds 24000 bytes; reduce size or narrow filters. For a single oversized observation inspect original evidence via get_event or the browser; nothing was truncated.")
+    return result

@@ -260,6 +260,25 @@ advertised capabilities and bounded connection behavior; stdio or direct tool
 tests alone miss this failure mode. Existing HTTP and stdio tests also check
 that MCP writes immediately appear through the browser API.
 
+`get_inventory` forwards to `POST /api/inventory`, implemented by `Inventory.query`.
+Its default overview contains compact snapshot times, coverage indicators and
+category availability/counts. Explicit categories support exact scope filters,
+name/ID substring search, stable pages and optional complete-record details.
+Unknown query fields/categories and invalid filters are rejected. Responses over
+24,000 conservative serialized bytes fail without truncation; one oversized detail
+remains inspectable in the browser's unchanged full `GET /api/inventory` report.
+Neither inventory path scans history. `search_eks_pods` forwards to `POST /api/eks-pods` with the
+same required account/region/cluster scope, exact optional filters, time bounds,
+and full-selection totals. Its summary projection defaults to ten observations,
+with adjustable size (1–50) and a 24,000-byte response budget. Independent coverage
+pages contain ten original-event links and gap/warning counts, not full manifests;
+all attached collection scopes remain explicitly labelled. Missing manifests are
+counted as unknown. The browser's default full projection remains unchanged.
+Inventory category availability records actual startup inputs/EKS-derived data,
+not the browser report's empty placeholders. Both are read-only tools shared by HTTP and stdio;
+neither makes AWS or Kubernetes calls. Original log evidence remains available
+through `get_event` using the observation's global event ID.
+
 ## Resources, distribution and verification
 
 `memory.py` distinguishes process RSS, DuckDB-managed memory and system/container

@@ -5,10 +5,16 @@ import logging
 from pathlib import Path
 import re
 import time
+from typing import Literal, get_args
 
 
 logger = logging.getLogger(__name__)
 COLLECTIONS = ("resources", "vpcs", "security_groups", "relationships", "forwarding_paths", "listener_actions", "errors")
+InventoryCategory = Literal["resources", "vpcs", "subnets", "security_groups", "relationships",
+    "forwarding_paths", "listener_actions", "errors", "eks_coverage", "metadata",
+    "iam.users", "iam.roles", "iam.groups", "iam.policies", "iam.aws_managed_policies",
+    "iam.profiles", "iam.errors", "iam.metadata"]
+INVENTORY_RESPONSE_LIMIT = 24000  # Leaves headroom for MCP's text and structured copies.
 
 
 class Inventory:
@@ -16,14 +22,21 @@ class Inventory:
         self.report = {"loaded": False, "metadata": None, "counts": {}, **{key: [] for key in COLLECTIONS}}
         self.index = {}
         self.networks = []
+        self.available_categories = set()
         if folder is None and eks_export is None:
             return
         path = Path(folder) / "report.json" if folder is not None else None
         try:
             report = json.loads(path.read_text(encoding="utf-8")) if path else self.report
+            if path:
+                self.available_categories = {name for name in get_args(InventoryCategory)
+                    if (name.split(".")[-1] in report.get("iam", {}) if name.startswith("iam.") else name in report)}
+                if "iam" in report:
+                    self.available_categories.add("iam.metadata")
             if eks_export is not None:
                 from .inventory import add_eks
                 add_eks(report, eks_export)
+                self.available_categories.update(("resources", "relationships", "errors", "eks_coverage", "metadata"))
             if (not isinstance(report, dict) or not isinstance(report.get("metadata"), dict)
                     or not isinstance(report["metadata"].get("account"), str)
                     or any(not isinstance(report.get(key), list) for key in COLLECTIONS)
@@ -85,6 +98,84 @@ class Inventory:
                     self.add("identity", name, role)
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
             raise ValueError(f"Cannot load inventory export {path}: {error}") from error
+
+    def query(self, body):
+        allowed = {"category", "search", "account", "region", "kind", "resource_id", "page", "size", "include_details"}
+        if body.keys() - allowed:
+            raise ValueError("Unknown inventory query fields")
+        category = body.get("category")
+        if category is not None and category not in get_args(InventoryCategory):
+            raise ValueError("Unknown inventory category")
+        for key in ("search", "account", "region", "kind", "resource_id"):
+            value = body.get(key)
+            if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 2048):
+                if key != "search" or value != "":
+                    raise ValueError(f"{key} must be nonempty text up to 2048 characters")
+        page, size = body.get("page", 1), body.get("size", 25)
+        if type(page) is not int or not 1 <= page <= 1000000 or type(size) is not int or not 1 <= size <= 100:
+            raise ValueError("Inventory page must be 1–1000000 and size 1–100")
+        details = body.get("include_details", False)
+        if type(details) is not bool:
+            raise ValueError("include_details must be a boolean")
+        if category is None and (any(body.get(k) for k in ("search", "account", "region", "kind", "resource_id"))
+                                 or details or page != 1 or size != 25):
+            raise ValueError("Select an inventory category before filtering, paging or requesting details")
+
+        metadata = self.report.get("metadata") or {}
+        categories = {}
+        for name in get_args(InventoryCategory):
+            owner = self.report.get("iam", {}) if name.startswith("iam.") else self.report
+            key = name.split(".")[-1]
+            value = owner.get(key)
+            if name == "iam.metadata":
+                value = {k: v for k, v in owner.items()
+                         if "iam." + k not in get_args(InventoryCategory)} if "iam" in self.report else None
+            if isinstance(value, dict):
+                items = [{"id": k, "value": v} for k, v in value.items()]
+            else:
+                items = value or []
+            categories[name] = (name in self.available_categories, items)
+        result = {"loaded": self.report["loaded"],
+            "snapshot": {k: metadata[k] for k in ("account", "started_at_utc", "completed_at_utc", "iam_completed_at_utc") if k in metadata},
+            "eks_snapshot": {k: metadata["eks"][k] for k in ("started_at", "finished_at") if k in metadata.get("eks", {})},
+            "coverage": {"errors": len(self.report["errors"]), "eks_operations": len(self.report.get("eks_coverage", [])),
+                         "eks_gaps": sum(row.get("status") != "retrieved" for row in self.report.get("eks_coverage", []))},
+            "warning": "Current configuration, not incident-time state, live pods or effective access. Unavailable or empty categories do not establish absence; inspect metadata, errors and collection coverage.",
+            "response_limit_bytes": INVENTORY_RESPONSE_LIMIT}
+        if category is None:
+            result["categories"] = [{"category": name, "available": available, "total": len(items)}
+                                    for name, (available, items) in categories.items()]
+        else:
+            available, items = categories[category]
+            id_fields = ("id", "Arn", "UserId", "RoleId", "GroupId", "PolicyId", "source", "target", "resource",
+                         "load_balancer_id", "listener_id", "rule_id", "target_group_id", "target_id",
+                         "target_resource_id", "forwarding_path_id")
+            identity_fields = (*id_fields, "name", "UserName", "RoleName", "GroupName", "PolicyName",
+                               "load_balancer_name", "target_group_name", "target_name")
+            selected = []
+            for index, item in enumerate(items):
+                identities = [item[k] for k in identity_fields if isinstance(item.get(k), str)]
+                region = item.get("region", "global" if category.startswith("iam.") else None)
+                if any(body.get(k) and body[k] != value for k, value in (
+                        ("account", item.get("account", metadata.get("account"))),
+                        ("region", region), ("kind", item.get("kind")))):
+                    continue
+                if body.get("resource_id") and body["resource_id"] not in [item.get(k) for k in id_fields]:
+                    continue
+                if body.get("search") and not any(body["search"].casefold() in value.casefold() for value in identities):
+                    continue
+                selected.append((str(region or ""), tuple(identities), index, item))
+            selected.sort(key=lambda row: row[:3])
+            data = [row[3] for row in selected[(page - 1) * size:page * size]]
+            if not details:
+                summary_fields = {*identity_fields, "account", "region", "kind", "state", "status", "observed_at", "operation", "error", "value"}
+                data = [{k: v for k, v in item.items() if k in summary_fields and not isinstance(v, (dict, list))} for item in data]
+            result.update(category=category, available=available, total=len(selected), page=page, size=size,
+                          next_page=page + 1 if page * size < len(selected) else None,
+                          include_details=details, data=data)
+        if len(json.dumps(result, ensure_ascii=True).encode("utf-8")) > INVENTORY_RESPONSE_LIMIT:
+            raise ValueError("Inventory response exceeds 24000 bytes; reduce size, narrow filters or use include_details=false. A single oversized detail is available through the browser's full GET /api/inventory report; nothing was truncated.")
+        return result
 
     def add(self, kind, value, match):
         if value:

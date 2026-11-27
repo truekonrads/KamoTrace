@@ -1726,7 +1726,60 @@ changed the note since, the call fails without writing; re-read it and retry.
 | `reattach_ssm_review` | Explicit, audited reattachment from an orphan to a current entry with no review. Requires the orphan stamp and an analyst reason; unknown/ambiguous identities additionally require an explicit analyst mapping. Never overwrites destination work. |
 | `edit_ssm_log_entries` | 1–100 explicit edits within 1 MiB. Independent per-item commits, `ok/stale/missing/invalid` results; all duplicate-ID occurrences are invalid. Retry rejected items after rereading; replayed successful stamps are stale. |
 | `lookup_reference` | Scoped `identity/machine/ip` summaries with sources, snapshot times, ambiguity and pagination. History is not searched unless explicitly requested; current configuration is not incident-time identity. Missing inventory is labelled, and no online lookup is triggered. |
+| `get_inventory` | No arguments returns compact snapshot times, coverage indicators and category availability/counts. Select `category` for paginated identity/status summaries; add `include_details=true` for complete selected configuration/provenance. Optional exact `account`, `region`, `kind`, `resource_id` filters AND with case-insensitive name/ID `search`. `page` defaults to 1; `size` defaults to 25 (1–100); follow `next_page`. `loaded=false` means no attached snapshot. Does not scan logs or contact AWS. |
+| `search_eks_pods` | Historical pod observations from attached EKS logs. Requires exact `account`, `region`, `cluster`; optional exact `namespace`, `pod`, `uid`, inclusive `start`/exclusive `end` (ISO timestamps with offsets), `page` (default 1) and `size` (default 10, 1–50). Returns full-selection `total`, `next_page`, complete observation rows, up to `size` identity `contexts` with `total_contexts`, and compact coverage. `coverage_page` separately pages ten coverage-event links; follow `coverage_next_page`. Read original observations and manifests with `get_event(id)`. Caller credentials, target pods and workload metadata stay distinct; this is not live pod inventory or proof of placement. |
 | `create_export` | Immutable NDJSON snapshot of an event `query` or SSM `ssm_selection` with allowlisted fields. Returns readiness, row/byte counts, SHA-256, expiry and an opaque download URL, never a filesystem path. |
+
+EKS configuration requires a verified `--eks-export` at server startup. Historical
+pod searches require the separately imported EKS database attached through
+`--other-events`; `auto` with EKS selection prepares both. No result is proof that
+no pods exist: inspect coverage, unsupported messages and missing UIDs. Inventory
+is collection-time AWS configuration, not incident-time state or effective access.
+
+Inventory categories are `resources` (including EKS clusters/components), `vpcs`,
+`subnets`, `security_groups`, `relationships`, `forwarding_paths`, `listener_actions`,
+`errors`, `eks_coverage`, `metadata`, `iam.users`, `iam.roles`, `iam.groups`,
+`iam.policies`, `iam.aws_managed_policies`, `iam.profiles`, `iam.errors` and
+`iam.metadata`. `available` means the category was supplied, not that collection
+succeeded or was complete. EKS-only startup does not mark absent network/IAM
+categories as supplied; legacy empty browser placeholders do not establish
+availability. Overview counts cover entire categories; selected
+pages report the full filtered `total`. Categories absent from older exports are
+unavailable, not evidence of no resources. Metadata/profile dictionaries become
+`id`/`value` rows; select `include_details=true` to retrieve nested values.
+
+Search matches top-level names, IDs/ARNs (including stable IAM user/role/group/policy
+IDs, listener/rule and target-group identifiers) and relationship endpoints, not nested
+policies, messages or configuration. `resource_id` matches exact IDs/ARNs or
+relationship endpoints. IAM rows without a region use `global`; other unknown
+regions do not match a region filter. Sorting is stable by region, identifiers,
+then source position. Filters, nondefault paging and details require a category.
+For example, discover clusters with
+`get_inventory(category="resources", kind="EKS cluster")`, then pass the selected
+row's `id` as `resource_id` with `include_details=true`. Access/Pod Identity
+observations stay in cluster details; collection operations are in `eks_coverage`.
+
+Inventory query results have a conservative 24,000-byte serialized JSON limit,
+leaving room for MCP's text and structured copies. Oversized pages fail explicitly;
+reduce `size`, narrow the scope or use summaries. A single oversized detail must
+be inspected in the browser's full report; no records or values are silently cut.
+The shared `POST /api/inventory` implements this query contract. The browser's
+existing full `GET /api/inventory` remains unchanged.
+
+MCP pod searches use the shared `POST /api/eks-pods` with `projection="summary"`.
+Observation rows are not text-truncated. Coverage summaries contain total attached
+datasets, `datasets_without_coverage` (unknown coverage), total coverage records,
+and ten `coverage_records` links per coverage page, in attachment/source order.
+Each link carries `id`, `record_sha256`, time, dataset index, operation count,
+operation-gap count and warning count (null when unavailable). Coverage links
+describe **all attached EKS collections**, not just the selected cluster/time;
+read their original events for collection bounds, warnings and failure details.
+No full manifests are repeated in MCP search results. Coverage paging is independent
+of observation paging. Both retain full totals and never turn missing coverage
+into a completeness claim. Summary responses over 24,000 conservative serialized
+bytes fail explicitly: reduce `size` or narrow filters; a single oversized
+observation remains inspectable in original evidence or the browser. The browser's
+default full projection retains its existing manifests and 50-row pages.
 
 Exports prepare synchronously, with one preparation at a time, at most 50,000
 rows / 32 MiB each and four artifacts / 128 MiB per server. Narrow the selection

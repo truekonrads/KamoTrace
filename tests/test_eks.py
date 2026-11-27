@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import re
+import sys
 import tempfile
 import threading
 import unittest
@@ -17,7 +18,7 @@ import anyio
 from boto3 import Session
 from botocore.stub import Stubber
 import duckdb
-from mcp import Client
+from mcp import Client, StdioServerParameters
 
 from kamotrace.cli import main
 from kamotrace import eks
@@ -225,6 +226,36 @@ class EKSContract(unittest.TestCase):
 
         async def check():
             async with Client(url + "/mcp") as client:
+                tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+                for name in ("get_inventory", "search_eks_pods"):
+                    self.assertTrue(tools[name].annotations.read_only_hint)
+                    self.assertFalse(tools[name].annotations.open_world_hint)
+                inventory = await client.call_tool("get_inventory", {})
+                self.assertFalse(inventory.is_error, inventory)
+                overview = inventory.structured_content
+                self.assertNotIn("resources", overview)
+                categories = {row["category"]: row for row in overview["categories"]}
+                for name in ("vpcs", "subnets", "security_groups", "forwarding_paths", "listener_actions", "iam.roles"):
+                    self.assertFalse(categories[name]["available"], name)
+                missing_network = await client.call_tool("get_inventory", {"category": "vpcs"})
+                self.assertFalse(missing_network.is_error, missing_network)
+                self.assertFalse(missing_network.structured_content["available"])
+                self.assertEqual(missing_network.structured_content["total"], 0)
+                self.assertTrue(categories["relationships"]["available"])
+                self.assertEqual(next(c["total"] for c in overview["categories"] if c["category"] == "resources"), 4)
+                self.assertEqual(overview["eks_snapshot"]["finished_at"], info["finished_at"])
+                self.assertGreater(overview["coverage"]["eks_gaps"], 0)
+                clusters = await client.call_tool("get_inventory", {"category": "resources", "kind": "EKS cluster"})
+                self.assertFalse(clusters.is_error, clusters)
+                self.assertEqual([r["id"] for r in clusters.structured_content["data"]], [cluster["id"]])
+                detailed = await client.call_tool("get_inventory", {"category": "resources", "resource_id": cluster["id"],
+                    "region": REGION, "account": "123456789012", "include_details": True})
+                self.assertFalse(detailed.is_error, detailed)
+                self.assertEqual(detailed.structured_content["data"], [cluster])
+                coverage = await client.call_tool("get_inventory", {"category": "eks_coverage", "include_details": True})
+                self.assertFalse(coverage.is_error, coverage)
+                self.assertCountEqual(coverage.structured_content["data"], report["eks_coverage"])
+                self.assertIsNone(store.eks_pod_sources)  # Inventory reads never scan historical logs.
                 result = await client.call_tool("search_events", {"query": {"pipeline_version": 1,
                     "pipeline": 'event_type = "other" | search "CloudWatch log event"'}})
                 self.assertFalse(result.is_error, result)
@@ -377,6 +408,75 @@ class EKSContract(unittest.TestCase):
 
 
 class PodObservationsContract(unittest.TestCase):
+    def test_mcp_pod_coverage_is_bounded_and_evidence_linked(self):
+        from kamotrace import other_events
+
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            root = Path(temporary)
+            databases = []
+            for dataset in range(2):
+                rows = [{"date": START, "content": {"kind": "kamotrace-eks-v1", "complete": True,
+                    "collection": dataset * 6 + i, "warnings": ["Synthetic collection gap"],
+                    "operations": [{"operation": "synthetic", "description": "x" * 120,
+                                    "status": "error" if op == 199 else "retrieved"} for op in range(200)]}}
+                    for i in range(6)]
+                rows.append({"date": START, "content": {"kind": "CloudWatch log event", "account": "123456789012", "region": REGION,
+                    "log_group": "/aws/eks/large/cluster", "event": {"message": json.dumps({"kubernetes": {
+                        "pod_name": str(dataset) + "p" * 8000, "namespace_name": "jobs"}})}}})
+                source, database = root / f"source-{dataset}.jsonl", root / f"source-{dataset}.duckdb"
+                source.write_text("\n".join(json.dumps(row) for row in rows))
+                other_events.build([source], database, eks.ORIGIN)
+                databases.append(database)
+            before = {path: sha256(path) for path in databases}
+            store = Store(databases[0], other_events=databases[1:])
+            stack.callback(store.selection_directory.cleanup)
+            stack.callback(store.connection.close)
+            stack.callback(store.reviews.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            stack.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            stack.callback(thread.join)
+            stack.callback(server.shutdown)
+            url = f"http://127.0.0.1:{server.server_port}"
+            server.mcp_request = stack.enter_context(http_transport(url))
+            scope = {"account": "123456789012", "region": REGION, "cluster": "empty"}
+            with urlopen(Request(url + "/api/eks-pods", data=json.dumps(scope).encode(), headers={"Content-Type": "application/json"})) as response:
+                full = json.load(response)
+            self.assertGreater(len(json.dumps(full).encode()), 400000)
+            self.assertEqual(len(full["coverage"]["datasets"]), 2)
+
+            async def check(transport):
+                async with Client(transport) as client:
+                    pages = []
+                    for page in (1, 2):
+                        result = await client.call_tool("search_eks_pods", {**scope, "coverage_page": page})
+                        self.assertFalse(result.is_error, result)
+                        self.assertLess(len(result.model_dump_json().encode()), 80000)
+                        self.assertEqual(result.structured_content["total"], 0)
+                        pages.append(result.structured_content["coverage"])
+                    self.assertEqual(pages[0]["datasets_total"], 2)
+                    self.assertEqual(pages[0]["coverage_records_total"], 12)
+                    self.assertEqual([page["coverage_next_page"] for page in pages], [2, None])
+                    links = [link for page in pages for link in page["coverage_records"]]
+                    self.assertEqual([link["id"] for link in links], [*range(1, 7), *range(8, 14)])
+                    self.assertEqual({link["operations_with_gaps"] for link in links}, {1})
+                    original = await client.call_tool("get_event", {"id": links[-1]["id"]})
+                    self.assertTrue(original.structured_content["raw_json_matches_hash"])
+                    self.assertEqual(original.structured_content["record_sha256"], links[-1]["record_sha256"])
+                    self.assertEqual(len(json.loads(original.structured_content["raw_json"])["content"]["operations"]), 200)
+                    rejected = await client.call_tool("search_eks_pods", {**scope, "cluster": "large", "size": 2})
+                    self.assertTrue(rejected.is_error, rejected)
+                    self.assertIn("reduce size", rejected.content[0].text)
+                    for page in (1, 2):
+                        result = await client.call_tool("search_eks_pods", {**scope, "cluster": "large", "size": 1, "page": page})
+                        self.assertFalse(result.is_error, result)
+                        self.assertEqual(result.structured_content["total"], 2)
+                        self.assertEqual(result.structured_content["data"][0]["pod"], str(2 - page) + "p" * 8000)
+            for transport in (url + "/mcp", StdioServerParameters(command=sys.executable, args=["-m", "kamotrace", "mcp", "--url", url])):
+                anyio.run(check, transport)
+            self.assertEqual({path: sha256(path) for path in before}, before)
+
     def test_combined_import_preserves_each_coverage_record(self):
         from kamotrace import other_events
 
@@ -483,6 +583,7 @@ class PodObservationsContract(unittest.TestCase):
                 stack.callback(server.shutdown)
                 url = f"http://127.0.0.1:{server.server_port}"
                 query = {"account": "123456789012", "region": REGION, "cluster": "historical", "start": START, "end": END}
+                server.mcp_request = stack.enter_context(http_transport(url))
 
                 def request(body):
                     with urlopen(Request(url + "/api/eks-pods", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})) as response:
@@ -518,8 +619,41 @@ class PodObservationsContract(unittest.TestCase):
                 self.assertEqual(detail["record_sha256"], target["record_sha256"])
                 self.assertEqual(json.loads(detail["raw_json"])["content"]["event"]["message"], records[0]["content"]["event"]["message"])
                 self.assertEqual(target["source"]["event_id"], "source-0")
+
+                async def check():
+                    async with Client(url + "/mcp") as client:
+                        inventory = await client.call_tool("get_inventory", {})
+                        self.assertFalse(inventory.is_error, inventory)
+                        self.assertFalse(inventory.structured_content["loaded"])
+                        pods = await client.call_tool("search_eks_pods", query)
+                        self.assertFalse(pods.is_error, pods)
+                        self.assertEqual(pods.structured_content["data"], result["data"])
+                        self.assertEqual(pods.structured_content["contexts"], result["contexts"])
+                        self.assertEqual(pods.structured_content, request({**query, "projection": "summary", "size": 10}))
+                        self.assertEqual(pods.structured_content["coverage"]["coverage_records"][0]["id"], 17)
+                        for filters, expected in (({"pod": "reused", "uid": "target-old"}, 1),
+                                                  ({"pod": "reused", "namespace": "operations"}, 0),
+                                                  ({"account": "999999999999"}, 2),
+                                                  ({"region": "us-east-1"}, 2),
+                                                  ({"cluster": "other"}, 2),
+                                                  ({"pod": "' OR true --"}, 0),
+                                                  ({"start": "2026-10-01T08:00:00.001+08:00", "end": "2026-10-01T08:00:00.100+08:00"}, 0),
+                                                  ({"page": 2}, 0)):
+                            selected = await client.call_tool("search_eks_pods", {**query, **filters})
+                            self.assertFalse(selected.is_error, selected)
+                            self.assertEqual(len(selected.structured_content["data"]), expected)
+                        original = await client.call_tool("get_event", {"id": target["id"]})
+                        self.assertTrue(original.structured_content["raw_json_matches_hash"])
+                        self.assertEqual(original.structured_content["record_sha256"], target["record_sha256"])
+                        for invalid in ({**query, "start": END}, {**query, "page": True},
+                                        {**query, "size": 0}, {**query, "size": 51}, {**query, "coverage_page": True},
+                                        {**query, "account": ""}, {"region": REGION, "cluster": "historical"}):
+                            rejected = await client.call_tool("search_eks_pods", invalid)
+                            self.assertTrue(rejected.is_error, rejected)
+                anyio.run(check)
                 from urllib.error import HTTPError
-                for invalid in ({**query, "start": END}, {**query, "page": True}, {**query, "sql": "SELECT *"}):
+                for invalid in ({**query, "start": END}, {**query, "page": True}, {**query, "size": 0},
+                                {**query, "coverage_page": True}, {**query, "projection": "unknown"}, {**query, "sql": "SELECT *"}):
                     with self.assertRaises(HTTPError) as raised:
                         request(invalid)
                     self.assertEqual(raised.exception.code, 400)
@@ -549,6 +683,31 @@ class PodObservationsContract(unittest.TestCase):
                     self.assertEqual({r["observations"] for r in first["contexts"]}, {1})
                     self.assertIsNone(first["coverage"]["datasets"][0]["manifest"])
                     self.assertEqual(store.eks_pods({**query, "uid": "unobserved"})["total"], 0)
+                    with ExitStack() as stack:
+                        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+                        stack.callback(server.server_close)
+                        thread = threading.Thread(target=server.serve_forever, daemon=True)
+                        thread.start()
+                        stack.callback(thread.join)
+                        stack.callback(server.shutdown)
+                        url = f"http://127.0.0.1:{server.server_port}"
+                        server.mcp_request = stack.enter_context(http_transport(url))
+
+                        async def check():
+                            async with Client(url + "/mcp") as client:
+                                ids = []
+                                for page in range(1, 7):
+                                    result = await client.call_tool("search_eks_pods", {**query, "page": page})
+                                    self.assertFalse(result.is_error, result)
+                                    value = result.structured_content
+                                    self.assertEqual((value["total"], value["total_contexts"]), (53, 53))
+                                    self.assertEqual(value["next_page"], page + 1 if page < 6 else None)
+                                    self.assertEqual(len(value["contexts"]), 10)
+                                    self.assertEqual(value["coverage"]["datasets_without_coverage"], 1)
+                                    self.assertEqual(value["coverage"]["coverage_records_total"], 0)
+                                    ids.extend(row["id"] for row in value["data"])
+                                self.assertEqual(ids, list(range(53, 0, -1)))
+                        anyio.run(check)
                 finally:
                     store.connection.close()
                     store.reviews.close()

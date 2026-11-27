@@ -465,10 +465,13 @@ class Store:
     def eks_pods(self, body):
         from .eks_pods import prepare, query, validate
         scope, page, bounds = validate(body)
+        summary = body.get("projection", "full") == "summary"
         with self.locked("eks.pod_observations"):
             if self.eks_pod_sources is None:
                 self.eks_pod_sources = prepare(self.connection, self.event_sources)
-            return query(self.connection, self.eks_pod_sources, scope, page, bounds)
+            return query(self.connection, self.eks_pod_sources, scope, page, bounds,
+                         size=body.get("size", 10 if summary else 50), summary=summary,
+                         coverage_page=body.get("coverage_page", 1))
 
     def manual_write(self, body):
         from .other_events import save_manual
@@ -1505,7 +1508,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/eks-pods", "/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
+        if self.path not in ("/api/inventory", "/api/eks-pods", "/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1519,6 +1522,7 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/manual-events": self.store.manual_write,
                          "/api/computers": self.store.computers,
                          "/api/eks-pods": self.store.eks_pods,
+                         "/api/inventory": self.store.inventory.query,
                          "/api/schema": self.store.schema, "/api/notes": self.store.notes_read,
                          "/api/pipeline": describe_pipeline,
                          "/api/column-values": self.store.column_values, "/api/reviews": self.store.review_write,

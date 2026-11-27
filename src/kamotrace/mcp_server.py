@@ -23,6 +23,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from .inventory_store import InventoryCategory
+
 BASE = "http://127.0.0.1:8765"
 HTTP_BASE = ContextVar("kamotrace_http_base", default=None)
 NEW_TAG_COLOR = "#c45436"  # Same default as the browser's quick-tag colour picker.
@@ -450,11 +452,59 @@ def edit_ssm_log_entry(entry_id: str, text: str, tags: list[str], finding: str,
 
 
 @mcp.tool(annotations=READ)
+def get_inventory(category: InventoryCategory | None = None, search: str = "",
+                  account: str | None = None, region: str | None = None,
+                  kind: str | None = None, resource_id: str | None = None,
+                  page: Annotated[int, Field(strict=True, ge=1, le=1000000)] = 1,
+                  size: Annotated[int, Field(strict=True, ge=1, le=100)] = 25,
+                  include_details: bool = False) -> dict[str, Any]:
+    """Browse the offline AWS inventory: omit category for compact snapshot times, coverage and category counts.
+    Select one category for data pages (25 rows by default), full filtered total and next_page.
+    search is case-insensitive name/ID substring matching, not nested configuration search.
+    account, region, kind and resource_id are exact AND filters; resource_id also matches relationship
+    endpoints. IAM rows without region use global; other missing regions do not match a region filter.
+    Default rows are identity/status summaries; include_details=true returns complete selected records,
+    including EKS access/Pod Identity observations. Metadata/profile dictionaries are id/value rows.
+    Filters, paging and details require a category. Responses over 24,000 serialized bytes fail explicitly:
+    reduce size or narrow filters; nothing is silently truncated. loaded=false means no attached snapshot.
+    Current configuration is not incident-time state, live pods or effective access; no history scan or
+    AWS calls. Use search_eks_pods for historical observations and get_event for original log evidence."""
+    return call("/api/inventory", {"category": category, "search": search, "account": account,
+        "region": region, "kind": kind, "resource_id": resource_id, "page": page, "size": size,
+        "include_details": include_details})
+
+
+@mcp.tool(annotations=READ)
+def search_eks_pods(account: str, region: str, cluster: str,
+                    start: str | None = None, end: str | None = None,
+                    namespace: str | None = None, pod: str | None = None, uid: str | None = None,
+                    page: Annotated[int, Field(strict=True, ge=1, le=1000000)] = 1,
+                    size: Annotated[int, Field(strict=True, ge=1, le=50)] = 10,
+                    coverage_page: Annotated[int, Field(strict=True, ge=1, le=1000000)] = 1) -> dict[str, Any]:
+    """Search historical pod observations in attached EKS logs, offline; not live pod inventory.
+    Requires exact account/region/cluster; namespace, pod and uid are optional exact matches.
+    start is inclusive and end exclusive (ISO timestamps with offsets, at most millisecond precision).
+    Returns total, next_page, data pages newest first (size default 10, max 50), and up to size identity
+    contexts with total_contexts. Coverage summaries link to original events via id/record_sha256;
+    coverage_page independently pages ten records from all attached collections, not just this scope.
+    Follow coverage_next_page and read get_event(id) for original manifests, bounds, warnings and gaps.
+    datasets_without_coverage means unknown coverage. Responses over 24,000 serialized bytes fail:
+    reduce size or narrow filters; a single oversized observation remains in original evidence/browser.
+    Keep authenticated caller credentials, target pods and workload metadata distinct; missing UIDs
+    leave name reuse unresolved. Empty results do not establish absence. Follow data[].id with
+    get_event for original evidence. Use get_inventory for current AWS configuration, not pod placement."""
+    return call("/api/eks-pods", {"account": account, "region": region, "cluster": cluster,
+        "start": start, "end": end, "namespace": namespace, "pod": pod, "uid": uid, "page": page,
+        "size": size, "coverage_page": coverage_page, "projection": "summary"})
+
+
+@mcp.tool(annotations=READ)
 def lookup_reference(kind: Literal["identity", "machine", "ip"], value: str,
                       account: str | None = None, region: str | None = None,
                       include_history: bool = False,
                       page: Annotated[int, Field(ge=1)] = 1) -> dict[str, Any]:
     """Bounded scoped reference summaries from loaded inventory, with snapshot times and ambiguity.
+    Use get_inventory for full configuration details and relationships rather than compact matches.
     Current configuration is not incident-time identity. No AWS/DNS/network lookups occur.
     History is not searched unless explicitly requested; not searched does not mean no activity.
     Follow next_page. Never attach a singular asset to ambiguous addresses or infer a hostname."""

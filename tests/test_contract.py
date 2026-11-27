@@ -734,6 +734,76 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(self.call("/api/events", {"annotation_id": nid})[1]["last_row"], 0)
         self.assertEqual(self.call("/api/reviews")[1]["annotations"], [])
 
+    def test_inventory_category_search_pages_and_response_limits(self):
+        def query(**body):
+            status, result = self.call("/api/inventory", body)
+            self.assertEqual(status, 200, result)
+            return result
+
+        original = self.call("/api/inventory")[1]
+        overview = query()
+        self.assertNotIn("data", overview)
+        categories = {row["category"]: row for row in overview["categories"]}
+        self.assertEqual(categories["resources"]["total"], 4)
+        self.assertFalse(categories["eks_coverage"]["available"])
+        self.assertTrue(categories["relationships"]["available"])
+        self.assertEqual(categories["relationships"]["total"], 0)
+        self.assertLess(len(json.dumps(overview).encode()), 3000)
+        resources = query(category="resources", search="APPLICATION", account="123", region="ap-southeast-3", kind="EC2")
+        self.assertEqual([row["id"] for row in resources["data"]], ["i-example"])
+        self.assertNotIn("details", resources["data"][0])
+        self.assertEqual(query(category="resources", account="different-account")["total"], 0)
+        self.assertEqual(query(category="resources", search="t3.small")["total"], 0)  # Not nested configuration search.
+        self.assertEqual(query(category="resources", search="' OR true --")["total"], 0)
+        detail = query(category="resources", resource_id="i-example", include_details=True)
+        self.assertEqual(detail["data"], [original["resources"][0]])
+        self.assertEqual(query(category="forwarding_paths", resource_id="i-example", include_details=True)["data"], original["forwarding_paths"])
+        iam = query(category="iam.roles", search="AUDITOR", region="global", include_details=True)
+        self.assertEqual(iam["data"], original["iam"]["roles"])
+        self.assertEqual(query(category="iam.roles", region="ap-southeast-3")["total"], 0)
+        for category, field in (("users", "UserId"), ("roles", "RoleId"), ("groups", "GroupId")):
+            identifier = original["iam"][category][0][field]
+            exact = query(category="iam." + category, resource_id=identifier)
+            self.assertEqual(exact["total"], 1)
+            self.assertEqual(exact["data"][0][field], identifier)
+            self.assertEqual(query(category="iam." + category, search=identifier.lower())["total"], 1)
+        action = original["forwarding_paths"][0]
+        with patch.dict(self.store.inventory.report, {"listener_actions": [action]}):
+            for field in ("listener_id", "rule_id", "target_group_id"):
+                self.assertEqual(query(category="listener_actions", resource_id=action[field])["data"][0][field], action[field])
+                self.assertEqual(query(category="listener_actions", search=action[field].upper())["total"], 1)
+            self.assertEqual(query(category="listener_actions", search=action["load_balancer_name"].upper())["total"], 1)
+            self.assertEqual(query(category="listener_actions", resource_id=action["load_balancer_name"])["total"], 0)
+        meta = query(category="metadata", resource_id="limitations", include_details=True)
+        self.assertEqual(meta["data"], [{"id": "limitations", "value": original["metadata"]["limitations"]}])
+        for body in ({"search": "application"}, {"category": "raw.path"}, {"category": "resources", "page": True},
+                     {"category": "resources", "size": 101}, {"category": "resources", "page": 0},
+                     {"category": "resources", "account": []}, {"category": "resources", "include_details": "false"},
+                     {"category": "resources", "sql": "SELECT *"}):
+            with self.subTest(body=body):
+                self.assertEqual(self.call("/api/inventory", body)[0], 400)
+
+        large = [{"id": f"synthetic-{i:02}", "name": "Bulk", "kind": "EC2", "region": "ap-southeast-3",
+                  "details": {"configuration": "界" * 6000}} for i in reversed(range(53))]
+        with patch.dict(self.store.inventory.report, {"resources": large}):
+            self.assertLess(len(json.dumps(query()).encode()), 3000)
+            pages = [query(category="resources", search="bulk", size=25, page=p) for p in (1, 2, 3)]
+            self.assertEqual([page["total"] for page in pages], [53, 53, 53])
+            self.assertEqual([page["next_page"] for page in pages], [2, 3, None])
+            self.assertEqual([r["id"] for page in pages for r in page["data"]], [f"synthetic-{i:02}" for i in range(53)])
+            status, error = self.call("/api/inventory", {"category": "resources", "resource_id": "synthetic-00", "include_details": True, "size": 1})
+            self.assertEqual(status, 400)
+            self.assertIn("nothing was truncated", error["error"])
+            self.assertEqual(query(category="resources", resource_id="synthetic-00")["total"], 1)
+            self.assertEqual(self.call("/api/inventory")[1]["resources"], large)  # Full browser report stays compatible.
+        moderate = [{"id": f"sized-{i}", "details": {"configuration": "x" * 12000}} for i in range(2)]
+        with patch.dict(self.store.inventory.report, {"resources": moderate}):
+            self.assertEqual(self.call("/api/inventory", {"category": "resources", "include_details": True, "size": 2})[0], 400)
+            first = query(category="resources", include_details=True, size=1)
+            self.assertEqual((first["total"], first["next_page"], first["data"]), (2, 2, moderate[:1]))
+            self.assertEqual(query(category="resources", include_details=True, size=1, page=2)["data"], moderate[1:])
+        self.assertEqual(self.call("/api/inventory")[1], original)
+
     def test_mcp_sessions_share_the_browser_servers_reviews(self):
         # Real MCP sessions over HTTP and stdio. The adapter holds no database handle: every agent
         # write must be visible through the browser's own API immediately, and vice versa.
@@ -749,6 +819,17 @@ class BrowserContract(unittest.TestCase):
                     return ("error", result.content[0].text) if result.is_error else result.structured_content
 
                 names = {t.name for t in (await client.list_tools()).tools}
+                overview = await tool("get_inventory")
+                self.assertTrue(overview["loaded"])
+                self.assertNotIn("data", overview)
+                inventory = await tool("get_inventory", category="resources", search="APPLICATION",
+                                       region="us-east-1", size=1, include_details=True)
+                self.assertEqual(inventory["total"], 1)
+                self.assertEqual(inventory["data"], [self.inventory_report["resources"][1]])
+                self.assertEqual((await tool("get_inventory", search="application"))[0], "error")
+                pods = await tool("search_eks_pods", account="123", region="us-east-1", cluster="uncollected")
+                self.assertEqual(pods["total"], 0)
+                self.assertEqual(pods["coverage"]["datasets_total"], 0)
                 orphan_page = await tool("list_ssm_orphan_reviews", page=1)
                 self.assertIn("next_page", orphan_page)
                 self.assertEqual((await tool("get_ssm_orphan_review", entry_id="nonexistent"))[0], "error")
