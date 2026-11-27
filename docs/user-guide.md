@@ -850,6 +850,61 @@ intervals and unsupported resources stay unlinked, never guessed from IPs.
 All findings remain in the source and sidecar. Linked raw finding JSON is
 available in event details and MCP `get_event`, separately from CloudTrail JSON.
 
+All retained findings, linked or not, appear independently in the shared Events
+timeline as `event_type = "guardduty"`, labelled **derived finding snapshots**,
+not original CloudTrail evidence. The **GuardDuty timeline** button in Detections
+toggles that type within the current query without clearing dates or other scopes.
+Queries, histograms, exports, Event tags, Findings and MCP use the same selection
+and review paths as other event types. Lead/minimum-level filters still select
+context-linked CloudTrail events, not GuardDuty snapshot severity; inspect/filter
+the snapshot's original `raw.Severity` separately.
+
+Timeline time is `Service.EventFirstSeen`, falling back in order to `CreatedAt`,
+`UpdatedAt`, then `Service.EventLastSeen`. Without any timestamp the row has unknown
+time (and is excluded by date scopes). The detail states the chosen basis; raw
+observed interval, creation/update times and import/acquisition provenance remain
+separate. Finding update time is not activity time. Selected IANA timezone and
+start-inclusive/end-exclusive query ranges apply unchanged. Context-v1 retains
+the strict observed `[first,last)` rule above: point observations remain unlinked,
+even if a collected event exists at that instant. No broader heuristic or exact
+reference matcher is introduced. Details offer at most 100 contextual navigation
+links in either direction, with the complete association count and basis.
+Timeline rows, detail headers and contextual navigation timestamps all use the
+selected IANA timezone, including when opening a linked row not loaded in the grid.
+Original timestamps inside raw JSON and provenance remain unchanged.
+
+The linked-lead catalog groups GuardDuty findings by ARN and shows each distinct
+retained snapshot underneath, with its own title and severity. Identical repeats
+show an occurrence count; their physical timeline rows remain separate. The group
+badge is the highest retained severity, not an assertion about the latest state.
+Its event count is distinct contextual AWS rows, not the sum of overlapping
+snapshot associations. Click a snapshot to inspect it; the group filters AWS context.
+Unlinked-only findings remain available through the GuardDuty timeline shortcut.
+
+Sample status is independent of link status: `guardduty_sample` is `sample=true`,
+`sample=false` or `sample=unknown`. It accepts explicit boolean or true/false text
+in `Service.AdditionalInfo.Sample` and parsed `Service.AdditionalInfo.Value.sample`;
+missing, malformed or conflicting flags remain unknown, never presumed real.
+The timeline summary and detail show this status. Archived status remains in raw JSON.
+
+New schema-2 sidecars preserve every input-array occurrence, including identical
+duplicates and multiple updates with the same ARN. ARN identifies the provider
+finding; the namespaced canonical-content review hash identifies an immutable
+snapshot. Identical repeats have distinct physical rows but share reviews, as
+CloudTrail duplicates do. Changed content has a new review key; it never inherits
+an older snapshot's annotations automatically. `content_sha256` hashes the exact
+stored JSON text. Row `id` is a navigation handle for this loaded dataset, not a
+cross-import identity. Rebuilding replaces the derived snapshot set with the
+supplied source; it does not fetch or accumulate history. Preserve earlier source
+exports if history is needed. Legacy schema-1 sidecars load read-only without a
+rebuild; their original source-array position is unavailable and explicitly labelled
+as legacy ARN order. Existing attached dataset order/IDs and CloudTrail hashes
+are unchanged; GuardDuty rows are appended after other imported datasets.
+
+MCP example: `search_events(query={pipeline_version: 1, pipeline: 'event_type = "guardduty" | guardduty_sample = "sample=unknown"'})`.
+Use `get_event(id)` for the snapshot's exact raw JSON and hash check, `guardduty`
+status/time/link metadata, and `related_events` / `related_events_total` navigation.
+
 Collection requires `guardduty:ListDetectors`, `guardduty:ListFindings` and
 `guardduty:GetFindings` in addition to the default generated collection policy,
 plus normal STS identity and EC2 Region discovery access when using `--regions all`.
@@ -1079,7 +1134,7 @@ Use the bar above the grid to work with selected events:
 
 ## Other events and manual events
 
-The **Events** timeline combines CloudTrail, imported other events and investigator-entered manual events. The **Type** column distinguishes `cloudtrail`, `other` and `manual`; filter it with **+ Filter** or `event_type = "manual"` in Pipeline mode. **Operation / content** shows the AWS operation or a bounded content preview; **Service / origin** shows the AWS service or documented origin. Search covers full raw records, not only previews. The optional identity is free text, not an asserted AWS principal. [Key-event prominence](#mark-key-events) is a separate tag that can apply to any of these types.
+The **Events** timeline combines CloudTrail, [GuardDuty derived snapshots](#guardduty-context), imported other events and investigator-entered manual events. The **Type** column distinguishes `cloudtrail`, `guardduty`, `other` and `manual`; filter it with **+ Filter** or `event_type = "manual"` in Pipeline mode. **Operation / content** shows the AWS operation or a bounded content preview; **Service / origin** shows the AWS service or documented origin. Search covers full raw records, not only previews. The optional identity is free text, not an asserted AWS principal. [Key-event prominence](#mark-key-events) is a separate tag that can apply to any of these types.
 
 ### Import other events
 
@@ -1606,12 +1661,12 @@ changed the note since, the call fails without writing; re-read it and retry.
 | `search_events` | `query` (search, filters, `pipeline`/`pipeline_version`, all-of tags/rules, minimum level, note, SSM command, start/end and timezone) plus sort, page and size. Returns the full filtered total and one page with hashes, tags and note IDs. External query properties AND with the whole pipeline. |
 | `summarize_field` | Top/bottom five values, distinct count and total for a field across the whole filtered result. |
 | `event_histogram` | Counts per `query.timezone`-aligned bucket (empty buckets included, at most 2,000), with epoch-millisecond boundaries. |
-| `get_event` | Exact stored raw JSON by `id`, its `record_sha256`, a recomputed hash check, linked SSM commands and separate linked GuardDuty finding JSON. |
+| `get_event` | Exact stored raw JSON by `id`, its `record_sha256`, a recomputed hash check, timeline `event_time_ms`, linked SSM commands and separate linked GuardDuty finding JSON. Derived GuardDuty events include sample/time/link metadata and contextual `related_events`. |
 | `list_tags` / `tag_events` / `untag_events` | Tags with event counts; add or remove one tag on explicit hashes. Adding is additive and keeps an existing tag's colour (new tags default to the browser's colour). |
 | `list_notes` / `get_note` / `read_note_text` | Searchable, paginated note summaries (25/page, follow `next_page`), direct note preview with linked-event page, and exact body/context chunks. `get_note` takes `timezone` (default `UTC`) for linked events. Read truncated bodies fully before editing. |
 | `create_note` / `edit_note` / `delete_note` | Markdown notes (sanitised when the browser renders them). `create_note` can record the agent's query so **Reopen query** works in the browser. |
 | `link_note_events` / `unlink_note_events` | Add or remove linked events; a note keeps at least one. |
-| `list_detections` | Suzaku rules and labelled GuardDuty contextual leads, with linked event counts and separate provenance. `run` is null without Suzaku; `guardduty` is null without GuardDuty. Takes no arguments; filter events using `query.rules` (all must match) or `query.min_level` in `search_events`, `summarize_field` or `event_histogram`. GuardDuty context is not an exact event match. |
+| `list_detections` | Suzaku rules and labelled GuardDuty contextual leads, with linked event counts and separate provenance. GuardDuty ARN groups include distinct `snapshots` with detail IDs, titles, severity, occurrence counts and contextual AWS counts; the group severity is highest retained, not latest. `run` is null without Suzaku; `guardduty` is null without GuardDuty. Takes no arguments; filter events using `query.rules` (all must match) or `query.min_level` in `search_events`, `summarize_field` or `event_histogram`. GuardDuty context is not an exact event match. |
 | `search_ssm_commands` / `get_ssm_command` / `get_ssm_event` | SSM commands from the JSON-backed export, each system/plugin output kept separate, linked CloudTrail events by exact account/region/command ID. |
 | `search_ssm_log` / `get_ssm_log_entry` / `read_ssm_log_text` | Fixed 5-row summary pages with optional allowlisted `fields`, exact summary lookup and full text in chunks. Previews carry truncation metadata; linked-event metadata is retrieved as `field="events"`. Follow `next_page`, passing the search revision for non-empty enhanced/both continuations. |
 | `list_ssm_orphan_reviews` / `get_ssm_orphan_review` | Preserved, unattached reviews: 25 summaries/page and exact preview lookup. Ordinary searches return only a count. Complete review text remains available in chunks. |

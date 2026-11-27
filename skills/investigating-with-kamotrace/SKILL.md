@@ -94,7 +94,7 @@ that it is true before relying on a record.
 
 ## Other events and editable manual events
 
-`search_events` includes `cloudtrail`, `other` and `manual` rows. Filter with `query.pipeline_version: 1` and `query.pipeline: "event_type = \"manual\""` when investigating authored manual events, or filter `origin` for documented non-AWS sources. Inspect `get_event().provenance`; event identity text does not establish AWS principal ownership. Full raw content is searchable; the grid preview is bounded.
+`search_events` includes `cloudtrail`, `guardduty` (derived finding snapshots), `other` and `manual` rows. Filter with `query.pipeline_version: 1` and `query.pipeline: "event_type = \"manual\""` when investigating authored manual events, or filter `origin` for documented non-AWS sources. Inspect `get_event().provenance`; event identity text does not establish AWS principal ownership. Full raw content is searchable; the grid preview is bounded.
 
 When asked to add a new investigator-authored event, call `create_manual_event` with `record_json` as exact JSON text, required `origin` and optional self-reported `author`. To mark an existing event as prominent, use the `key-event` tag instead; do not create a duplicate manual event. The record requires `date` (RFC 3339 including offset) and non-null `content`; optional `ip` and `identity` are strings. Content can be nested JSON. Preserve numeric literals as text rather than converting them to floating point. Example arguments:
 
@@ -450,6 +450,17 @@ SSM/note chunks and event pages. Never send an export to an online service.
   Offline preparation: `kamotrace guardduty --database case.duckdb --findings guardduty.json`;
   restart the server to load the sidecar. Do not infer "no findings" from denied
   or incomplete collection.
+- GuardDuty snapshots are independently queryable, even with zero links:
+  `search_events(query={pipeline_version: 1, pipeline: 'event_type = "guardduty" | guardduty_sample = "sample=unknown"'})`.
+  `get_event(id)` returns original finding JSON, `guardduty` time/sample/link basis,
+  and up to 100 `related_events` with `related_events_total`; associations are
+  contextual, never exact matches. Unknown sample status is not proof of a real
+  threat. Timeline time prefers EventFirstSeen, then CreatedAt, UpdatedAt, LastSeen;
+  check the stated basis rather than calling update time activity time. Identical
+  snapshots share review hashes but retain physical rows; changed snapshots have
+  new review hashes and do not inherit annotations. Lead/min-level filters select
+  associated CloudTrail events, not snapshot severity. Query ranges stay half-open;
+  point observations remain unlinked under context-v1.
 - `country`, `city`, `asn` and `isp` are offline lookups (DB-IP Lite/GeoLite2 and/or the
   analyst's provider JSONL), not evidence. `(unmapped / service / private)`
   means no lookup applied (AWS service names, private ranges, missing data).

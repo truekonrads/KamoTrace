@@ -224,7 +224,7 @@ def build_query(body, scalar_function):
         raise ValueError("Invalid page or page size")
     where = "\nWHERE " + "\n  AND ".join(conditions) if conditions else ""
     sql = ("SELECT id, record_sha256, time_local, event_name, event_source, identity, source_ip, country,\n"
-           "       event_type, origin, content_preview, summary, source_label, updated,\n"
+           "       event_type, origin, content_preview, summary, source_label, updated, guardduty_sample,\n"
            "       identity_type, key_id, target, document_name, error_code, region, isp, city, asn, ip_info, user_agent, event_id\n"
            + "".join(f", {raw[f]}.value AS {raw[f]}, {raw[f]}.json_type AS {raw[f]}_type\n"
                      for f in dict.fromkeys(body.get("raw_fields", []))) +
@@ -327,6 +327,8 @@ class Store:
                     e.request_parameters->>'$.documentName' AS document_name,
                     e.error_code, e.aws_region AS region, e.user_agent, e.raw_event,
                     e.event_type, e.origin, e.content_preview, e.updated,
+                    (SELECT f.sample_status FROM guardduty_findings f
+                        WHERE e.event_type='guardduty' AND f.finding_record=e.source_ordinal) AS guardduty_sample,
                     coalesce(g.country, '(unmapped / service / private)') AS country, g.isp, g.city, g.asn, g.ip_info
                 FROM events e LEFT JOIN ip_enrichment g ON e.source_ip = g.ip
             """
@@ -419,8 +421,15 @@ class Store:
         self.startup_timing("event_index_" + self.event_index_status, stage_started)
         self.connection.execute("CREATE TEMP VIEW event_raw AS " + " UNION ALL ".join(raw_selects))
         manual = "SELECT * EXCLUDE(raw_event), -1 AS dataset_index, raw_event FROM (" + EVENTS_VIEW.replace("FROM raw_events", "FROM manual_raw") + ")"
+        # Derived snapshots stay outside the immutable-import cache; existing IDs stay unchanged.
+        self.guardduty_offset = offset
+        finding_count = self.connection.execute("SELECT count(*) FROM guardduty_raw").fetchone()[0]
+        if offset + finding_count >= MANUAL_BASE:
+            raise ValueError("Too many GuardDuty events for exact browser row identifiers")
+        guardduty = ("SELECT * EXCLUDE(raw_event), -2 AS dataset_index, raw_event FROM "
+            f"(SELECT * REPLACE (source_record + {offset} AS source_record) FROM guardduty_events)")
         self.connection.execute("CREATE TEMP VIEW events AS SELECT i.*, r.raw_event FROM normalized_cache.event_index i "
-            "JOIN event_raw r USING(source_record) UNION ALL " + manual)
+            "JOIN event_raw r USING(source_record) UNION ALL " + guardduty + " UNION ALL " + manual)
 
     def computers(self, body):
         from .computers import summarize
@@ -1222,6 +1231,7 @@ class Store:
     def detail(self, record):
         with self.locked("event.detail"):
             rows = self.rows("""SELECT event_id, record_sha256, raw_event::VARCHAR AS raw_json,
+                epoch_ms(event_time) AS event_time_ms,
                 event_type, origin, author, created, updated, content_sha256, source_file, source_ordinal, dataset_index
                 FROM events WHERE source_record=?""",
                              [record], operation="event.detail")
@@ -1231,6 +1241,27 @@ class Store:
                 row["provenance"] = {k: row[k] for k in ("event_type", "origin", "author", "created", "updated", "source_file", "source_ordinal")}
                 dataset = row.pop("dataset_index")
                 row["provenance"]["imports"] = [self.event_sources[dataset]] if dataset >= 0 else []
+                if row["event_type"] == "guardduty":
+                    row["provenance"]["imports"] = [self.guardduty_run]
+                    row["provenance"]["ordinal_basis"] = "source array position" if self.guardduty_run["schema_version"] == 2 else "legacy sidecar ARN order (original position unavailable)"
+                    row["guardduty"] = self.rows("""SELECT sample_status, time_basis, link_status
+                        FROM guardduty_findings WHERE finding_record=?""", [record - self.guardduty_offset])[0]
+                    row["guardduty"]["link_basis"] = self.guardduty_run["link_basis"]
+                    row["related_events"] = self.rows("""SELECT e.source_record AS id, e.event_id,
+                        e.event_type, e.event_time::VARCHAR AS event_time, epoch_ms(e.event_time) AS event_time_ms, e.event_name AS summary
+                        FROM events e WHERE e.source_record IN
+                        (SELECT source_record FROM guardduty_event_links WHERE finding_record=?)
+                        ORDER BY e.source_record LIMIT 100""", [record - self.guardduty_offset])
+                    row["related_events_total"] = self.connection.execute("""SELECT count(DISTINCT source_record)
+                        FROM guardduty_event_links WHERE finding_record=?""", [record - self.guardduty_offset]).fetchone()[0]
+                else:
+                    row["related_events"] = self.rows("""SELECT g.source_record + ? AS id,
+                        g.event_id, g.event_type, g.event_time::VARCHAR AS event_time, epoch_ms(g.event_time) AS event_time_ms, g.content_preview AS summary
+                        FROM guardduty_events g WHERE g.source_record IN
+                        (SELECT finding_record FROM guardduty_event_links WHERE source_record=?)
+                        ORDER BY g.source_record LIMIT 100""", [self.guardduty_offset, record])
+                    row["related_events_total"] = self.connection.execute("""SELECT count(DISTINCT finding_record)
+                        FROM guardduty_event_links WHERE source_record=?""", [record]).fetchone()[0]
                 # Return exact content text separately so the manual editor never parses JSON numbers.
                 if row["event_type"] == "manual":
                     from .other_events import json as precise_json, manual_rows
@@ -1251,8 +1282,8 @@ class Store:
                 rows[0]["ssm_commands"] = self.commands.for_record(record)
                 rows[0]["detections"] = self.row_detections([record]).get(record, [])
                 rows[0]["guardduty_findings"] = self.rows("""SELECT g.rule_id, g.raw_finding
-                    FROM guardduty_findings g WHERE g.rule_id IN
-                    (SELECT rule_id FROM detections WHERE source_record=?) ORDER BY g.rule_id""",
+                    FROM guardduty_findings g WHERE g.finding_record IN
+                    (SELECT finding_record FROM guardduty_event_links WHERE source_record=?) ORDER BY g.finding_record""",
                     [record], operation="event.guardduty")
         return rows[0] if rows else None
 
@@ -1272,6 +1303,25 @@ class Store:
                     any_value(level_rank) AS level_rank, any_value(tactics) AS tactics,
                     any_value(technique_ids) AS techniques, count(DISTINCT source_record) AS events
                 FROM detections GROUP BY rule_id ORDER BY level_rank DESC, events DESC, title""")
+            snapshots = self.rows("""SELECT f.rule_id, r.record_sha256,
+                    min(f.finding_record) + ? AS id, any_value(f.title) AS title,
+                    any_value(f.level) AS level, any_value(f.level_rank) AS level_rank,
+                    epoch_ms(any_value(e.event_time)) AS event_time_ms,
+                    count(DISTINCT f.finding_record) AS occurrences,
+                    count(DISTINCT l.source_record) AS events
+                FROM guardduty_findings f JOIN guardduty_raw r ON r.source_record=f.finding_record
+                JOIN guardduty_events e ON e.source_record=f.finding_record
+                LEFT JOIN guardduty_event_links l ON l.finding_record=f.finding_record
+                GROUP BY f.rule_id, r.record_sha256 ORDER BY level_rank DESC, id""", [self.guardduty_offset])
+            for rule in rules:
+                retained = [snapshot for snapshot in snapshots if snapshot["rule_id"] == rule["rule_id"]]
+                if retained:
+                    rule["snapshots"] = retained
+                    # All severities remain visible; the group's badge is explicitly the highest retained.
+                    rule["level"] = retained[0]["level"]
+                    rule["level_rank"] = retained[0]["level_rank"]
+                    rule["title"] = retained[0]["title"] if len(retained) == 1 else "GuardDuty finding · multiple snapshots"
+            rules.sort(key=lambda rule: (-rule["level_rank"], -rule["events"], rule["title"]))
         for rule in rules:
             del rule["level_rank"]
         return {"run": self.suzaku_run, "guardduty": self.guardduty_run, "rules": rules}

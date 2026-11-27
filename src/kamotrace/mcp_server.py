@@ -204,7 +204,9 @@ def event_histogram(bucket_minutes: Annotated[int, Field(ge=1, le=525600)] = 144
 def get_event(id: Annotated[int, Field(ge=1, description="The event's `id` from search_events.")]) -> dict[str, Any]:
     """Stored JSON (not re-serialized), content hash check, stable review key and provenance.
     Manual events include updated/editor fields and prior revisions; imported events cannot be edited.
-    CloudTrail also includes SSM links by exact command identity."""
+    CloudTrail also includes SSM links by exact command identity. GuardDuty snapshots include
+    sample/time/link metadata; related_events are contextual associations, not exact matches.
+    event_time_ms is the timeline instant for display in the selected timezone."""
     detail = call(f"/api/events/{id}")
     raw = detail["raw_json"]
     return {**detail, "raw_json_matches_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest() == detail["content_sha256"]}
@@ -476,9 +478,11 @@ def list_detections() -> dict[str, Any]:
     number of linked evidence events, plus the import's provenance (Suzaku version, rules revision,
     linked/unmatched/ambiguous counts). `run` is null without Suzaku. `guardduty` contains GuardDuty
     provenance, contextual/unlinked finding counts and link_basis, or null. GuardDuty IDs start with
-    guardduty: and titles explicitly say context (not exact); these are NOT exact event matches.
-    Raw findings, including unsupported/unlinked ones, remain in the source JSON and GuardDuty sidecar.
-    Linked original finding JSON is available in get_event.guardduty_findings[].raw_finding."""
+    guardduty:; these are contextual associations, NOT exact event matches. Each GuardDuty group
+    includes distinct retained snapshots with their own level, title, occurrence count and detail id;
+    the group level is highest retained, not latest, and its events count is distinct AWS rows.
+    Search event_type = "guardduty" to include unlinked snapshots independently in the timeline.
+    Linked finding JSON is also available in get_event.guardduty_findings[].raw_finding."""
     return call("/api/detections")
 
 

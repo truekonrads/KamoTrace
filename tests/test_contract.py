@@ -2586,9 +2586,11 @@ class GuardDutyContract(unittest.TestCase):
                 "Id": "one", "AccountId": "123456789012", "Region": "us-east-1", "Type": "UnauthorizedAccess:IAMUser/Test",
                 "Title": "Synthetic API activity <script>neverRun()</script>", "Severity": 8.9,
                 "Resource": {"AccessKeyDetails": {"AccessKeyId": "AKIASYNTHETIC"}},
-                "Service": {"EventFirstSeen": "2026-10-01T01:00:00Z", "EventLastSeen": "2026-10-01T02:00:00Z", "Archived": True},
+                "Service": {"EventFirstSeen": "2026-10-01T01:00:00Z", "EventLastSeen": "2026-10-01T02:00:00Z", "Archived": True,
+                            "AdditionalInfo": {"Value": "{\"sample\": true}"}},
                 "large_number": 9007199254740993}
-            unsupported = {**finding, "Arn": finding["Arn"] + "-unsupported", "Id": "unsupported", "Resource": {}}
+            unsupported = {**finding, "Arn": finding["Arn"] + "-unsupported", "Id": "unsupported", "Resource": {},
+                           "Service": {"EventFirstSeen": "2026-10-01T01:00:00Z", "EventLastSeen": "2026-10-01T01:00:00Z"}}
             findings.write_text(json.dumps({"Findings": [finding, unsupported]}))
             self.assertEqual(main(["guardduty", "--database", str(database), "--findings", str(findings)]), 0)
             sidecar = database.with_suffix(".guardduty.duckdb")
@@ -2639,16 +2641,50 @@ class GuardDutyContract(unittest.TestCase):
             self.assertEqual({r["event_id"] for r in events["data"]}, {"1", "2"})
             self.assertIn("context (not exact)", events["data"][0]["detections"][0]["title"])
             self.assertEqual(request("/api/events", {"min_level": "critical"})["last_row"], 0)
+            timeline_query = {"pipeline_version": 1, "pipeline": 'event_type = "guardduty"'}
+            timeline = request("/api/events", timeline_query)
+            self.assertEqual(timeline["last_row"], 2)
+            self.assertEqual(request("/api/events", {})["last_row"], len(records) + 2)
+            by_arn = {row["event_id"]: row for row in timeline["data"]}
+            snapshot = request(f'/api/events/{by_arn[finding["Arn"]]["id"]}')
+            self.assertEqual(json.loads(snapshot["raw_json"]), finding)
+            self.assertEqual(snapshot["guardduty"]["sample_status"], "sample=true")
+            self.assertEqual(snapshot["guardduty"]["time_basis"], "Service.EventFirstSeen")
+            self.assertEqual(snapshot["event_time_ms"], 1790816400000)
+            self.assertEqual(request("/api/events/3")["event_time_ms"], 1790816580000)
+            self.assertEqual({row["event_time_ms"] for row in snapshot["related_events"]}, {1790816400000, 1790816580000})
+            self.assertEqual(request("/api/events/2")["related_events"][0]["event_time_ms"], 1790816400000)
+            self.assertEqual({row["id"] for row in snapshot["related_events"]}, {2, 3})
+            self.assertEqual(request("/api/events/2")["related_events"][0]["id"], by_arn[finding["Arn"]]["id"])
+            unlinked = request(f'/api/events/{by_arn[unsupported["Arn"]]["id"]}')
+            self.assertEqual(unlinked["related_events_total"], 0)
+            self.assertEqual(unlinked["guardduty"]["sample_status"], "sample=unknown")
+            self.assertEqual(request("/api/histogram", {**timeline_query, "bucket_minutes": 60})["total"], 2)
+            self.assertEqual(request("/api/events", {**timeline_query, "pipeline": timeline_query["pipeline"] +
+                ' | guardduty_sample = "sample=unknown"'})["last_row"], 1)
+            self.assertEqual(request("/api/events", {**timeline_query, "start": "2026-10-01T09:00:00+08:00",
+                "end": "2026-10-01T09:00:01+08:00", "timezone": "Asia/Singapore"})["last_row"], 2)
+            self.assertEqual(request("/api/events", {**timeline_query, "end": "2026-10-01T01:00:00Z"})["last_row"], 0)
+            request("/api/reviews", {"action": "tag", "slug": "snapshot-review", "color": "#123456",
+                "hashes": [by_arn[finding["Arn"]]["record_sha256"]]})
+            self.assertEqual(request("/api/events", {"tags": ["snapshot-review"]})["last_row"], 1)
 
             async def mcp_contract():
                 async with Client(StdioServerParameters(command=sys.executable,
                     args=["-m", "kamotrace", "mcp", "--url", url])) as client:
                     detections = await client.call_tool("list_detections", {})
                     self.assertEqual(detections.structured_content["guardduty"]["findings"], 2)
+                    self.assertEqual(detections.structured_content["rules"][0]["snapshots"][0]["id"], by_arn[finding["Arn"]]["id"])
                     response = await client.call_tool("search_events", {"query": query})
                     self.assertEqual(response.structured_content["total"], 2)
                     event = await client.call_tool("get_event", {"id": events["data"][0]["id"]})
                     self.assertEqual(json.loads(event.structured_content["guardduty_findings"][0]["raw_finding"]), finding)
+                    independent = await client.call_tool("search_events", {"query": timeline_query})
+                    self.assertEqual(independent.structured_content["total"], 2)
+                    standalone = await client.call_tool("get_event", {"id": by_arn[unsupported["Arn"]]["id"]})
+                    self.assertTrue(standalone.structured_content["raw_json_matches_hash"])
+                    self.assertEqual(standalone.structured_content["event_time_ms"], 1790816400000)
+                    self.assertEqual(json.loads(standalone.structured_content["raw_json"]), unsupported)
             anyio.run(mcp_contract)
             # Both sources must coexist without numeric catalog-key collisions or altered rule filters.
             suzaku = root / "suzaku.detections.duckdb"
@@ -2672,6 +2708,63 @@ class GuardDutyContract(unittest.TestCase):
             finally:
                 combined.connection.close()
                 combined.reviews.close()
+            # Snapshots are immutable, not ARN upserts: preserve repeats and changed updates.
+            point = {**finding, "Service": {"EventFirstSeen": "2026-10-01T09:03:00+08:00",
+                "EventLastSeen": "2026-10-01T01:03:00Z", "AdditionalInfo": {"Sample": False}}}
+            fallback = {**unsupported, "Resource": None, "Service": {"AdditionalInfo": {"Sample": True, "Value": "{\"sample\":false}"}}, "CreatedAt": "2026-10-01T03:00:00Z",
+                        "UpdatedAt": "2026-10-01T04:00:00Z"}
+            updated_only = {**unsupported, "Service": {}, "UpdatedAt": "2026-10-01T04:00:00Z"}
+            last_only = {**unsupported, "Service": {"EventLastSeen": "2026-10-01T05:00:00Z"}}
+            unknown_time = {**unsupported, "Service": {}}
+            low = {**finding, "Title": "Earlier low snapshot", "Severity": 2}
+            critical = {**finding, "Title": "Later critical snapshot", "Severity": 9.5}
+            findings.write_text(json.dumps({"Findings": [finding, finding, point, fallback, updated_only, last_only, unknown_time, low, critical]}))
+            import_findings(database, findings, sidecar, replace=True)
+            reopened = Store(database)
+            try:
+                independent = reopened.query(timeline_query)["data"]
+                self.assertEqual(len(independent), 9)
+                self.assertEqual(len({row["id"] for row in independent}), 9)
+                self.assertEqual(len({row["record_sha256"] for row in independent}), 8)
+                self.assertEqual(by_arn[finding["Arn"]]["record_sha256"], next(row["record_sha256"] for row in independent if row["id"] == len(records) + 1))
+                self.assertEqual({r["id"] for r in reopened.detail(len(records) + 1)["related_events"]}, {2, 3})
+                self.assertEqual(len(reopened.detail(2)["guardduty_findings"]), 4)
+                self.assertEqual([json.loads(r["raw_finding"]) for r in reopened.detail(2)["guardduty_findings"]], [finding, finding, low, critical])
+                catalog = reopened.detections_list()["rules"][0]
+                self.assertEqual((catalog["level"], catalog["events"]), ("critical", 2))
+                self.assertEqual({(s["title"].removeprefix("GuardDuty context (not exact): "), s["level"], s["occurrences"], s["events"]) for s in catalog["snapshots"]},
+                    {(finding["Title"], "high", 2, 2), (finding["Title"], "high", 1, 0),
+                     (low["Title"], "low", 1, 2), (critical["Title"], "critical", 1, 2)})
+                for retained in catalog["snapshots"]:
+                    self.assertEqual(json.loads(reopened.detail(retained["id"])["raw_json"])["Title"], retained["title"].removeprefix("GuardDuty context (not exact): "))
+                self.assertEqual(reopened.query({"tags": ["snapshot-review"]})["last_row"], 2)
+                self.assertEqual(reopened.detail(len(records) + 3)["tags"], [])
+                self.assertEqual(reopened.detail(len(records) + 3)["related_events_total"], 0)
+                self.assertIn("point observation", reopened.detail(len(records) + 3)["guardduty"]["link_status"])
+                self.assertEqual(reopened.detail(len(records) + 3)["guardduty"]["sample_status"], "sample=false")
+                self.assertEqual(reopened.detail(len(records) + 4)["guardduty"]["time_basis"], "CreatedAt")
+                self.assertEqual(reopened.detail(len(records) + 4)["guardduty"]["sample_status"], "sample=unknown")
+                self.assertEqual(next(r["time_local"] for r in independent if r["id"] == len(records) + 4), "2026-10-01 03:00:00")
+                self.assertEqual([reopened.detail(len(records) + i)["guardduty"]["time_basis"] for i in (5, 6, 7)],
+                                 ["UpdatedAt", "Service.EventLastSeen", "unknown"])
+                self.assertIsNone(reopened.detail(len(records) + 7)["event_time_ms"])
+                self.assertEqual(reopened.query({**timeline_query, "start": "2026-10-01T00:00:00Z"})["last_row"], 8)
+            finally:
+                reopened.connection.close()
+                reopened.reviews.close()
+            # Input ordering must not pick the catalog severity or hide a changed title.
+            findings.write_text(json.dumps({"Findings": [critical, low]}))
+            import_findings(database, findings, sidecar, replace=True)
+            reversed_store = Store(database)
+            try:
+                group = reversed_store.detections_list()["rules"][0]
+                self.assertEqual((group["level"], group["events"]), ("critical", 2))
+                self.assertEqual({s["level"] for s in group["snapshots"]}, {"low", "critical"})
+                self.assertEqual({json.loads(reversed_store.detail(s["id"])["raw_json"])["Title"]
+                    for s in group["snapshots"]}, {low["Title"], critical["Title"]})
+            finally:
+                reversed_store.connection.close()
+                reversed_store.reviews.close()
             self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), before)
 
 

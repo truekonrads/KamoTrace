@@ -604,6 +604,7 @@ def main():
                 expect(manual).to_have_count(1)
                 manual.locator('[tabulator-field="summary"] .cell-text').click()
                 expect(page.locator("#detail-title")).to_have_text("Investigator-entered manual event")
+                expect(page.locator("#detail-id")).to_contain_text("2026-10-25 10:00:00 Asia/Singapore")
                 page.locator("#edit-manual-event").click()
                 expect(page.locator("#manual-event-dialog")).to_be_visible()
                 saved_content = page.locator("#manual-content").input_value()

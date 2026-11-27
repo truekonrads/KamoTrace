@@ -123,6 +123,14 @@ other resource types remain unlinked, not guessed from IPs. All findings and the
 raw JSON remain in the source and sidecar; linked finding JSON is also available
 in event details and MCP `get_event`, separately from original CloudTrail JSON.
 
+Every retained finding is also an independent **GuardDuty derived finding snapshot**
+in the Events timeline, including unlinked findings. Use the Detections pane's
+**GuardDuty timeline** button or pipeline `event_type = "guardduty"`.
+`guardduty_sample` filters `sample=true`, `sample=false` or `sample=unknown`;
+unknown is not proof of a real threat. Event details show raw JSON, time basis,
+sample/link status and separately labelled, bidirectional contextual associations.
+See the [snapshot identity and timestamp contract](docs/user-guide.md#guardduty-context).
+
 Collection needs `guardduty:ListDetectors`, `guardduty:ListFindings` and
 `guardduty:GetFindings` **in addition to** the generated default collection policy
 (plus normal STS identity and, for `--regions all`, EC2 region discovery access).

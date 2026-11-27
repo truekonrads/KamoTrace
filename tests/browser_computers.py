@@ -166,7 +166,11 @@ def undated_only():
                 expect(page.locator("#coverage")).to_contain_text("No selected timestamps")
                 zone = page.get_by_role("combobox", name="Timezone", exact=True)
                 zone.fill("Asia/Singapore")
-                zone.press("Tab")
+                with page.expect_response(lambda response: response.url.endswith("/api/events")
+                    and response.request.method == "POST"
+                    and response.request.post_data_json.get("timezone") == "Asia/Singapore"):
+                    zone.press("Tab")
+                expect(page.locator("#app-loading")).to_be_hidden()
                 expect(page.locator("#coverage")).to_contain_text("1 undated · No selected timestamps")
                 expect(page.locator("#coverage")).not_to_contain_text("1970")
                 expect(page.locator("#start")).to_have_value("")

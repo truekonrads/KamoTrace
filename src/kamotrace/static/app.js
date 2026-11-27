@@ -2898,7 +2898,16 @@ function renderDetections() {
     .filter(
       (r) =>
         !term ||
-        [r.title, r.level, ...r.tactics, ...r.techniques]
+        [
+          r.title,
+          r.level,
+          ...r.tactics,
+          ...r.techniques,
+          ...(r.snapshots || []).flatMap((snapshot) => [
+            snapshot.title,
+            snapshot.level,
+          ]),
+        ]
           .join(" ")
           .toLowerCase()
           .includes(term),
@@ -2914,7 +2923,8 @@ function renderDetections() {
       const name = document.createElement("button");
       name.type = "button";
       name.className = "tag-name";
-      name.textContent = rule.title;
+      name.textContent =
+        rule.title + (rule.snapshots ? " · highest retained severity" : "");
       name.title =
         `${rule.level} · ${[...rule.tactics, ...rule.techniques].join(", ") || "no ATT&CK tags"}\n` +
         `Rule ${rule.rule_id}\n` +
@@ -2926,7 +2936,37 @@ function renderDetections() {
       const count = document.createElement("span");
       count.className = "count";
       count.textContent = number(rule.events);
+      count.title = rule.snapshots
+        ? "Distinct contextual AWS event rows across these snapshots (not a sum)"
+        : "Linked event rows";
       li.append(levelBadge(rule.level), name, count);
+      if (rule.snapshots) {
+        const group = document.createElement("li");
+        const heading = document.createElement("div");
+        heading.className = li.className;
+        heading.append(...li.childNodes);
+        heading.firstChild.title = "Highest severity among retained snapshots";
+        const children = document.createElement("ul");
+        for (const snapshot of rule.snapshots) {
+          const child = document.createElement("li");
+          child.className = "tag-item";
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "tag-name";
+          button.textContent = snapshot.title;
+          button.title = `Open snapshot · ${number(snapshot.occurrences)} retained occurrences · ${number(snapshot.events)} contextual AWS events · ${snapshot.event_time_ms == null ? "Time unknown" : shown(snapshot.event_time_ms) + " " + meta.timezone}`;
+          button.onclick = () => detail(snapshot);
+          const retained = document.createElement("span");
+          retained.className = "count";
+          retained.textContent = `×${number(snapshot.occurrences)}`;
+          retained.title =
+            "Identical retained occurrences (physical timeline rows remain separate)";
+          child.append(levelBadge(snapshot.level), button, retained);
+          children.append(child);
+        }
+        group.append(heading, children);
+        return group;
+      }
       return li;
     });
   if (!items.length) {
@@ -2954,6 +2994,16 @@ function renderDetections() {
       `${number(gd.unlinked_findings)} unlinked (retained in the sidecar and source JSON). ` +
       "Context requires identity account, region, access key and observed interval [first, last). " +
       "These are not exact CloudTrail event matches or confirmed findings.";
+    const browse = document.createElement("button");
+    browse.type = "button";
+    browse.textContent = `GuardDuty timeline (${number(gd.findings)})`;
+    browse.title =
+      "Toggle GuardDuty event type within the current query; date and other scopes remain applied";
+    browse.onclick = () => {
+      if (commandsActive) switchView(false, false);
+      togglePipelineMembership("event_type", "guardduty");
+    };
+    $("detections-run").append(" ", browse);
   }
 }
 
@@ -3560,9 +3610,14 @@ async function detail(row) {
         ? "Investigator-entered manual event"
         : data.event_type === "other"
           ? "Imported other event"
-          : "Original CloudTrail event";
+          : data.event_type === "guardduty"
+            ? "GuardDuty derived finding snapshot — not CloudTrail evidence"
+            : "Original CloudTrail event";
     $("edit-manual-event").hidden = data.event_type !== "manual";
     $("edit-manual-event").onclick = () => manualEditor(row, data);
+    document
+      .querySelectorAll(".guardduty-context")
+      .forEach((element) => element.remove());
     $("event-provenance").textContent = JSON.stringify(
       data.provenance,
       null,
@@ -3578,7 +3633,7 @@ async function detail(row) {
       $("event-revisions").append(heading, raw);
     }
     $("detail-id").textContent =
-      `${data.event_id || data.event_type} · ${row.time_local ? row.time_local + " " + meta.timezone : ""}`;
+      `${data.event_id || data.event_type} · ${data.event_time_ms == null ? "Time unknown" : shown(data.event_time_ms) + " " + meta.timezone}`;
     showReference(row, $("detail-id").parentElement);
     eventCommandLinks(data.ssm_commands);
     // Format using token-aware whitespace only: do not parse/stringify numeric evidence in JavaScript.
@@ -3620,6 +3675,27 @@ async function detail(row) {
       .forEach((r) => r.classList.remove("inspected"));
     if (index >= 0) rows[index].getElement().classList.add("inspected");
     detailFindings();
+    if (data.guardduty) {
+      const context = document.createElement("p");
+      context.textContent = `${data.guardduty.sample_status} (unknown does not mean real) · Timeline time: ${data.guardduty.time_basis} · ${data.guardduty.link_status}. ${data.guardduty.link_basis}`;
+      $("raw-event").before(context);
+      context.className = "guardduty-context";
+    }
+    const links = document.createElement("div");
+    links.className = "guardduty-context command-links";
+    if (data.related_events_total) {
+      const heading = document.createElement("p");
+      heading.textContent = `GuardDuty contextual associations — not exact evidence matches (${data.related_events.length} of ${data.related_events_total} shown)`;
+      links.append(heading);
+      for (const related of data.related_events) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = `#${related.id} · ${related.event_type} · ${related.event_time_ms == null ? "Time unknown" : shown(related.event_time_ms) + " " + meta.timezone} · ${related.summary || related.event_id}`;
+        button.onclick = () => detail(related);
+        links.append(button);
+      }
+    }
+    $("raw-event").before(links);
     openDetail();
   } catch (e) {
     error(e.message);

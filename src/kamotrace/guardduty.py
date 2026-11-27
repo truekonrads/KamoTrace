@@ -3,6 +3,7 @@ import argparse
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -13,7 +14,7 @@ import simplejson
 from .importer import discard_abandoned, publish, staging, write_lock
 from .suzaku import LEVELS, check_output, evidence_identity, sha256
 
-SCHEMA = 1
+SCHEMA = 2
 TABLES = {"guardduty_run", "findings", "links"}
 LINK_BASIS = "context only: identity account + region + access key + observed interval [first, last); not an exact CloudTrail event match"
 
@@ -36,10 +37,10 @@ def build(database, source, output, replace=False, lock=True):
             try:
                 connection.execute("ATTACH ? AS ev (READ_ONLY)", [str(database)])
                 identity = evidence_identity(connection, "ev")
-                connection.execute("""CREATE TABLE findings(arn VARCHAR PRIMARY KEY, finding_id VARCHAR,
+                connection.execute("""CREATE TABLE findings(finding_record BIGINT PRIMARY KEY, arn VARCHAR, finding_id VARCHAR,
                     title VARCHAR, level VARCHAR, level_rank TINYINT, account VARCHAR, region VARCHAR,
                     access_key VARCHAR, first_seen TIMESTAMPTZ, last_seen TIMESTAMPTZ, raw_finding JSON)""")
-                for finding in findings:
+                for ordinal, finding in enumerate(findings, 1):
                     arn = finding.get("Arn")
                     if not all(isinstance(finding.get(key), str) and finding[key] for key in ("Arn", "Id", "AccountId", "Region", "Type")):
                         raise ValueError("GuardDuty findings require Arn, Id, AccountId, Region and Type")
@@ -57,24 +58,24 @@ def build(database, source, output, replace=False, lock=True):
                     if finding.get("Title") is not None and not isinstance(finding["Title"], str):
                         raise ValueError(f"{arn}: Title must be text")
                     first, last = service.get("EventFirstSeen"), service.get("EventLastSeen")
-                    for stamp in (first, last):
+                    for stamp in (first, last, finding.get('CreatedAt'), finding.get('UpdatedAt')):
                         if stamp is not None and (not isinstance(stamp, str) or datetime.fromisoformat(stamp.replace("Z", "+00:00")).tzinfo is None):
                             raise ValueError(f"{arn}: observed timestamps must include an offset")
                     if first and last and datetime.fromisoformat(first.replace("Z", "+00:00")) > datetime.fromisoformat(last.replace("Z", "+00:00")):
                         raise ValueError(f"{arn}: observed interval is reversed")
                     key = access.get("AccessKeyId")
-                    connection.execute("INSERT INTO findings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [arn, finding["Id"], "GuardDuty context (not exact): " + (finding.get("Title") or finding["Type"]),
+                    connection.execute("INSERT INTO findings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [ordinal, arn, finding["Id"], "GuardDuty context (not exact): " + (finding.get("Title") or finding["Type"]),
                          level, LEVELS.index(level), finding["AccountId"], finding["Region"], key, first, last,
                          simplejson.dumps(finding, use_decimal=True)])
-                connection.execute("""CREATE TABLE links AS SELECT e.source_record, e.record_sha256, f.arn
+                connection.execute("""CREATE TABLE links AS SELECT e.source_record, e.record_sha256, f.arn, f.finding_record
                     FROM findings f JOIN ev.events e ON
                         e.user_identity->>'$.accountId' = f.account AND e.aws_region = f.region
                         AND e.user_identity->>'$.accessKeyId' = f.access_key
                         AND f.access_key IS NOT NULL AND f.access_key <> ''
                         AND e.event_time >= f.first_seen AND e.event_time < f.last_seen""")
                 total, linked = connection.execute("""SELECT count(*), count(*) FILTER
-                    (WHERE arn IN (SELECT arn FROM links)) FROM findings""").fetchone()
+                    (WHERE finding_record IN (SELECT finding_record FROM links)) FROM findings""").fetchone()
                 run = {"schema_version": SCHEMA, "imported_at": datetime.now(timezone.utc).isoformat(),
                        "source_file": str(source), "source_sha256": sha256(source),
                        "evidence_source_sha256": identity[0], "evidence_records": identity[1],
@@ -92,39 +93,100 @@ def build(database, source, output, replace=False, lock=True):
 
 
 def load(connection, path):
-    """Append labelled context to the shared read-only detection projection."""
-    connection.execute("CREATE TEMP TABLE guardduty_findings(rule_id VARCHAR, raw_finding VARCHAR)")
+    """Load immutable finding snapshots and their separately labelled AWS context."""
+    from .other_events import RAW_SCHEMA, EVENTS_VIEW
+    connection.execute("""CREATE TEMP TABLE guardduty_findings(finding_record BIGINT, rule_id VARCHAR,
+        raw_finding VARCHAR, sample_status VARCHAR, time_basis VARCHAR, link_status VARCHAR,
+        title VARCHAR, level VARCHAR, level_rank TINYINT)""")
+    connection.execute(f"CREATE TEMP TABLE guardduty_raw ({RAW_SCHEMA})")
+    # The generic event-column contract, not a second query engine or a JSONL conversion.
+    stamp = "coalesce(raw_event->>'$.Service.EventFirstSeen', raw_event->>'$.CreatedAt', raw_event->>'$.UpdatedAt', raw_event->>'$.Service.EventLastSeen')"
+    projection = EVENTS_VIEW.replace("FROM raw_events", "FROM guardduty_raw")
+    connection.execute(f"""CREATE TEMP VIEW guardduty_events AS SELECT e.* REPLACE (
+        raw_event->>'$.Arn' AS event_id, {stamp} AS event_time_text,
+        ({stamp})::TIMESTAMPTZ AS event_time, raw_event->>'$.Region' AS aws_region,
+        NULL::VARCHAR AS source_ip,
+        'guardduty' AS event_type, raw_event->>'$.AccountId' AS generic_identity,
+        left('GuardDuty [' || f.sample_status || '] ' || coalesce(raw_event->>'$.Title', raw_event->>'$.Type'), 240) AS content_preview)
+        FROM ({projection}) e JOIN guardduty_findings f ON f.finding_record=e.source_record""")
+    connection.execute("CREATE TEMP TABLE guardduty_event_links(finding_record BIGINT, source_record BIGINT)")
     if path is None:
         return None
     sidecar = duckdb.connect(str(path), read_only=True)
     try:
         run = json.loads(sidecar.execute("SELECT metadata FROM guardduty_run").fetchone()[0])
-        if run.get("schema_version") != SCHEMA:
+        if run.get("schema_version") not in (1, SCHEMA):
             raise ValueError("Unsupported GuardDuty sidecar; rebuild with kamotrace guardduty --replace")
         if (run["evidence_source_sha256"], run["evidence_records"]) != evidence_identity(connection):
             raise ValueError("GuardDuty sidecar was built for a different evidence database")
-        sidecar.execute("SELECT 'guardduty:' || arn, raw_finding::VARCHAR FROM findings")
+        ordinal = "finding_record" if run["schema_version"] == 2 else "row_number() OVER (ORDER BY arn)"
+        sidecar.execute(f"CREATE TEMP TABLE snapshots AS SELECT {ordinal} AS snapshot_record, * FROM findings")
+        sidecar.execute("SELECT snapshot_record, arn, raw_finding::VARCHAR, title, level, level_rank FROM snapshots ORDER BY snapshot_record")
         while rows := sidecar.fetchmany(8192):
-            connection.execute("INSERT INTO guardduty_findings SELECT unnest(?::VARCHAR[]), unnest(?::VARCHAR[])",
-                               list(zip(*rows)))
+            for number, arn, raw, title, level, level_rank in rows:
+                value = simplejson.loads(raw, use_decimal=True)
+                canonical = simplejson.dumps(value, use_decimal=True, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+                digest = hashlib.sha256(raw.encode()).hexdigest()
+                review_key = hashlib.sha256(('guardduty-snapshot-v1:' + canonical).encode()).hexdigest()
+                service = value.get("Service") or {}
+                basis = next((key for key, stamp in (
+                    ('Service.EventFirstSeen', service.get('EventFirstSeen')), ('CreatedAt', value.get('CreatedAt')),
+                    ('UpdatedAt', value.get('UpdatedAt')), ('Service.EventLastSeen', service.get('EventLastSeen'))) if stamp), 'unknown')
+                sample = sample_status(service)
+                resource = value.get('Resource') or {}
+                first, last = service.get('EventFirstSeen'), service.get('EventLastSeen')
+                if not (resource.get('AccessKeyDetails') or {}).get('AccessKeyId'):
+                    status = 'missing access key'
+                elif not first or not last:
+                    status = 'missing observed time'
+                elif datetime.fromisoformat(first.replace('Z', '+00:00')) == datetime.fromisoformat(last.replace('Z', '+00:00')):
+                    status = 'point observation excluded by context-v1 [first,last)'
+                else:
+                    status = 'no matching collected event'
+                connection.execute("INSERT INTO guardduty_findings VALUES (?,?,?,?,?,?,?,?,?)",
+                    [number, 'guardduty:' + arn, raw, sample, basis, status, title, level, level_rank])
+                connection.execute("INSERT INTO guardduty_raw VALUES (?,?,?,?,?,?,?,?,?,?)", [number, raw, review_key,
+                    run['source_file'], number,
+                    'GuardDuty derived finding snapshot (not CloudTrail evidence)', None,
+                    value.get('CreatedAt'), value.get('UpdatedAt'), digest])
         # Append to main's compact catalog, not the read-only detections projection.
         offset = connection.execute("SELECT coalesce(max(detection_rule), 0) FROM detection_rules").fetchone()[0]
         sidecar.execute("""CREATE TEMP TABLE finding_rules AS
-            SELECT row_number() OVER (ORDER BY arn) + ? AS detection_rule, arn, title, level, level_rank
-            FROM findings""", [offset])
+            SELECT row_number() OVER (ORDER BY snapshot_record) + ? AS detection_rule, snapshot_record, arn, title, level, level_rank
+            FROM snapshots""", [offset])
         sidecar.execute("""SELECT detection_rule, 'guardduty:' || arn, title, level, level_rank
             FROM finding_rules ORDER BY detection_rule""")
         while rows := sidecar.fetchmany(8192):
             connection.execute("""INSERT INTO detection_rules SELECT unnest(?::BIGINT[]), unnest(?::VARCHAR[]),
                 unnest(?::VARCHAR[]), unnest(?::VARCHAR[]), unnest(?::TINYINT[]), []::VARCHAR[], []::VARCHAR[]""",
                 list(zip(*rows)))
-        sidecar.execute("SELECT l.source_record, f.detection_rule FROM links l JOIN finding_rules f USING (arn)")
+        join = 'l.finding_record=f.snapshot_record' if run['schema_version'] == 2 else 'l.arn=f.arn'
+        sidecar.execute(f"SELECT l.source_record, f.detection_rule, f.snapshot_record FROM links l JOIN finding_rules f ON {join}")
         while rows := sidecar.fetchmany(8192):
             connection.execute("INSERT INTO detection_links SELECT unnest(?::BIGINT[]), unnest(?::BIGINT[])",
-                               list(zip(*rows)))
+                               list(zip(*[(r[0], r[1]) for r in rows])))
+            connection.execute("INSERT INTO guardduty_event_links SELECT unnest(?::BIGINT[]), unnest(?::BIGINT[])",
+                               list(zip(*[(r[2], r[0]) for r in rows])))
+        connection.execute("""UPDATE guardduty_findings SET link_status='context-v1: collected event associations (not exact)'
+            WHERE finding_record IN (SELECT finding_record FROM guardduty_event_links)""")
         return run
     finally:
         sidecar.close()
+
+
+def sample_status(service):
+    """Only explicit provider flags establish sample status; unknown never means real."""
+    additional = service.get('AdditionalInfo') or {}
+    flags = [additional.get('Sample')] if isinstance(additional, dict) else []
+    if isinstance(additional, dict) and isinstance(additional.get('Value'), str):
+        try:
+            parsed = json.loads(additional['Value'])
+            if isinstance(parsed, dict):
+                flags.append(parsed.get('sample'))
+        except ValueError:
+            pass
+    normalized = {str(flag).lower() for flag in flags if isinstance(flag, (bool, str)) and str(flag).lower() in ('true', 'false')}
+    return 'sample=true' if normalized == {'true'} else 'sample=false' if normalized == {'false'} else 'sample=unknown'
 
 
 def main(argv=None):

@@ -99,7 +99,9 @@ cache existence nor attachment alone proves readiness.
 Store attaches the published cache `READ_ONLY` and queries it directly, without
 copying it into a TEMP table. A temporary `event_raw` union reads original JSON
 from the source databases and joins on exact global `source_record`, not hashes,
-times or addresses. Manual events stay in their separate live branch; reviews,
+times or addresses. GuardDuty snapshots are appended from the loaded sidecar
+outside this cache, after immutable imports without changing their IDs or dataset
+membership. Manual events stay in their separate live branch; reviews,
 tags, enrichment, detections and external exports are not cached by this feature.
 Request-time external file access remains disabled after startup.
 
@@ -114,6 +116,12 @@ The supporting components answer different questions:
 - **GuardDuty:** contextual leads, not exact detections of a CloudTrail event.
   Linking requires identity account, region, exact access key and the observed
   `[first, last)` interval. Raw finding JSON stays separate from CloudTrail JSON.
+  Every retained snapshot also projects through the existing other-event column
+  contract into the shared timeline, without changing `kamotrace-other-v1`.
+  Schema 2 preserves input occurrences rather than upserting ARN; schema 1 remains
+  readable without rewriting it. Namespaced canonical snapshot hashes own reviews;
+  changed content does not silently inherit annotations. CloudTrail links remain
+  separate, version-1 context, with bounded bidirectional detail navigation.
   See [collection and linkage](../README.md#optional-guardduty-alerts).
 - **IP enrichment:** offline lookup context with per-source provenance and
   explicit priority, not proof of a person's location or resource ownership.
