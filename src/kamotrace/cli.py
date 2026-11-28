@@ -6,6 +6,7 @@
   kamotrace download --dest CASE --regions all --start 2026-10-01 --end 2026-10-02
   kamotrace trailcheck [--profile NAME] [--regions all] [--json report.json|-] [--probe-buckets] [--emit-policy policy.json|-]
   kamotrace get-suzaku [--version 3.0.0]
+  kamotrace get-iwatobi [--dest FOLDER]
   kamotrace suzaku   --case case.json --timeline suzaku.duckdb
   kamotrace get-dbip [--dest FOLDER]
   kamotrace enrich   --case case.json (--geolite2 FOLDER | --jsonl FILE)...
@@ -27,6 +28,7 @@ COMMANDS = {
     "eks": ("kamotrace.eks", "Collect AWS-only EKS context and bounded existing CloudWatch logs; import offline"),
     "trailcheck": ("kamotrace.trailcheck", "Read-only audit of trails, logging/delivery state, S3 destinations and log dates"),
     "get-suzaku": ("kamotrace.get_suzaku", "Download and verify the official Suzaku 3.x release for this platform"),
+    "get-iwatobi": ("kamotrace.get_iwatobi", "Build and verify the pinned Iwatobi forensic-export fork (Git and Rust 1.88+)"),
     "suzaku": ("kamotrace.suzaku", "Import or run Suzaku Sigma detections into a detections sidecar"),
     "guardduty": ("kamotrace.guardduty", "Enrich events with contextual GuardDuty findings from downloaded JSON"),
     "get-dbip": ("kamotrace.get_dbip", "Download and verify the free DB-IP Lite City/ASN databases (no account)"),

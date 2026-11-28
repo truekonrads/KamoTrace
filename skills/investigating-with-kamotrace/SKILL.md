@@ -77,6 +77,7 @@ Use `import --case case.json --unit ACQUISITION --source export.json`, then `pre
 | --- | --- |
 | Import a CloudTrail `Records` export | `kamotrace import --source export.json --case case.json --unit ACQUISITION`, then `kamotrace prepare --case case.json --unit ACQUISITION` |
 | Suzaku Sigma detections | Generate an offline timeline separately, then `kamotrace suzaku --case case.json --timeline timeline.duckdb` |
+| Iwatobi setup | `kamotrace get-iwatobi [--dest FOLDER]` builds the pinned forensic-export fork; Git and Rust 1.88+ are prerequisites. It scans only a synthetic packaged example, never case evidence. See [setup and explicit offline scans](../../docs/user-guide.md#install-the-iwatobi-fork). |
 | IP enrichment | `kamotrace get-dbip` (free DB-IP Lite, no account), then `kamotrace enrich --case case.json --geolite2 FOLDER` and/or `--jsonl provider.jsonl` |
 
 The server must be restarted to pick up new detections or enrichment.

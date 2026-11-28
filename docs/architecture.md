@@ -37,7 +37,7 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `datasets.py` | Own the JSON case manifest, durable block reservations and immutable raw-unit registration. |
 | `suzaku.py`, `guardduty.py`, `enrich.py` | Build evidence-bound derived sidecars and load them read-only for investigation. |
 | `iwatobi.py` | Read retained native alert JSON and attach exact physical UAC occurrences within selected prepared coverage; no detector or persistent evidence writes. |
-| `get_suzaku.py`, `get_dbip.py` | Download and verify optional external tools/data, separately from the application distribution. |
+| `get_suzaku.py`, `get_iwatobi.py`, `get_dbip.py` | Fetch and verify optional external tools/data; Iwatobi builds a pinned forensic-export fork and checks synthetic exact references before installation. |
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
 | `computers.py` | Summarize bounded historical computer facts from declared prepared acquisitions, selected by stable unit key. |
 | `server.py`, `pipeline.py` | Own investigation state and REST validation/query execution; parse and compile the versioned filter language. |
@@ -290,6 +290,13 @@ Optional assets are fetched at runtime: `get_suzaku.py` verifies the official
 release checksum and archive paths; `get_dbip.py` verifies published decompressed
 checksums and database types. Suzaku (AGPL-3.0) and geolocation data are not
 bundled. Do not download MaxMind data; users supply it under their licence.
+`get_iwatobi.py` uses the same tools-folder convention to build Konrads's
+Iwatobi fork at a fixed full Git revision with locked Cargo dependencies,
+retaining source/rules/config/licence and a binary-hash receipt. Both forensic
+flags and a synthetic three-member correlation with exact decoded-text-line
+references must pass before private staging is published. It refuses existing
+targets and never scans evidence or changes case configuration. Iwatobi
+(RPL-1.5) and its Git/Rust/native-build prerequisites are not bundled.
 Keep DB-IP Lite's CC BY 4.0 attribution. The two-stage Docker image uses Debian
 trixie for Suzaku's glibc requirements; its wildcard container bind requires
 loopback-only host port publishing. See [Docker](user-guide.md#docker).

@@ -435,6 +435,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `kamotrace policy [--output PATH\|-] [--bucket NAME]... [--kms-key ARN]... [--validate \| --validate-file PATH]` | [Combined collection policy](preparation.md#aws-collection-iam-policy) for CloudTrail, SSM and inventory; offline generation, optional AWS IAM Access Analyzer validation |
 | `kamotrace trailcheck [--regions all] [--json PATH\|-] [--emit-policy PATH\|-] [--max-items N] [--max-s3-calls N] [--probe-buckets]` | [Read-only audit](#cloudtrail-trail-check) of trails, logging/delivery state, S3 destinations and observed log dates |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
+| `kamotrace get-iwatobi [--dest FOLDER]` | Build and verify the pinned [Iwatobi forensic-export fork](#install-the-iwatobi-fork); requires Git and Rust 1.88+ |
 | `kamotrace suzaku --case CASE.json --timeline FILE` | Link an offline Suzaku timeline within declared prepared coverage |
 | `kamotrace guardduty --case CASE.json --snapshot-unit KEY --findings FILE [--replace]` | Admit/prepare snapshots and build [contextual GuardDuty leads](#guardduty-context) |
 | `kamotrace get-dbip [--dest FOLDER]` | Download and verify the free DB-IP Lite City and ASN databases (CC BY 4.0, no account) |
@@ -734,6 +735,65 @@ On Linux, add `--user "$(id -u):$(id -g)"` to `docker run` so files in the case
 folder belong to you.
 
 ## Native Iwatobi attachments
+
+### Install the Iwatobi fork
+
+Install the optional detector separately, like Suzaku:
+
+```sh
+kamotrace get-iwatobi
+```
+
+This builds [Konrads's fork](https://github.com/truekonrads/iwatobi) at full revision
+`d4b5f02cbd7fe7a044f8a5e1153157355489bd5b` from the `uac-forensic-contract`
+work proposed in [upstream PR #17](https://github.com/Yamato-Security/iwatobi/pull/17).
+The helper never follows a moving branch or falls back to upstream. The fork's
+version string is still `1.0.0`; a stock release is not sufficient.
+
+Prerequisites are Git, Rust 1.88+ with Cargo, a working native linker/C build
+toolchain (Visual Studio C++ Build Tools for Windows MSVC; Xcode Command Line
+Tools on macOS; a C compiler/linker on Linux), disk space and network access to
+GitHub and Cargo dependencies. The helper does not install these prerequisites.
+It runs `cargo build --release --locked`; first installation may take several
+minutes. Pinning source and Cargo.lock makes inputs reproducible, not a promise
+of bit-identical executables across operating systems/toolchains or a security
+endorsement of the fork/dependencies. Iwatobi is separately licensed RPL-1.5.
+
+Like `get-suzaku`, it uses `$KAMOTRACE_TOOLS` or `~/.kamotrace/tools`; `--dest`
+overrides that folder. JSON stdout reports the executable and folder. Each full
+revision gets its own `iwatobi-<revision>` folder, keeping the executable,
+source, rules, config and licence together. `kamotrace-download.json` records
+the source, revision, binary SHA256, build command and smoke result. There is no
+PATH modification or implicit detector execution by `serve`.
+
+Before publication, setup checks both forensic CLI flags and runs only the
+fork's three-line synthetic example. It requires `iwatobi-forensic-1.0.0` /
+`uac-1.0.0`, one complete correlation and three exact members referencing decoded
+text lines 1, 2 and 3 with the supplied acquisition, collection, canonical path
+and original file hash. Failed downloads/builds/capability checks clean private
+staging without publishing an installation. Errors include missing prerequisites
+or compiler diagnostics; existing target folders (even partial ones) are never
+overwritten. Use the installed executable or choose a different `--dest` to
+retry; no automatic update or rule refresh occurs.
+
+For a synthetic check after installation, change to the reported installation
+folder and run the following (PowerShell: use `.\iwatobi.exe`):
+
+```sh
+./iwatobi dfir-timeline -f docs/examples/forensic/access.log -r rules/iwatobi/web/webserver/web_rapid_posts_to_php_index.yml -z UTC --forensic-output ../synthetic-iwatobi.json --evidence-manifest docs/examples/forensic/evidence-manifest.json -q -K -w -Q
+```
+
+Use a fresh output filename; forensic bundles are not overwritten, even with
+`--clobber`. Real offline scans are separate, explicit work: supply original
+logs and an evidence manifest with the same acquisition/collection IDs,
+canonical paths and original byte hashes used by your prepared UAC case. Use
+the logs' actual timezone, not automatically your local timezone. Never scan
+retained evidence just to test setup. See the installed `docs/UAC_CONTRACT.md`
+for binding details. Unbound output remains valid detections but cannot attach
+as exact evidence. No alerts or a successful setup says nothing about evidence
+coverage or whether a system is clean.
+
+### Open retained output
 
 Open an already prepared case with a retained native alert bundle:
 
