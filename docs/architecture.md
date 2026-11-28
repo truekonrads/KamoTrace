@@ -38,6 +38,7 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `suzaku.py`, `guardduty.py`, `enrich.py` | Build evidence-bound derived sidecars and load them read-only for investigation. |
 | `iwatobi.py` | Read retained native alert JSON and attach exact physical UAC occurrences within selected prepared coverage; no detector or persistent evidence writes. |
 | `get_suzaku.py`, `get_iwatobi.py`, `get_dbip.py` | Fetch and verify optional external tools/data; Iwatobi builds a pinned forensic-export fork and checks synthetic exact references before installation. |
+| `get_tracequarry.py` | Set up the exact external fork revision, isolated Python environment and locked native journal helper; verify capabilities before publishing a tools-folder installation. |
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
 | `computers.py` | Summarize bounded historical computer facts from declared prepared acquisitions, selected by stable unit key. |
 | `server.py`, `pipeline.py` | Own investigation state and REST validation/query execution; parse and compile the versioned filter language. |
@@ -300,6 +301,8 @@ targets and never scans evidence or changes case configuration. Iwatobi
 Keep DB-IP Lite's CC BY 4.0 attribution. The two-stage Docker image uses Debian
 trixie for Suzaku's glibc requirements; its wildcard container bind requires
 loopback-only host port publishing. See [Docker](user-guide.md#docker).
+
+TraceQuarry remains external: `get-tracequarry` uses the same tools-folder convention, but builds a pinned source checkout rather than trusting an upstream release/version string. Its private staging, native stream tests, importer-compatible parse probe and receipt are separate from evidence admission/preparation. It refuses overwrite and does not fall back to another revision if the fork has not published the pin; a local source bundle must be explicit. See [setup, source availability and platform prerequisites](preparation.md#set-up-tracequarry-for-uac).
 
 Tests use synthetic evidence: `test_contract.py` covers real DuckDB, HTTP and MCP;
 collector/CLI suites cover their own public interfaces; `browser_smoke.py` runs

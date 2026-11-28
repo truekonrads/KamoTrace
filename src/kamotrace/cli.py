@@ -23,6 +23,7 @@ COMMANDS = {
     "import": ("kamotrace.importer", "Load CloudTrail JSON/gzip files, folders or stdin into a new, read-only evidence DuckDB"),
     "import-other": ("kamotrace.other_events", "Stream other-event JSONL into a new immutable DuckDB with required origin provenance"),
     "import-uac": ("kamotrace.tracequarry", "Admit a completed external TraceQuarry parse-only acquisition into a fresh case"),
+    "get-tracequarry": ("kamotrace.get_tracequarry", "Set up the pinned TraceQuarry fork and native journal reader separately from evidence import"),
     "prepare": ("kamotrace.event_index", "Explicitly prepare selected fresh-case units or physical-ID ranges"),
     "download": ("kamotrace.download", "Resume CloudTrail and SSM collection using an existing AWS login"),
     "eks": ("kamotrace.eks", "Collect AWS-only EKS context and bounded existing CloudWatch logs; import offline"),

@@ -22,6 +22,8 @@ kamotrace serve --case C:\case\case.json
 
 Use a new case path; no old IDs, annotations or sidecars are migrated or overwritten. The [fresh-case preparation reference](docs/preparation.md#fresh-acquisition-unit-cases) covers generic JSONL, completed TraceQuarry/UAC and EKS exports, selected physical-ID ranges, retry/publication rules and coverage-bound sidecars. Legacy viewer and positional auto startup fail with re-ingestion instructions; existing evidence is left untouched.
 
+For UAC parsing, [`get-tracequarry`](docs/preparation.md#set-up-tracequarry-for-uac) sets up the exact compatible revision from our fork's `kamotrace-uac` branch and builds the native journal helper separately. Import and browsing remain offline.
+
 ## Get started
 
 You need Python 3.11+, [uv](https://docs.astral.sh/uv/getting-started/installation/)

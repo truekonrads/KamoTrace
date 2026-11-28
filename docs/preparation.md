@@ -39,6 +39,39 @@ One case writer holds the existing fail-fast lock. ID blocks are persisted befor
 
 Manifest/artifact publication fsyncs files and, on POSIX, their parent directories. Windows lacks Python directory fsync; atomic replacement is not a universal filesystem/power-loss guarantee. Qualification covers process interruption and injected I/O failures. Cold startup still hashes evidence and validates prepared fields; bounded Python batches do not bound total DuckDB/native RSS, spill, validation or checkpoint work.
 
+## Set up TraceQuarry for UAC
+
+`get-tracequarry` installs the separate [truekonrads/TraceQuarry fork](https://github.com/truekonrads/TraceQuarry) at exact commit `26c941fb575347c055f79a1c10ed68ba9bdb8a2d` (tree `a328e04ab6dbc2f53083905d5cdc608c0fe874a3`). Upstream and the fork's current `main` are **not substitutes**: they lack the required ECS parse-only/native-reader contract. Nothing is bundled with KamoTrace, and import, preparation and browsing never download or execute TraceQuarry.
+
+The required source is published on the fork's [`kamotrace-uac` branch](https://github.com/truekonrads/TraceQuarry/tree/kamotrace-uac). Setup verifies the exact commit rather than following future branch changes. If that object is unavailable, it fails rather than falling back to `main`. No private evidence, developer source bundle or prebuilt helper is needed for normal setup.
+
+Install Git, [uv](https://docs.astral.sh/uv/) and [rustup](https://rustup.rs/), then install the exact toolchain without changing your global default:
+
+```powershell
+rustup toolchain install 1.100.0 --profile minimal
+```
+
+Rust 1.99 is insufficient. A native linker is also required: Linux C development/linker tools (for example Debian `build-essential`), macOS Xcode Command Line Tools, or Windows Visual Studio Build Tools with Desktop development with C++, x64 MSVC and Windows SDK. On Windows use the corresponding developer shell and MSVC Rust host. Codecs are pure Rust; libsystemd, journalctl, CMake and native LZ4/Zstd/XZ libraries are not required. Setup needs network access to Python/Rust package registries and, without `--source`, GitHub. `uv` provisions a separate Python 3.12 environment and installs IANA `tzdata` for systems without OS timezone data, notably Windows. TraceQuarry supports Python 3.11–3.12, independently of KamoTrace's Python version.
+
+From a clean KamoTrace checkout:
+
+```powershell
+$tool = uv run kamotrace get-tracequarry | ConvertFrom-Json
+$env:TRACEQUARRY_JOURNAL_READER = $tool.journal_reader
+& $tool.python -m uac_parser.cli C:\exports\uac-host --parse-only --year 2025 --timezone UTC --utmp-layout linux-time32-le --acquisition-id host-acquisition-1 --out C:\exports\completed-parse-only
+uv run kamotrace import-uac --case C:\case\case.json --unit host-acquisition-1 --source C:\exports\completed-parse-only
+uv run kamotrace prepare --case C:\case\case.json --unit host-acquisition-1
+uv run kamotrace serve --case C:\case\case.json
+```
+
+For an explicitly supplied local source Git bundle/repository, add `--source PATH`; it must contain the same pinned commit. It is never automatically discovered. `--dest FOLDER` overrides `$KAMOTRACE_TOOLS` / `~/.kamotrace/tools`, as for Suzaku. A full checkout, relocatable Python environment, compiled journal helper and `kamotrace-install.json` receipt live in `tracequarry-COMMIT`; setup refuses to overwrite an existing installation. Use the returned Python and helper paths together, not an unrelated `tracequarry` on PATH. The receipt records source revision/tree, dependency versions, native helper SHA256 and platform. Python dependency resolution is recorded, not fully lockfile-reproducible; Cargo uses the pinned `Cargo.lock` and `--locked`.
+
+Before publishing the installation, setup builds the helper, runs all three native stream contract tests (including real Python intake, binary/repeated fields and corrupt/oversized journal rejection), then parses duplicate synthetic auth records and validates their ECS/identity envelopes with KamoTrace's importer checks. Stage-specific failures include the compiler/tool output; failed setup cleans its private staging and does not publish a partial tool. Missing tools, unavailable source revisions and linker failures have actionable diagnostics.
+
+Parsing is an explicit separate step. This parse-only revision requires an **extracted UAC directory**, not an archive or loose input file; extract separately without changing the retained original archive. Supply a **new output directory** and your own year/timezone/ABI assumptions; the example's year is not inferred evidence. `--utmp-layout linux-time32-le` enables only that accounting ABI. Journals need the explicit helper environment variable; missing helpers produce visible unsupported coverage, not text fallback. Lastlog/lastlog2 and other accounting ABIs remain unsupported. A completed run means finalized output, not complete parser coverage; inspect `run_manifest.json` and `source_index.json` for errors, partial and unsupported sources. Keep the original UAC inputs and all three finalized output files for provenance. Import preserves physical occurrences and exact observation JSON; only explicit `prepare` makes the unit searchable.
+
+Tested here: Linux x86-64, Python 3.12 and Rust 1.100.0, starting from an isolated KamoTrace checkout and empty tools/home/uv-cache, first from a verified source-only bundle and then directly from GitHub; real native journal tests, synthetic text/accounting/journal parse, fresh-case import, explicit preparation, REST/MCP search and original-detail/provenance access. No pre-existing parser or native helper was used. Windows and macOS setup are **not tested here**; earlier helper-only qualification does not qualify this installer or Windows ACLs.
+
 ## Prerequisites
 
 You need:
