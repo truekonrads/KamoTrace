@@ -3,12 +3,13 @@ name: Publish release image
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-image-${{ github.event.release.tag_name }}
+  group: release-image-${{ github.event.release.tag_name || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -22,13 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
           persist-credentials: false
       - name: Select release image tags
         env:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            RELEASE_TAG="sha-${GITHUB_SHA:0:12}"
+          fi
           if [[ "$RELEASE_TAG" == latest || ! "$RELEASE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
             echo 'Use a valid Docker release tag (1–128 letters, digits, underscores, dots or hyphens); latest is reserved.'
             exit 1
@@ -53,7 +57,7 @@ jobs:
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
       - name: Publish the qualified image
         env:
-          PRERELEASE: ${{ github.event.release.prerelease }}
+          PRERELEASE: ${{ github.event_name == 'release' && github.event.release.prerelease || false }}
         run: |
           docker push "$IMAGE:$VERSION"
           if [[ "$PRERELEASE" == 'false' ]]; then

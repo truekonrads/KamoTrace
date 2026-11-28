@@ -712,6 +712,12 @@ then publish `ghcr.io/truekonrads/kamotrace:TAG`. Stable releases also update
 saving a draft release does not publish an image. Release tags must be valid
 Docker tags (for example `v0.1.0`); `latest` is reserved.
 
+For an on-demand build without a GitHub Release, run **Publish release image**
+from the Actions tab (select the intended branch), or use
+`gh workflow run release-image.yml --ref main`. This checks out the selected
+commit, runs the same qualification, and publishes `sha-FIRST12COMMITCHARS`
+and `latest`. It does not create a Git tag or GitHub Release.
+
 The workflow uses GitHub's automatic `GITHUB_TOKEN` with `contents: read` and
 `packages: write`; no registry password secret is needed. After the first
 publication, the repository owner should check the linked GitHub package's
