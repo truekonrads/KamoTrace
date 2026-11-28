@@ -1,7 +1,7 @@
 """Local investigation browser. Open explicitly prepared coverage with: kamotrace serve --case case.json"""
 import argparse
 from collections import defaultdict
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -275,7 +275,7 @@ class Store:
             identity = json.dumps([self.case_manifest["case_id"]])
             if reviews_path.exists():
                 try:
-                    with sqlite3.connect(reviews_path.as_uri() + "?mode=ro", uri=True) as previous:
+                    with closing(sqlite3.connect(reviews_path.as_uri() + "?mode=ro", uri=True)) as previous:
                         binding = previous.execute("SELECT value FROM sidecar_meta WHERE key='evidence'").fetchone()
                         if binding is None or binding[0] != identity:
                             raise ValueError("Findings sidecar belongs to a different evidence database or legacy case; "
