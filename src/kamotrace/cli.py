@@ -1,25 +1,28 @@
 """KamoTrace command line: load evidence and enrichment, then browse it.
 
-  kamotrace auto     CASE_FOLDER [--profile NAME] [--start ...] [--no-serve] ...
-  kamotrace import   --source event_history.json --database case.duckdb
+  kamotrace auto     --case case.json --unit ACQUISITION --kind cloudtrail --source export.json [--no-serve]
+  kamotrace import   --source event_history.json --case case.json --unit ACQUISITION
+  kamotrace prepare  --case case.json --unit ACQUISITION [--range START END]
   kamotrace download --dest CASE --regions all --start 2026-10-01 --end 2026-10-02
   kamotrace trailcheck [--profile NAME] [--regions all] [--json report.json|-] [--probe-buckets] [--emit-policy policy.json|-]
   kamotrace get-suzaku [--version 3.0.0]
-  kamotrace suzaku   --database case.duckdb (--source event_history.json [--suzaku suzaku.exe] | --timeline suzaku.duckdb)
+  kamotrace suzaku   --case case.json --timeline suzaku.duckdb
   kamotrace get-dbip [--dest FOLDER]
-  kamotrace enrich   --database case.duckdb (--geolite2 FOLDER | --jsonl FILE)...
+  kamotrace enrich   --case case.json (--geolite2 FOLDER | --jsonl FILE)...
   kamotrace ssmcheck [--profile NAME] [--regions all] [--json report.json] [--max-items 200] [--emit-policy policy.json|-]
   kamotrace inventory [--output FOLDER] [--profile NAME] [--regions all] [--from-export FOLDER] [--emit-policy policy.json|-]
   kamotrace policy [--output policy.json|-] [--bucket NAME]... [--kms-key ARN]... [--validate]
-  kamotrace serve    --database case.duckdb [--ssm-export ...]
+  kamotrace serve    --case case.json [--unit ACQUISITION] [--ssm-export ...]
   kamotrace mcp      --url http://127.0.0.1:8765
 """
 import sys
 
 COMMANDS = {
-    "auto": ("kamotrace.auto", "Full-auto, resumable: tools, AWS download, import, enrichment, detections, then the UI"),
+    "auto": ("kamotrace.auto", "Explicit offline acquisition admission, selected preparation, optional sidecars and UI"),
     "import": ("kamotrace.importer", "Load CloudTrail JSON/gzip files, folders or stdin into a new, read-only evidence DuckDB"),
     "import-other": ("kamotrace.other_events", "Stream other-event JSONL into a new immutable DuckDB with required origin provenance"),
+    "import-uac": ("kamotrace.tracequarry", "Admit a completed external TraceQuarry parse-only acquisition into a fresh case"),
+    "prepare": ("kamotrace.event_index", "Explicitly prepare selected fresh-case units or physical-ID ranges"),
     "download": ("kamotrace.download", "Resume CloudTrail and SSM collection using an existing AWS login"),
     "eks": ("kamotrace.eks", "Collect AWS-only EKS context and bounded existing CloudWatch logs; import offline"),
     "trailcheck": ("kamotrace.trailcheck", "Read-only audit of trails, logging/delivery state, S3 destinations and log dates"),

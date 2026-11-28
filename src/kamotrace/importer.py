@@ -182,13 +182,13 @@ def discard_abandoned(output, keep=()):
     return removed
 
 
-def build(source, database, lock=True):
+def build(source, database, lock=True, *, allocate=None, case_unit=None):
     """Import into a new database. Pass lock=False only while already holding write_lock(database)."""
     with write_lock(database) if lock else nullcontext():
-        return _build(source, database)
+        return _build(source, database, allocate=allocate, case_unit=case_unit)
 
 
-def _build(source, database):
+def _build(source, database, *, allocate=None, case_unit=None):
     # Paths remain rereadable; binary streams are spooled privately for independent verification.
     sources = expand(source)
     if not sources:
@@ -231,6 +231,7 @@ def _build(source, database):
                     raise ValueError(f"Source changed during import: {label}")
         if not count:
             raise ValueError("No CloudTrail Records found")
+        first_id = allocate(count) if allocate else 1
         with staging(database) as building:
             connection = duckdb.connect(str(building))
             try:
@@ -249,11 +250,11 @@ def _build(source, database):
                 """)
                 connection.execute("""
                     INSERT INTO raw_events
-                    SELECT ordinal, json, sha256(json::VARCHAR), source_file, ordinal - first_record + 1
+                    SELECT ordinal + ?, json, sha256(json::VARCHAR), source_file, ordinal - first_record + 1
                     FROM (SELECT row_number() OVER () AS ordinal, json
                           FROM read_json_objects(?, format='newline_delimited'))
                     JOIN import_sources ON ordinal BETWEEN first_record AND last_record
-                """, [str(staged)])
+                """, [first_id - 1, str(staged)])
                 connection.execute("""
                     CREATE VIEW events AS
                     SELECT source_record,
@@ -277,7 +278,9 @@ def _build(source, database):
                         raw_event, record_sha256, source_file, source_ordinal
                     FROM raw_events
                 """)
-                quality = connection.execute("""
+                # Fresh raw admission verifies content/provenance only. Derived
+                # quality statistics belong to explicit preparation, not import.
+                quality = connection.execute("SELECT count(*) AS records FROM raw_events" if case_unit else """
                     SELECT count(*) AS records, count(DISTINCT event_id) AS distinct_event_ids,
                         count(*) FILTER (WHERE event_id IS NULL) AS missing_event_ids,
                         count(*) FILTER (WHERE event_time IS NULL) AS invalid_timestamps,
@@ -302,7 +305,7 @@ def _build(source, database):
                             canonical = json.dumps(record, ensure_ascii=False, use_decimal=True,
                                                    allow_nan=False, separators=(",", ":"))
                             expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-                            if rows.fetchone() != (ordinal, expected):
+                            if rows.fetchone() != (first_id + ordinal - 1, expected):
                                 raise ValueError(f"Record integrity mismatch: {ordinal}")
                     if (verified != entry["source_records"] or sha256(path) != entry["source_sha256"]
                             or path.stat().st_mtime_ns != original.st_mtime_ns):
@@ -322,6 +325,8 @@ def _build(source, database):
                               built_at_utc=datetime.now(timezone.utc).isoformat(),
                               duckdb_version=duckdb.__version__, loader_sha256=sha256(Path(__file__)),
                               elapsed_seconds=round(time.monotonic() - started, 3))
+                if case_unit is not None:
+                    report["case_unit"] = case_unit
                 metadata = json.dumps(report, default=str)
                 connection.execute("CREATE TABLE build_info (metadata JSON)")
                 connection.execute("INSERT INTO build_info VALUES (?)", [metadata])
@@ -336,11 +341,20 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace import", description=__doc__)
     parser.add_argument("--source", action="extend", nargs="+", required=True,
                         help="JSON/gzip files or folders (recursive, sorted); repeatable; - reads binary stdin")
-    parser.add_argument("--database", type=Path, required=True)
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--database", type=Path)
+    destination.add_argument("--case", type=Path, help="Fresh case manifest; raw admission only")
+    parser.add_argument("--unit", help="Stable acquisition key (required with --case)")
     args = parser.parse_args(argv)
     if args.source.count("-") > 1:
         parser.error("stdin (-) can only be read once")
+    if bool(args.case) != bool(args.unit) or args.case and "-" in args.source:
+        parser.error("--case requires --unit and rereadable input files (not stdin)")
     try:
-        build([sys.stdin.buffer if item == "-" else Path(item) for item in args.source], args.database)
+        if args.case:
+            from .datasets import admit
+            admit(args.case, args.unit, "cloudtrail", args.source)
+        else:
+            build([sys.stdin.buffer if item == "-" else Path(item) for item in args.source], args.database)
     except (OSError, ValueError, EOFError, ijson.JSONError) as error:
         parser.error(str(error))

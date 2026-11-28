@@ -1127,7 +1127,11 @@
       status.textContent = "Loading acquired computer context…";
       try {
         const data = await request("/api/computers", {
-          ...(select.value ? { dataset_index: Number(select.value) } : {}),
+          ...(select.value
+            ? select.selectedOptions[0]?.dataset.unit
+              ? { unit_id: select.value }
+              : { dataset_index: Number(select.value) }
+            : {}),
           page,
         });
         if (token !== generation) return;
@@ -1138,9 +1142,10 @@
             "option",
             `Import ${entry.dataset_index + 1} · ${entry.acquisition_id || entry.collection_id || entry.run_id || "Unknown collection"} · ${formatTime(entry.imported_at)} · ${entry.records} observations`,
           );
-          option.value = entry.dataset_index;
+          option.value = entry.unit_id ?? entry.dataset_index;
+          if (entry.unit_id) option.dataset.unit = "true";
         }
-        select.value = data.dataset_index;
+        select.value = data.unit_id ?? data.dataset_index;
         status.textContent = `${data.total} computer / label groups · ${data.scanned} / ${data.records} observations inspected${data.truncated ? " · PARTIAL: scan limit reached; later computers/facts may be missing, automatic AWS links disabled" : ""} · Page ${page}`;
         status.classList.toggle("computer-warning", Boolean(data.truncated));
         for (const computer of data.cards) {
@@ -1301,6 +1306,7 @@
             "pre",
             JSON.stringify(
               {
+                unit_id: data.unit_id,
                 dataset_index: data.dataset_index,
                 manifest_sha256: data.manifest_sha256,
                 run_id: computer.run_id,

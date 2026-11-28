@@ -24,7 +24,7 @@ import simplejson
 from kamotrace.cli import main
 from kamotrace.download import Progress
 from kamotrace.importer import build
-from kamotrace.server import Store
+from case_fixtures import open_fixture as Store
 
 
 def dt(value):

@@ -4,6 +4,41 @@ For the shortest path from AWS login to an AI-assisted investigation,
 [start with the README](../README.md#get-started). This reference covers auto
 options, collection limits and the individual preparation steps.
 
+## Fresh acquisition-unit cases
+
+The explicit `--case` path separates raw admission, preparation and viewing. It does not migrate or overwrite older databases, Findings or sidecars. Choose a new manifest path and re-ingest from original exports. Do not pass an individual raw unit to `serve --database`.
+
+```powershell
+kamotrace import --case C:\case\case.json --unit aws-acquisition-1 --source C:\exports\cloudtrail.json
+kamotrace import-other --case C:\case\case.json --unit generic-acquisition-1 --source C:\exports\events.jsonl --origin "Application export"
+kamotrace import-uac --case C:\case\case.json --unit host-acquisition-1 --source C:\exports\completed-parse-only
+kamotrace prepare --case C:\case\case.json --unit aws-acquisition-1 --unit generic-acquisition-1 --unit host-acquisition-1
+kamotrace serve --case C:\case\case.json
+```
+
+Each caller-chosen unit key identifies one immutable acquisition. A retry with the same key and identical source paths, hashes and options reuses its raw artifact. Changed inputs require a new key. A deliberately new acquisition keeps duplicate occurrences even if its bytes match an older acquisition. CloudTrail/generic content duplicates share content-based reviews; TraceQuarry review identities remain manifest-and-line occurrences. Provider event IDs are separate from the numeric browse ID.
+
+`prepare --unit KEY` prepares the whole raw unit by default. For one selected unit, repeat `--range START END` to select sorted, disjoint, nonadjacent half-open intervals on persisted `source_record` IDs. IDs may have gaps: counts are actual occurrences, not interval lengths. An explicit partial preparation replaces the selected output; it does not union with the previous scope. `--rebuild` publishes a new output for an already selected scope when transformation/engine compatibility changes or a derived file is damaged. Old published files are retained.
+
+Serving without `--unit` selects all registered units and fails if any lacks compatible preparation. Repeat `serve --unit KEY` to deliberately open a prepared subset. The browser, REST metadata and MCP `describe_schema` disclose the same pinned coverage, partial preparation and excluded units. Unprepared is not searched, not evidence of no activity. Reopen the viewer to activate later preparation.
+
+The offline convenience path uses the same admission and preparation owners:
+
+```powershell
+kamotrace auto --case C:\case\case.json --unit eks-acquisition-1 --kind eks --source C:\exports\completed-eks --no-serve
+kamotrace guardduty --case C:\case\case.json --snapshot-unit alerts-acquisition-1 --findings C:\exports\guardduty.json
+kamotrace enrich --case C:\case\case.json --jsonl C:\lookups\provider.jsonl
+kamotrace suzaku --case C:\case\case.json --timeline C:\exports\timeline.duckdb
+```
+
+`auto --case` accepts `cloudtrail`, `generic` (with `--origin`), `uac` or `eks`; it performs no AWS collection or online tool installation. Optional `--guardduty-findings` plus `--snapshot-unit` admits/prepares snapshots before optional `--jsonl`/`--geolite2` enrichment and `--timeline` linking. Complete AWS/EKS collection separately with the existing collector. SSM command/output remains JSON-backed; pass `serve --ssm-export` or `auto --case --ssm-export` for exact command links.
+
+Sidecar producers accept repeatable `--unit` selections matching the viewer. A sidecar bound to a different prepared scope fails closed; regenerate it rather than adopting legacy links. GuardDuty snapshots are allocated ordinary IDs as raw units and prepared explicitly, not appended with count-derived offsets. Prepare all intended snapshot units before generating other sidecars, since adding snapshots changes the selected coverage identity. Findings/manual events bind to the stable case UUID, independent of selection changes; saved Finding queries additionally bind to their original prepared selection and refuse silent reopening on a different one.
+
+One case writer holds the existing fail-fast lock. ID blocks are persisted before use; interrupted builds burn reservations. Artifacts are validated, closed and published before their manifest reference. Failed replacements leave the old selected output intact. Published-but-unregistered artifacts are retained and never adopted merely because they exist; inspect the stopped command's output and case directory. Retrying restarts the unfinished unit/scope from private staging, not a mid-unit checkpoint. Do not delete evidence or reset the high-water counter to reclaim gaps.
+
+Manifest/artifact publication fsyncs files and, on POSIX, their parent directories. Windows lacks Python directory fsync; atomic replacement is not a universal filesystem/power-loss guarantee. Qualification covers process interruption and injected I/O failures. Cold startup still hashes evidence and validates prepared fields; bounded Python batches do not bound total DuckDB/native RSS, spill, validation or checkpoint work.
+
 ## Prerequisites
 
 You need:
@@ -25,46 +60,20 @@ uv tool install C:\path\to\KamoTrace
 If you are working from the checkout without installing the command, use
 `uv run kamotrace` instead of `kamotrace` in the steps below.
 
-#### Full-auto: one command from AWS login to browser
+#### Offline admission and preparation with auto
 
-After logging in with your normal AWS tooling, `kamotrace auto` runs steps 2–5
-for you, in dependency order, and then opens the server:
+After collecting exports separately, `auto` admits and prepares one named
+acquisition, then starts the viewer unless `--no-serve` is supplied:
 
 ```powershell
-kamotrace auto C:\cases\example
+kamotrace auto --case C:\cases\example\case.json --unit cloudtrail-1 --kind cloudtrail --source C:\exports\cloudtrail.json --no-serve
+kamotrace serve --case C:\cases\example\case.json
 ```
 
-It installs and verifies Suzaku and DB-IP Lite (unless already installed),
-downloads CloudTrail and SSM from all enabled regions (maximum available history),
-imports `case.duckdb`, adds IP enrichment and Suzaku detections, collects a current
-network inventory in `TARGET/inventory`, and starts the
-UI on http://127.0.0.1:8765. Every default can be overridden, for example
-`--profile investigation --start 2026-10-01 --end 2026-10-02`, `--source FILE`
-to skip AWS, `--skip-suzaku`, or `--no-serve` for unattended use. If anything
-fails or you interrupt it, **rerun the same command**: completed work is kept,
-including the collection's frozen time range. See
-[full-auto preparation](user-guide.md#full-auto-preparation) for all
-options and recovery rules.
-
-With explicit `--start`, auto first runs trailcheck and prefers discovered
-current-account S3 locations when every requested Region has at least one root
-whose requested day listings succeed. Empty days and Regions with no existing
-prefix are allowed: unused Regions need not contain logs. Samples without matching
-objects and unknown samples are counted separately in the collection output;
-per-day results remain in the audit. Empty listings do not prove missing logs or
-complete coverage. Missing locations, unknown Region scope, or denied, failed or
-budget-limited checks that leave no readable root for a Region keep Event History
-(90-day management-event retention only); they do not prove S3 logs are absent. Use
-`--cloudtrail-source history` to disable this check. An omitted `--end` means
-now (the first run's start time, frozen on resume). Without `--start`, auto
-keeps its existing Event History behavior. The source decision and discovered
-locations are frozen in the checkpoint; the audit is saved as `download/trailcheck.json`.
-Once the readability gate passes, collection fully lists every requested day at
-every discovered current-account/Region root, including roots whose sample
-found no matching object. A denied collection listing stops the run rather than
-silently dropping that root. Existing history checkpoints, including those from
-before S3 support, retain their original source on resume; use a new destination
-to collect a different source.
+It does not collect AWS data or install tools. Supply completed lookup files or
+a Suzaku timeline explicitly when needed. See [full-auto preparation](user-guide.md#full-auto-preparation)
+for supported options and retry rules, and the standalone collection steps below
+for AWS permissions, coverage and checkpoint behavior.
 
 #### AWS-only EKS context and existing logs
 
@@ -82,20 +91,16 @@ can still be read.
 # Current context only; no log bodies:
 kamotrace eks --output C:\cases\example\eks-context --regions ap-southeast-3
 # Existing conventional /aws/eks/*/cluster logs, start inclusive / end EXCLUSIVE:
-kamotrace eks --output C:\cases\example\eks --regions ap-southeast-3 --start 2026-10-01T00:00:00Z --end 2026-10-02T00:00:00Z --database C:\cases\example\eks.duckdb
+kamotrace eks --output C:\cases\example\eks --regions ap-southeast-3 --start 2026-10-01T00:00:00Z --end 2026-10-02T00:00:00Z
 # An explicitly named existing workload group can be added with:
 # --log-group ap-southeast-3:/aws/containerinsights/example/application
-# Verified offline import, no AWS calls (new database required):
-kamotrace eks --from-export C:\cases\example\eks --database C:\cases\example\eks-offline.duckdb
-kamotrace serve --database C:\cases\example\case.duckdb --other-events C:\cases\example\eks.duckdb --eks-export C:\cases\example\eks
-# Auto collects/imports/attaches it; EKS bounds are separate from CloudTrail bounds:
-kamotrace auto C:\cases\new-example --collect-eks --eks-start 2026-10-01T00:00:00Z --eks-end 2026-10-02T00:00:00Z
-# Or attach an existing EKS export without collecting EKS again:
-kamotrace auto C:\cases\offline --source C:\exports\cloudtrail.json --eks-export C:\cases\example\eks --skip-inventory --skip-enrich --skip-suzaku
+# Verified offline admission and preparation, no AWS calls:
+kamotrace auto --case C:\cases\example\case.json --unit eks-1 --kind eks --source C:\cases\example\eks --no-serve
+kamotrace serve --case C:\cases\example\case.json --eks-export C:\cases\example\eks
 ```
 
-`auto --collect-eks` and `auto --eks-export` also supply the verified export to
-the existing AWS inventory and map. For manual startup, `serve --eks-export FOLDER`
+`serve --eks-export FOLDER` (also accepted by offline `auto`) supplies the verified export to
+the existing AWS inventory and map. For startup, this flag
 adds current EKS context, alongside optional `--inventory-export NETWORK_FOLDER`.
 The context overlay is offline and read-only; neither source snapshot is rewritten.
 Clusters, managed node groups, Fargate profiles and add-ons are map resources,
@@ -108,7 +113,7 @@ remain uncollected. Public/private endpoint flags and configured CIDRs are shown
 as configuration, never verified reachability or effective access. EKS resources
 remain `Unknown` in the exposure assessment; links do not assert pod placement
 or traffic. `--eks-export` alone does not attach timeline logs: retain the
-`--other-events` import for those. Context changes take effect only at startup.
+prepared EKS acquisition for those. Context changes take effect only at startup.
 
 Without both EKS bounds, only current metadata is collected. Existing workload
 logs hosted by CloudWatch can be read without node access, but are not discovered
@@ -119,7 +124,7 @@ No S3 archive bodies, Config history or CloudTrail are collected by this command
 existing CloudTrail collection remains separate. No future logging setting can
 recreate absent historical logs.
 
-Before reading log bodies, `eks` (including collection through `auto`) warns on
+Before reading log bodies, standalone `eks` warns on
 stderr when selected groups in a region report at least **1 GB (1,000,000,000
 bytes)** of combined CloudWatch `storedBytes`. This is current group-wide
 storage, **not** a requested-window or download-size estimate. Missing size
@@ -131,7 +136,7 @@ See AWS's [log-group metadata contract](https://docs.aws.amazon.com/AmazonCloudW
 
 The initial global limits are 2,000 EKS/Logs API requests, 100,000 imported log
 events and 100 MiB of log-message bytes (`--max-calls`, `--max-events`,
-`--max-bytes`; prefix with `--eks-` in auto). Identity/region discovery and SDK
+`--max-bytes`). Identity/region discovery and SDK
 retries are additional requests. Raw acquisition can exceed the byte budget by
 one CloudWatch page (up to 1 MiB), plus JSON/metadata overhead. Raw and imported
 copies both use disk. Responses are streamed to files, not accumulated as a log
@@ -147,29 +152,15 @@ request/data charges; this collector does not issue Logs Insights queries or exp
 Exports contain hashed `raw.jsonl` API envelopes and `events.jsonl`, published
 atomically to a new folder. Interruptions before publication discard private
 staging; rerun to recollect, not to resume an expired page token. A published
-partial-coverage snapshot is immutable. Auto verifies hashes and request scope
-before reusing it without AWS calls, imports `case.eks.duckdb` separately from
-CloudTrail, and passes `--other-events` to serve. `--skip-download` forbids online
-EKS collection; use `--eks-export` instead. `--no-serve` prints the attachment flag
-needed when starting later. Existing viewers do not reload attachments live.
-Auto also accepts repeatable `--other-events` paths to register any immutable
-import-other dataset. It records `case.datasets.json`, bound to the primary
-evidence identity, with source paths, SHA256s, row counts and physical offsets.
-Existing bindings retain their positions; later EKS, UAC or other datasets append
-without shifting existing row IDs. **EKS has no permanently last position.**
-Registered acquisition arrivals are included using the same append rule. Paths
-are deduplicated; missing/changed sources or a wrong-evidence binding stop startup
-rather than silently dropping or replacing data. There is no implicit removal.
-`serve --database` reads these saved bindings at startup without preparing or
-modifying them; it does not hot-reload a running viewer. Once a binding exists,
-new explicit or UAC-discovered sources must first be registered through auto;
-startup refuses transient additions whose order could be lost on a later reopen.
-Auto reports the ordered
-rows/offsets and keeps earlier bindings even if their original flags are omitted.
-When first recording a case, carry forward all existing manual `--other-events`
-flags in their current order: it cannot infer an already-running viewer's command.
-Keep the binding file with the case. Existing enrichment, annotation and primary
-evidence bindings must not be replaced merely to add data.
+partial-coverage snapshot is immutable. Offline `auto --kind eks --source FOLDER`
+verifies the export and admits its events into a named unit in the one case JSON,
+then explicitly prepares that unit. Browse IDs are persisted `source_record`
+values, not offsets calculated from attachment order or row counts. Reservations
+may leave gaps; never renumber evidence to close them. Existing viewers do not
+reload new units live. Reopen with `serve --case` after preparing all intended
+units, and regenerate sidecars whose prepared selection has changed. Keep the
+case JSON and every referenced raw/prepared artifact together; no old database
+or sidecar is discovered or adopted as a case acquisition.
 
 The timeline calls these records **other** events with origin
 `AWS EKS context and CloudWatch logs (AWS APIs only)`. Current API observations
@@ -257,15 +248,10 @@ included in the report. Completion records mean collection finished, **not** tha
 every API call was authorized or successful. Exports contain sensitive infrastructure
 metadata and are not encrypted.
 
-Online `auto` collects this snapshot by default and passes it to `serve` using
-`--inventory-export FOLDER`. `--skip-inventory` opts out. Offline `auto --source`
-and `auto --skip-download` never collect inventory or make inventory AWS calls;
-pass `--inventory-export FOLDER` to show an existing snapshot instead. Tool downloads
-and IP enrichment retain their separate existing defaults. Auto reuses only a
-completed, hash-verified inventory with matching requested regions/profile; it
-does not refresh an existing snapshot or recheck its account through AWS on resume.
-Use a new TARGET for a fresh configuration snapshot. An unknown, changed, partial
-or differently scoped inventory folder is refused, never overwritten.
+Collect inventory separately, then pass `--inventory-export FOLDER` to
+`serve --case` or offline `auto` to show that existing snapshot. Neither command
+collects or refreshes inventory. Use a new output folder for a fresh configuration
+snapshot; existing exports are never overwritten.
 
 ### 2. Get your CloudTrail export
 
@@ -307,7 +293,8 @@ Use your authenticated account ID in the path. Organization paths such as
 This direct mode does not require trail discovery permissions; it needs
 `s3:GetBucketLocation`, `s3:ListBucket`, `s3:GetObject` and, for KMS-encrypted
 objects, `kms:Decrypt`. Alternatively `download --cloudtrail-source auto` uses
-the same trailcheck gate as dated auto mode (including its Describe/Get/List permissions).
+the trailcheck readability gate described in the [user guide](user-guide.md#cloudtrail-trail-check),
+including its Describe/Get/List permissions.
 
 S3 collection lists all pages under the selected UTC delivery-date folders,
 downloads only matching nonempty account/Region/date `.json.gz` log files,
@@ -397,8 +384,9 @@ source/file mapping), and `checkpoint.sqlite`. Keep the whole directory private
 and outside Git (or under ignored `data/`). Import and browse with:
 
 ```powershell
-kamotrace import --source C:\cases\example\download\cloudtrail.json --database C:\cases\example\case.duckdb
-kamotrace serve --database C:\cases\example\case.duckdb --ssm-export C:\cases\example\download\ssm.json
+kamotrace import --source C:\cases\example\download\cloudtrail.json --case C:\cases\example\case.json --unit cloudtrail-1
+kamotrace prepare --case C:\cases\example\case.json --unit cloudtrail-1
+kamotrace serve --case C:\cases\example\case.json --ssm-export C:\cases\example\download\ssm.json
 ```
 
 CloudTrail Event History provides available **management events from the last
@@ -470,7 +458,7 @@ produce findings that need administrator review; they are not silently ignored.
 Access Analyzer checks **policy syntax and security recommendations, not effective
 access**. After the administrator grants the reviewed policy, use the same role
 to rerun `trailcheck`, `ssmcheck` and `inventory`, then collect the selected logs
-with `download` or `auto`. Check reports for denied/unknown results: audit success
+with `download`. Check reports for denied/unknown results: audit success
 alone does not test S3 object reads or KMS decryption. A successful download tests
 only the selected, available objects, not missing/expired logs or all possible
 destinations. Cross-account policies, SCPs and other explicit denies still apply.
@@ -478,11 +466,11 @@ destinations. Cross-account policies, SCPs and other explicit denies still apply
 The following is an example **identity policy for the investigator's AWS role or
 user**, covering `trailcheck`, `ssmcheck` and `download` (CloudTrail Event History,
 S3 trail logs, SSM history/output and configured S3/CloudWatch transcripts), plus
-the current network `inventory` snapshot that online `auto` collects by default.
+the current network snapshot collected by standalone `inventory`.
 It grants no AWS writes and is **not a service delivery policy**: it does not
 enable logging or grant CloudTrail or the SSM Agent permission to deliver logs.
-Omit the `ReadNetworkInventory` statement if not collecting inventory (for
-example, with `auto --skip-inventory`); the other statements cover log collection.
+Omit the `ReadNetworkInventory` statement if not collecting inventory;
+the other statements cover log collection.
 
 Replace every uppercase placeholder before attaching the policy. Use `aws`,
 `aws-us-gov` or `aws-cn` for `PARTITION` as appropriate. The arrays illustrate
@@ -709,58 +697,62 @@ Put `event_history.json` in a case folder, then run:
 
 ```powershell
 Set-Location C:\cases\example
-kamotrace import --source event_history.json --database case.duckdb
+kamotrace import --source event_history.json --case case.json --unit cloudtrail-1
+kamotrace prepare --case case.json --unit cloudtrail-1
 ```
 
 The importer preserves the original records and JSON numeric precision. It
 records the source file's SHA-256 hash and a canonical hash for each record.
-It refuses to overwrite an existing database.
+Raw admission never overwrites evidence; preparation is a separate derived artifact.
 
 #### Multiple files, gzip and stdin
 
-Combine regional files into **one new database in one invocation**, without
+Combine regional files into **one acquisition in one invocation**, without
 manually merging JSON. Mix plain JSON and gzip inputs; `--source` is repeatable
 and also accepts several paths after it:
 
 ```powershell
-kamotrace import --source C:\cases\example\us-east-1.json --source C:\cases\example\ap-southeast-1.json.gz --database C:\cases\example\combined.duckdb
+kamotrace import --source C:\cases\example\us-east-1.json --source C:\cases\example\ap-southeast-1.json.gz --case C:\cases\example\case.json --unit regional-1
 ```
 
 For many S3 trail files, pass a **CloudTrail-only folder**. It is searched
 recursively for `.json` and `.json.gz` files in sorted path order:
 
 ```powershell
-kamotrace import --source C:\cases\example\trail-logs --database C:\cases\example\combined.duckdb
+kamotrace import --source C:\cases\example\trail-logs --case C:\cases\example\case.json --unit s3-trail-1
 ```
 
-Or pipe one complete `{"Records": [...]}` document into `--source -` (POSIX shell):
+Fresh-case admission requires rereadable input files, not stdin. Save a stream
+to a new evidence file first (POSIX shell):
 
 ```sh
-gzip -dc cloudtrail.json.gz | kamotrace import --source - --database case.duckdb
+gzip -dc cloudtrail.json.gz > retained-cloudtrail.json
+kamotrace import --source retained-cloudtrail.json --case case.json --unit stream-1
 ```
 
-Stdin also accepts gzip bytes directly, so decompression is optional. Use a
-binary-preserving pipe; older PowerShell text pipelines may change bytes.
+Gzip files can also be admitted directly without decompression. Use
+binary-preserving tooling when saving a stream; older PowerShell text pipelines may change bytes.
 Concatenating several JSON documents is not a merge: pass them as separate sources.
 Do not pass a whole downloader directory containing SSM/manifest/log JSON as a
 CloudTrail folder; use its `cloudtrail.json` or `cloudtrail.json.gz` explicitly.
 
 Imports never append to or replace existing evidence. To keep regions separate,
-import each file into its own database; to combine them, select the entire file
-set when creating a new database. All records, including duplicates across
+admit each file under its own unit key; to combine them, select the entire file
+set for one acquisition. Explicitly prepare every intended unit before serving.
+All records, including duplicates across
 overlapping files, are preserved with their original `awsRegion`. Each event has
 `source_file` and a one-based `source_ordinal`; `import_sources` and `build_info`
 retain each source's byte hash, size, record count and global record range.
 Single-source identity remains that source's SHA-256 (of compressed bytes for
 gzip); multi-source identity hashes the ordered source hashes, not local paths.
-Changing input order changes the identity because it changes global record IDs.
-Stdin is spooled to private temporary disk for hashing and independent record
-verification, then deleted. Keep your original inputs for reproducibility and
-Suzaku; a stdin import cannot recreate the incoming original file for you.
+Changing input order changes the acquisition identity. The case also binds
+source paths, kind and options to its unit key. Browse IDs are persisted sparse
+`source_record` values, never inferred from counts or attachment offsets.
+Keep original inputs for reproducibility and Suzaku.
 
 #### Other-event JSONL
 
-Use `kamotrace import-other --source events.jsonl --database other.duckdb --origin "Where these events came from and how they were converted"` for arbitrary non-CloudTrail records. Each line requires `date` (RFC 3339 with offset) and non-null `content`; optional `ip` and `identity` are strings. Nested content remains JSON with exact numbers. The command streams plain/gzip JSONL into a new immutable database, retaining file hashes and original line numbers; invalid records fail the whole import. Attach it with `serve --database case.duckdb --other-events other.duckdb`, or serve `other.duckdb` as the primary database for an other-events-only case. See [other events and editable manual key events](user-guide.md#other-events-and-manual-key-events) for the schema, provenance and backup rules. Investigator-entered manual events use a separate revisioned DuckDB and do not modify imported evidence.
+Use `kamotrace import-other --source events.jsonl --case case.json --unit application-1 --origin "Where these events came from and how they were converted"` for arbitrary non-CloudTrail records, then `kamotrace prepare --case case.json --unit application-1`. Each line requires `date` (RFC 3339 with offset) and non-null `content`; optional `ip` and `identity` are strings. Nested content remains JSON with exact numbers. The command streams plain/gzip JSONL into a new immutable raw artifact, retaining file hashes and original line numbers; invalid records fail the whole import. Open with `kamotrace serve --case case.json`; a case need not contain CloudTrail. See [other events and editable manual key events](user-guide.md#other-events-and-manual-key-events) for the schema, provenance and backup rules. Investigator-entered manual events use a separate revisioned DuckDB and do not modify imported evidence.
 
 ### 4. Add GeoIP information
 
@@ -776,7 +768,7 @@ Use the folder printed by `get-dbip` in the next command. This example uses the
 October 2026 release; replace the path with your downloaded folder:
 
 ```powershell
-kamotrace enrich --database case.duckdb --geolite2 "$HOME\.kamotrace\tools\dbip-lite-2026-10"
+kamotrace enrich --case case.json --geolite2 "$HOME\.kamotrace\tools\dbip-lite-2026-10"
 ```
 
 Lookups run offline and the original evidence stays unchanged. IP geography is
@@ -790,18 +782,20 @@ detections are leads, not confirmed findings.
 ### 5. Open the browser
 
 ```powershell
-kamotrace serve --database case.duckdb
+kamotrace serve --case case.json
 ```
 
 Open **http://127.0.0.1:8765** on the computer running KamoTrace. Leave the
 server running while you investigate. It loads the IP enrichment and Suzaku
-detection files beside `case.duckdb` automatically when they are present.
+detection files beside `case.json` automatically when present and bound to the
+same declared prepared selection. Startup only verifies and attaches; it never
+prepares missing units or adopts old databases/sidecars.
 Startup logs on stderr show timestamped loading stages and sidecar paths before
 the server accepts requests, followed by the total startup time and ready URL.
 MCP is served at **http://127.0.0.1:8765/mcp** on the same port by default.
 Startup prints the URL and Amp/Claude Code setup commands. For a local subprocess
 connection instead, use `--mcp-transport stdio`; startup then prints the stdio
-registration commands. Both `serve` and `auto` accept this option.
+registration commands. This option belongs to `serve`, not `auto`.
 If startup is slow, the last stage message identifies the work still in progress.
 
 ### 6. Find events and save findings

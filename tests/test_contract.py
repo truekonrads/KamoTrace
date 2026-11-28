@@ -1,5 +1,5 @@
 """HTTP, MCP and Suzaku contract tests with a disposable, real CloudTrail DuckDB database."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -27,10 +27,9 @@ from mcp import Client, StdioServerParameters
 import duckdb
 
 from kamotrace.importer import build
-from kamotrace.server import Handler, Store
+from kamotrace.server import Handler
 from kamotrace.mcp_server import http_transport
-from kamotrace.enrich import build as enrich
-from kamotrace.suzaku import import_timeline
+from case_fixtures import case_for, open_fixture as Store, enrich, import_timeline
 
 
 def inventory_fixture(folder):
@@ -505,7 +504,8 @@ class BrowserContract(unittest.TestCase):
     def check_startup(self, transport):
         with tempfile.TemporaryDirectory() as temporary:
             process = subprocess.Popen([sys.executable, "-m", "kamotrace", "serve",
-                "--database", str(self.database), "--ssm-export", str(self.ssm_export),
+                "--case", str(self.database.with_suffix(".fixture-case.json")), "--ssm-export", str(self.ssm_export),
+                "--enrichment", str(self.database.with_suffix(".enrichment.duckdb")),
                 "--annotations", str(Path(temporary) / "reviews.sqlite3"), "--bind", "127.0.0.1", "--port", "0",
                 *(["--mcp-transport", "stdio", "--inventory-export", str(self.inventory_export)] if transport == "stdio" else [])],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -552,7 +552,7 @@ class BrowserContract(unittest.TestCase):
                               "Loading IP enrichment", "Loading and linking SSM commands", "Loading Suzaku detections",
                               "Calculating event counts", "Binding HTTP server", "Startup complete in"):
                     self.assertIn(stage, output)
-                self.assertIn(str(self.database), output)
+                self.assertIn(str(self.database.with_suffix(".fixture-case.json")), output)
                 self.assertIn(str(self.database.with_suffix(".enrichment.duckdb")), output)
                 self.assertIn(str(self.ssm_export), output)
                 self.assertRegex(output, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4} INFO")
@@ -703,7 +703,8 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(status, 200, created)
         second = created["id"]
         listed = {n["id"]: n for n in self.call("/api/reviews")[1]["annotations"]}
-        self.assertEqual((listed[second]["context"], listed[second]["events"], listed[nid]["context"]), (context, 1, None))
+        self.assertEqual((listed[second]["context"], listed[second]["events"], listed[nid]["context"]),
+                         ({**context, "case_context": {k: self.store.coverage[k] for k in ("case_id", "selection_id")}}, 1, None))
         write(action="link", id=second, hashes=[hashes[0], hashes[4]])
         self.assertEqual(self.call("/api/events", {"annotation_id": second})[1]["last_row"], 2)
         write(action="unlink", id=second, hashes=[hashes[4]])
@@ -1125,8 +1126,9 @@ class BrowserContract(unittest.TestCase):
 
     def test_large_detection_sidecar_preserves_all_rules_and_lists(self):
         sidecar = Path(self.temp.name) / "bulk.detections.duckdb"
-        info = json.loads(self.store.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
-        run = {"schema_version": 1, "evidence_source_sha256": info["source_sha256"], "evidence_records": 5}
+        from kamotrace.suzaku import evidence_identity
+        identity = evidence_identity(self.store.connection)
+        run = {"schema_version": 1, "evidence_source_sha256": identity[0], "evidence_records": identity[1]}
         out = duckdb.connect(str(sidecar))
         try:
             out.execute("CREATE TABLE suzaku_run (metadata JSON)")
@@ -1362,7 +1364,7 @@ class BrowserContract(unittest.TestCase):
         self.assertEqual(rows["192.0.2.1"][:4], ("Indonesia", "ID", None, 64500))
         self.assertEqual([p["file"] for p in provenance], ["dbip-city-lite-2026-10.mmdb", "dbip-asn-lite-2026-10.mmdb"])
 
-    def test_older_annotation_sidecar_is_migrated_additively(self):
+    def test_older_annotation_sidecar_is_rejected_unchanged(self):
         import sqlite3
         path = Path(self.temp.name) / "old.sqlite3"
         old = sqlite3.connect(path)
@@ -1373,17 +1375,15 @@ class BrowserContract(unittest.TestCase):
         old.execute("INSERT INTO annotation_events VALUES (1, ?)", (rows[0]["record_sha256"],))
         old.commit()
         old.close()
-        store = Store(self.database, annotations=path)
-        try:
-            self.assertEqual([(n["body"], n["context"], n["events"]) for n in store.reviews_list()["annotations"]], [("kept", None, 1)])
-        finally:
-            store.connection.close()
-            store.reviews.close()
-        # Opening it binds the sidecar to this evidence; another case's database is refused.
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "legacy Findings sidecar"):
+            Store(self.database, annotations=path)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+        # An old sidecar cannot be adopted by a different fresh case either.
         source = Path(self.temp.name) / "other.json"
         source.write_text(json.dumps({"Records": [{"eventID": "x", "eventTime": "2026-10-24T00:00:00Z"}]}), encoding="utf-8")
         build(source, Path(self.temp.name) / "other.duckdb")
-        with self.assertRaisesRegex(ValueError, "different evidence database"):
+        with self.assertRaisesRegex(ValueError, "legacy Findings sidecar"):
             Store(Path(self.temp.name) / "other.duckdb", annotations=path)
 
     def test_ssm_groups_systems_plugins_enrichment_and_exact_event_links(self):
@@ -2649,7 +2649,7 @@ class BrowserContract(unittest.TestCase):
 class GuardDutyContract(unittest.TestCase):
     def test_guardduty_context_http_mcp_and_evidence_safety(self):
         from kamotrace.cli import main
-        from kamotrace.guardduty import build as import_findings
+        from case_fixtures import guardduty as import_findings
         with tempfile.TemporaryDirectory() as temporary, ExitStack() as cleanup:
             root = Path(temporary)
             source, database, findings = root / "events.json", root / "case.duckdb", root / "guardduty.json"
@@ -2673,8 +2673,8 @@ class GuardDutyContract(unittest.TestCase):
             unsupported = {**finding, "Arn": finding["Arn"] + "-unsupported", "Id": "unsupported", "Resource": {},
                            "Service": {"EventFirstSeen": "2026-10-01T01:00:00Z", "EventLastSeen": "2026-10-01T01:00:00Z"}}
             findings.write_text(json.dumps({"Findings": [finding, unsupported]}))
-            self.assertEqual(main(["guardduty", "--database", str(database), "--findings", str(findings)]), 0)
             sidecar = database.with_suffix(".guardduty.duckdb")
+            import_findings(database, findings, sidecar)
             with duckdb.connect(str(sidecar), read_only=True) as connection:
                 self.assertEqual(connection.execute("SELECT raw_finding->>'$.large_number' FROM findings LIMIT 1").fetchone()[0], "9007199254740993")
             with self.assertRaises(FileExistsError):
@@ -2769,11 +2769,12 @@ class GuardDutyContract(unittest.TestCase):
             anyio.run(mcp_contract)
             # Both sources must coexist without numeric catalog-key collisions or altered rule filters.
             suzaku = root / "suzaku.detections.duckdb"
-            info = json.loads(store.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
+            from kamotrace.suzaku import evidence_identity
+            identity = evidence_identity(store.connection)
             with duckdb.connect(str(suzaku)) as out:
                 out.execute("CREATE TABLE suzaku_run(metadata JSON)")
                 out.execute("INSERT INTO suzaku_run VALUES (?)", [json.dumps({"schema_version": 1,
-                    "evidence_source_sha256": info["source_sha256"], "evidence_records": len(records)})])
+                    "evidence_source_sha256": identity[0], "evidence_records": identity[1]})])
                 out.execute("""CREATE TABLE detections AS SELECT 2::BIGINT AS source_record,
                     'sigma-test' AS rule_id, 'Synthetic Sigma' AS rule_title, 'low' AS level,
                     1::TINYINT AS level_rank, ['Discovery']::VARCHAR[] AS tactics,
@@ -2801,14 +2802,16 @@ class GuardDutyContract(unittest.TestCase):
             critical = {**finding, "Title": "Later critical snapshot", "Severity": 9.5}
             findings.write_text(json.dumps({"Findings": [finding, finding, point, fallback, updated_only, last_only, unknown_time, low, critical]}))
             import_findings(database, findings, sidecar, replace=True)
+            from kamotrace.datasets import read_case
+            snapshot_start = read_case(database.with_suffix(".fixture-case.json"))["units"][-1]["raw"]["ranges"][0][0]
             reopened = Store(database)
             try:
                 independent = reopened.query(timeline_query)["data"]
                 self.assertEqual(len(independent), 9)
                 self.assertEqual(len({row["id"] for row in independent}), 9)
                 self.assertEqual(len({row["record_sha256"] for row in independent}), 8)
-                self.assertEqual(by_arn[finding["Arn"]]["record_sha256"], next(row["record_sha256"] for row in independent if row["id"] == len(records) + 1))
-                self.assertEqual({r["id"] for r in reopened.detail(len(records) + 1)["related_events"]}, {2, 3})
+                self.assertEqual(by_arn[finding["Arn"]]["record_sha256"], next(row["record_sha256"] for row in independent if row["id"] == snapshot_start))
+                self.assertEqual({r["id"] for r in reopened.detail(snapshot_start)["related_events"]}, {2, 3})
                 self.assertEqual(len(reopened.detail(2)["guardduty_findings"]), 4)
                 self.assertEqual([json.loads(r["raw_finding"]) for r in reopened.detail(2)["guardduty_findings"]], [finding, finding, low, critical])
                 catalog = reopened.detections_list()["rules"][0]
@@ -2819,16 +2822,16 @@ class GuardDutyContract(unittest.TestCase):
                 for retained in catalog["snapshots"]:
                     self.assertEqual(json.loads(reopened.detail(retained["id"])["raw_json"])["Title"], retained["title"].removeprefix("GuardDuty context (not exact): "))
                 self.assertEqual(reopened.query({"tags": ["snapshot-review"]})["last_row"], 2)
-                self.assertEqual(reopened.detail(len(records) + 3)["tags"], [])
-                self.assertEqual(reopened.detail(len(records) + 3)["related_events_total"], 0)
-                self.assertIn("point observation", reopened.detail(len(records) + 3)["guardduty"]["link_status"])
-                self.assertEqual(reopened.detail(len(records) + 3)["guardduty"]["sample_status"], "sample=false")
-                self.assertEqual(reopened.detail(len(records) + 4)["guardduty"]["time_basis"], "CreatedAt")
-                self.assertEqual(reopened.detail(len(records) + 4)["guardduty"]["sample_status"], "sample=unknown")
-                self.assertEqual(next(r["time_local"] for r in independent if r["id"] == len(records) + 4), "2026-10-01 03:00:00")
-                self.assertEqual([reopened.detail(len(records) + i)["guardduty"]["time_basis"] for i in (5, 6, 7)],
+                self.assertEqual(reopened.detail(snapshot_start + 2)["tags"], [])
+                self.assertEqual(reopened.detail(snapshot_start + 2)["related_events_total"], 0)
+                self.assertIn("point observation", reopened.detail(snapshot_start + 2)["guardduty"]["link_status"])
+                self.assertEqual(reopened.detail(snapshot_start + 2)["guardduty"]["sample_status"], "sample=false")
+                self.assertEqual(reopened.detail(snapshot_start + 3)["guardduty"]["time_basis"], "CreatedAt")
+                self.assertEqual(reopened.detail(snapshot_start + 3)["guardduty"]["sample_status"], "sample=unknown")
+                self.assertEqual(next(r["time_local"] for r in independent if r["id"] == snapshot_start + 3), "2026-10-01 03:00:00")
+                self.assertEqual([reopened.detail(snapshot_start + i - 1)["guardduty"]["time_basis"] for i in (5, 6, 7)],
                                  ["UpdatedAt", "Service.EventLastSeen", "unknown"])
-                self.assertIsNone(reopened.detail(len(records) + 7)["event_time_ms"])
+                self.assertIsNone(reopened.detail(snapshot_start + 6)["event_time_ms"])
                 self.assertEqual(reopened.query({**timeline_query, "start": "2026-10-01T00:00:00Z"})["last_row"], 8)
             finally:
                 reopened.connection.close()
@@ -2938,134 +2941,692 @@ class MFAContract(unittest.TestCase):
         self.assertEqual([m["identity"]["event_count"] for m in session["matches"] if m["source"] == "cloudtrail"], [1])
 
 
-class OtherEventsContract(unittest.TestCase):
-    call = BrowserContract.call
+class CaseManifestContract(unittest.TestCase):
+    def test_histogram_preserves_submillisecond_occurrences_and_half_open_buckets(self):
+        from kamotrace.datasets import admit
+        from kamotrace.event_index import prepare
+        # The earliest two occurrences round UP to a millisecond boundary. The
+        # other three distinguish exact inclusion, exclusive end and bucket side.
+        for edge in ("1970-01-01T00:00:00+00:00", "2026-01-03T16:00:00+00:00"):
+            boundary = datetime.fromisoformat(edge)
+            stamps = [(boundary + timedelta(microseconds=offset)).isoformat()
+                      for offset in (-194, -194, 0, 194, 1001)]
+            with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
+                root = Path(folder)
+                case, source = root / "case.json", root / "events.json"
+                source.write_text(json.dumps({"Records": [
+                    {"eventID": str(i), "eventTime": stamp, "eventName": "SyntheticFraction"}
+                    for i, stamp in enumerate(stamps)]}))
+                admit(case, "fractional-acquisition", "cloudtrail", [source])
+                prepare(case, ["fractional-acquisition"])
+                store = Store(case=case)
+                cleanup.callback(store.selection_directory.cleanup)
+                cleanup.callback(store.connection.close)
+                cleanup.callback(store.reviews.close)
+                server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+                cleanup.callback(server.server_close)
+                worker = threading.Thread(target=server.serve_forever, daemon=True)
+                worker.start()
+                cleanup.callback(worker.join)
+                cleanup.callback(server.shutdown)
+                self.url = f"http://127.0.0.1:{server.server_port}"
+                server.mcp_request = cleanup.enter_context(http_transport(self.url))
 
-    def test_persistent_index_reuse_invalidation_and_read_only_originals(self):
-        from kamotrace.other_events import EVENTS_VIEW, build as import_other
-        from kamotrace.importer import sha256, write_lock
+                for zone in ("UTC", "Asia/Singapore"):
+                    queries = [
+                        ({"bucket_minutes": 525600}, 5, None),
+                        # Singapore was UTC+07:30 at the epoch: half-hour
+                        # boundaries discriminate bucket sides in both eras/zones.
+                        ({"bucket_minutes": 30}, 5, [2, 3]),
+                        ({"bucket_minutes": 30, "start": stamps[0], "end": edge}, 2, [2]),
+                        ({"bucket_minutes": 30, "start": edge, "end": stamps[3]}, 1, [1]),
+                        ({"bucket_minutes": 30, "start": stamps[3], "end": stamps[4]}, 1, [1]),
+                    ]
+                    for query, expected, buckets in queries:
+                        with self.subTest(transport="http", edge=edge, zone=zone, query=query):
+                            body = {"timezone": zone, **query}
+                            status, events = BrowserContract.call(self, "/api/events", body)
+                            self.assertEqual(status, 200, events)
+                            self.assertEqual(events["last_row"], expected)
+                            status, histogram = BrowserContract.call(self, "/api/histogram", body)
+                            self.assertEqual(status, 200, histogram)
+                            self.assertEqual(histogram["total"], expected)
+                            if buckets is not None:
+                                self.assertEqual([r["events"] for r in histogram["data"]], buckets)
+
+                    async def session():
+                        async with Client(self.url + "/mcp") as client:
+                            for query, expected, buckets in queries:
+                                with self.subTest(transport="mcp", edge=edge, zone=zone, query=query):
+                                    result = await client.call_tool("event_histogram", {
+                                        "bucket_minutes": query["bucket_minutes"], "query": {"timezone": zone,
+                                            **{k: v for k, v in query.items() if k != "bucket_minutes"}}})
+                                    self.assertFalse(result.is_error, result)
+                                    histogram = result.structured_content
+                                    self.assertEqual(histogram["total"], expected)
+                                    if buckets is not None:
+                                        self.assertEqual([r["events"] for r in histogram["buckets"]], buckets)
+                    anyio.run(session)
+
+    def test_sparse_case_ssm_occurrences_and_manual_edits_through_http_and_mcp(self):
+        from kamotrace.datasets import admit
+        from kamotrace.event_index import prepare
+        from kamotrace.other_events import MANUAL_BASE
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
+            root = Path(folder)
+            case, source, export = root / "case.json", root / "aws.json", root / "ssm.json"
+            event = {"eventID": "duplicate-occurrence", "eventTime": "2026-10-25T00:00:00Z",
+                "eventName": "SendCommand", "eventSource": "ssm.amazonaws.com",
+                "recipientAccountId": "123", "awsRegion": "us-east-1",
+                "responseElements": {"command": {"commandId": "exact-command"}},
+                "requestParameters": {"number": 9007199254740993}}
+            source.write_text(json.dumps({"Records": [event, event,
+                {**event, "eventID": "unprepared"}, {**event, "recipientAccountId": "456"}]}))
+            admit(case, "excluded-acquisition", "cloudtrail", [source])
+            unit = admit(case, "selected-acquisition", "cloudtrail", [source])
+            first = unit["raw"]["ranges"][0][0]
+            self.assertGreater(first, 4)
+            prepare(case, ["selected-acquisition"], [[first, first + 2]])
+            command = {"CommandId": "exact-command", "RequestedDateTime": "2026-10-25T00:00:00Z",
+                       "InstanceIds": ["i-alpha", "i-beta"], "Parameters": {"commands": ["synthetic only"]}}
+            export.write_text(json.dumps({"account_id": "123",
+                "commands": [{"region": region, "record": command} for region in ("us-east-1", "eu-west-1")],
+                "invocations": [{"region": "us-east-1", "record": {"CommandId": "exact-command",
+                    "InstanceId": "i-beta", "CommandPlugins": [{"Name": "combined", "Output": "combined only"}]}}],
+                "invocation_details": [{"region": "us-east-1", "record": {"CommandId": "exact-command",
+                    "InstanceId": "i-alpha", "PluginName": plugin, "StandardOutputContent": stdout,
+                    "StandardErrorContent": stderr}} for plugin, stdout, stderr in
+                    [("first", "alpha output", ""), ("second", "", "alpha error")]],
+                "cloudtrail_records": [event]}))
+            store = Store(case=case, units=["selected-acquisition"], ssm_export=export)
+            cleanup.callback(store.selection_directory.cleanup)
+            cleanup.callback(store.connection.close)
+            cleanup.callback(store.reviews.close)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+            cleanup.callback(server.server_close)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            cleanup.callback(worker.join)
+            cleanup.callback(server.shutdown)
+            self.url = f"http://127.0.0.1:{server.server_port}"
+            server.mcp_request = cleanup.enter_context(http_transport(self.url))
+
+            def rest(route, body=None, status=200):
+                code, value = BrowserContract.call(self, route, body)
+                self.assertEqual(code, status, value)
+                return value
+
+            key = '["123","us-east-1","exact-command"]'
+            linked = rest("/api/events", {"command_key": key})
+            self.assertEqual({row["id"] for row in linked["data"]}, {first, first + 1})
+            self.assertEqual(rest("/api/histogram", {"command_key": key})["total"], 2)
+            detail = rest("/api/ssm-detail", {"key": key})
+            self.assertEqual({row["id"] for row in detail["events"]}, {first, first + 1})
+            self.assertEqual(len(detail["events"]), 2)  # Supplemental copy adds no occurrence.
+            systems = {row["instance_id"]: row for row in detail["systems"]}
+            self.assertEqual([row["PluginName"] for row in systems["i-alpha"]["details"]], ["first", "second"])
+            self.assertEqual(systems["i-beta"]["details"], [])
+            self.assertEqual(systems["i-beta"]["invocation"]["CommandPlugins"][0]["Output"], "combined only")
+            self.assertEqual(rest("/api/ssm-detail", {"key": '["123","eu-west-1","exact-command"]'})["events"], [])
+            self.assertEqual(rest(f"/api/events/{first}")["ssm_commands"], [{"key": key, "command_id": "exact-command"}])
+            self.assertEqual(rest(f"/api/events/{first + 1}")["ssm_commands"], [{"key": key, "command_id": "exact-command"}])
+            rest(f"/api/events/{first + 2}", status=404)
+            rest("/api/events/1", status=404)
+            raw = '{"date":"2026-10-25T00:00:00Z","content":{"amount":9007199254740993}}'
+
+            async def session():
+                async with Client(self.url + "/mcp") as client:
+                    result = (await client.call_tool("get_ssm_command", {"key": key})).structured_content
+                    self.assertEqual({row["id"] for row in result["events"]}, {first, first + 1})
+                    created = await client.call_tool("create_manual_event", {"record_json": raw, "origin": "Synthetic review"})
+                    self.assertFalse(created.is_error, created)
+                    value = created.structured_content
+                    self.assertGreater(value["id"], MANUAL_BASE)
+                    changed = {**value, "record_json": raw.replace("amount", "corrected_amount"), "origin": "Synthetic correction"}
+                    changed.pop("record_sha256")
+                    edited = await client.call_tool("edit_manual_event", changed)
+                    self.assertFalse(edited.is_error, edited)
+                    self.assertEqual(edited.structured_content["id"], value["id"])
+                    stale = await client.call_tool("edit_manual_event", changed)
+                    self.assertTrue(stale.is_error)
+                    event_detail = (await client.call_tool("get_event", {"id": value["id"]})).structured_content
+                    self.assertIn("9007199254740993", event_detail["raw_json"])
+                    rest("/api/manual-events", {**changed, "id": first}, status=400)
+                    return value["id"]
+            manual_id = anyio.run(session)
+            self.assertEqual(rest("/api/events", {})["last_row"], 3)
+            cleanup.close()
+            # The same stable case owns manual state across selection changes/reopen.
+            reopened = Store(case=case, units=["selected-acquisition"], ssm_export=export)
+            try:
+                self.assertIn("corrected_amount", reopened.detail(manual_id)["raw_json"])
+                self.assertEqual(reopened.meta["total"], 3)
+                self.assertEqual(reopened.coverage["excluded_units"], ["excluded-acquisition"])
+            finally:
+                reopened.connection.close()
+                reopened.reviews.close()
+                reopened.selection_directory.cleanup()
+            # Test-only deletion exercises durable high-water state, not a delete API.
+            manual_path = case.with_suffix(".manual.duckdb")
+            with duckdb.connect(str(manual_path)) as connection:
+                connection.execute("DELETE FROM raw_events")
+                connection.execute("DELETE FROM revisions")
+            from kamotrace.other_events import save_manual
+            identity = [store.case_manifest["case_id"]]
+            replacement = save_manual(manual_path, identity, {"record_json": raw, "origin": "Synthetic replacement"})
+            self.assertEqual(replacement[0], manual_id + 1)
+            with duckdb.connect(str(manual_path)) as connection:
+                connection.execute("UPDATE manual_ids SET next_record=?", [2 ** 53 - 1])
+            last = save_manual(manual_path, identity, {"record_json": raw, "origin": "Synthetic last exact ID"})
+            self.assertEqual(last[0], 2 ** 53 - 1)
+            from kamotrace.importer import sha256
+            before = sha256(manual_path)
+            with self.assertRaisesRegex(ValueError, "namespace exhausted"):
+                save_manual(manual_path, identity, {"record_json": raw, "origin": "Synthetic overflow"})
+            self.assertEqual(sha256(manual_path), before)
+
+    def test_guardduty_snapshot_ids_and_links_use_declared_case_coverage(self):
+        from kamotrace.cli import main
+        from kamotrace.datasets import admit, read_case
+        from kamotrace.event_index import prepare
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            source, database = root / "source.jsonl", root / "events.duckdb"
-            raw = '{"date":"2026-10-25T00:00:00.123456Z","content":{"n":9007199254740993,"d":0.123456789012345678901234567890,"text":"日本語"}}'
-            source.write_text(raw + "\n" + raw, encoding="utf-8")
-            import_other([source], database, "Synthetic repeated observations")
-            second = root / "second.duckdb"
-            source.write_text('{"date":"2026-10-26T00:00:00Z","content":"asymmetric second source"}')
-            import_other([source], second, "Synthetic second source")
-            cache = database.with_suffix(".event-index.duckdb")
-            before = {p: sha256(p) for p in (database, second)}
+            case, source, findings = root / "case.json", root / "aws.json", root / "findings.json"
+            source.write_text(json.dumps({"Records": [
+                {"eventID": "event-" + str(i), "eventTime": f"2026-10-25T00:00:0{i}Z",
+                 "eventName": "SendCommand", "awsRegion": "us-east-1",
+                 "userIdentity": {"accountId": "123", "accessKeyId": "SYNTHETIC"}} for i in range(3)]}))
+            admit(case, "AWS", "cloudtrail", [source])
+            prepare(case, ["AWS"], [[1, 3]])
+            finding = {"Arn": "arn:aws:guardduty:us-east-1:123:detector/synthetic/finding/one", "Id": "one",
+                "AccountId": "123", "Region": "us-east-1", "Type": "Synthetic", "Severity": 7,
+                "Service": {"EventFirstSeen": "2026-10-25T00:00:01Z", "EventLastSeen": "2026-10-25T00:00:02Z"},
+                "Resource": {"AccessKeyDetails": {"AccessKeyId": "SYNTHETIC"}}, "large": 9007199254740993}
+            findings.write_text(json.dumps({"Findings": [finding, finding]}))
+            self.assertEqual(main(["guardduty", "--case", str(case), "--snapshot-unit", "alerts-1",
+                                  "--findings", str(findings)]), 0)
+            before = read_case(case)
+            records = before["units"][1]["raw"]["ranges"][0][0]
+            self.assertGreater(records, 3)
+            store = Store(case=case)
+            try:
+                self.assertEqual(store.meta["total"], 4)
+                snapshots = store.query({"filters": [{"field": "event_type", "op": "eq", "value": "guardduty"}]})["data"]
+                self.assertEqual({r["id"] for r in snapshots}, {records, records + 1})
+                self.assertEqual(len({r["record_sha256"] for r in snapshots}), 1)
+                for row in snapshots:
+                    detail = store.detail(row["id"])
+                    self.assertIn("9007199254740993", detail["raw_json"])
+                    self.assertEqual([e["id"] for e in detail["related_events"]], [2])
+                self.assertEqual({e["id"] for e in store.detail(2)["related_events"]}, {records, records + 1})
+                self.assertEqual(store.detail(1)["related_events"], [])
+                self.assertIsNone(store.detail(3))
+            finally:
+                store.connection.close()
+                store.reviews.close()
+                store.selection_directory.cleanup()
+            # A repeated acquisition is reused; rebuilding links cannot reissue snapshot IDs.
+            self.assertEqual(main(["guardduty", "--case", str(case), "--snapshot-unit", "alerts-1",
+                                  "--findings", str(findings), "--replace"]), 0)
+            self.assertEqual(read_case(case), before)
 
-            def open_store(paths=()):
-                store = Store(database, other_events=paths)
-                self.addCleanup(store.selection_directory.cleanup)
-                return store
+    def test_case_sidecars_and_saved_queries_bind_exact_selected_coverage(self):
+        from kamotrace.cli import main
+        from kamotrace.datasets import admit
+        from kamotrace.event_index import prepare
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            case, source, geo = root / "case.json", root / "aws.json", root / "geo.jsonl"
+            source.write_text(json.dumps({"Records": [
+                {"eventID": f"event-{i}", "eventTime": f"2026-10-25T00:00:0{i}Z",
+                 "eventName": "SendCommand", "awsRegion": "us-east-1", "sourceIPAddress": "192.0.2.1"}
+                for i in range(2)]}))
+            geo.write_text(json.dumps({"ip": "192.0.2.1", "country": "Synthetic country"}) + "\n")
+            admit(case, "A", "cloudtrail", [source])
+            prepare(case, ["A"], [[1, 2]])
+            timeline = root / "timeline.duckdb"
+            with duckdb.connect(str(timeline)) as connection:
+                connection.execute('''CREATE TABLE timeline("Timestamp" TIMESTAMP, RuleTitle VARCHAR,
+                    "Level" VARCHAR, EventName VARCHAR, AwsRegion VARCHAR, EventID VARCHAR, RuleAuthor VARCHAR,
+                    Tactics VARCHAR[], TechniqueIDs VARCHAR[], OtherTags VARCHAR[], RuleID VARCHAR);
+                    CREATE TABLE suzaku_meta(schema_version INTEGER, suzaku_version VARCHAR, command VARCHAR,
+                    timestamp_tz VARCHAR, rules_version VARCHAR, rules_count BIGINT);
+                    INSERT INTO suzaku_meta VALUES (1, '3.0.0', 'aws-ct-timeline', 'UTC', 'synthetic', 1);
+                    INSERT INTO timeline VALUES ('2026-10-25 00:00:00', 'Synthetic rule', 'high',
+                        'SendCommand', 'us-east-1', 'event-0', 'synthetic', [], [], [], 'synthetic-rule'),
+                        ('2026-10-25 00:00:01', 'Synthetic rule', 'high',
+                        'SendCommand', 'us-east-1', 'event-1', 'synthetic', [], [], [], 'synthetic-rule')''')
+            self.assertIn(main(["enrich", "--case", str(case), "--unit", "A", "--jsonl", str(geo)]), (None, 0))
+            self.assertIn(main(["suzaku", "--case", str(case), "--unit", "A", "--timeline", str(timeline)]), (None, 0))
+            store = Store(case=case)
+            try:
+                row = store.query({})["data"][0]
+                self.assertEqual(row["country"], "Synthetic country")
+                self.assertEqual([d["rule_id"] for d in row["detections"]], ["synthetic-rule"])
+                store.review_write({"action": "annotate", "body": "Synthetic finding",
+                    "hashes": [row["record_sha256"]], "context": {"search": "SendCommand"}})
+                context = json.loads(store.reviews.execute("SELECT context FROM annotations").fetchone()[0])
+                self.assertEqual(store.query(context)["last_row"], 1)
+            finally:
+                store.connection.close()
+                store.reviews.close()
+                store.selection_directory.cleanup()
+            prepare(case, ["A"])
+            # Old sidecars cannot silently answer a newly widened selection.
+            with self.assertRaisesRegex(ValueError, "different evidence"):
+                Store(case=case)
+            # Explicit fresh sidecar paths preserve the independent Findings store.
+            empty_enrichment = root / "new.enrichment.duckdb"
+            self.assertIn(main(["enrich", "--case", str(case), "--jsonl", str(geo),
+                                  "--output", str(empty_enrichment)]), (None, 0))
+            self.assertIn(main(["suzaku", "--case", str(case), "--timeline", str(timeline),
+                                  "--replace"]), (None, 0))
+            store = Store(case=case, enrichment=empty_enrichment)
+            try:
+                self.assertEqual(store.query({})["last_row"], 2)
+                with self.assertRaisesRegex(ValueError, "different case/coverage"):
+                    store.query(context)
+                with self.assertRaisesRegex(ValueError, "different case/coverage"):
+                    store.histogram(context)
+            finally:
+                store.connection.close()
+                store.reviews.close()
+                store.selection_directory.cleanup()
 
-            def close(store):
+    def test_uac_raw_admission_keeps_envelope_precision_and_occurrences(self):
+        from kamotrace.cli import main
+        from kamotrace.datasets import read_case
+        from kamotrace.importer import sha256
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "parse-only"
+            source.mkdir()
+            observation = {"ecs": {"version": "8.17.0"}, "@timestamp": "2021-03-08T01:02:00Z",
+                "event": {"id": "emission-one", "module": "tracequarry"}, "message": "synthetic session",
+                "host": {"id": "host-A", "ip": ["192.0.2.1", "192.0.2.1"]},
+                "uac": {"profile_version": "1.1.0", "run_id": "run-one", "collection": {"id": "collection-one"},
+                    "identity": {"policy": "source-emission-v1", "emission_id": "emission-one"}, "source_refs": [],
+                    "time": {"policy": "claim-time-v1", "selected": "source", "basis": "event_time",
+                             "candidates": [{"id": "source", "value": "2021-03-08T01:02:00Z"}]}},
+                "large": 9007199254740993}
+            text = json.dumps(observation)
+            (source / "observations.jsonl").write_text(text + "\n" + text + "\n")
+            (source / "source_index.json").write_text(json.dumps({"analysis": {"status": "not_run"},
+                "sources": [{"status": "partial", "uninterpreted_lines": 7}]}))
+            manifest = {"mode": "parse_only", "status": "complete", "ecs_version": "8.17.0", "uac_profile_version": "1.1.0",
+                "time_policy": "claim-time-v1", "identity_policy": "source-emission-v1", "deduplication": "none",
+                "run_id": "run-one", "collection_id": "collection-one", "input_verification": "hash_size_mtime_verified",
+                "analysis": {"status": "not_run"}, "coverage": {"events": 2, "sources_partial": 1}, "outputs": []}
+            for name in ("observations.jsonl", "source_index.json"):
+                file = source / name
+                manifest["outputs"].append({"name": name, "size": file.stat().st_size, "sha256": sha256(file)})
+            (source / "run_manifest.json").write_text(json.dumps(manifest))
+            case = root / "case.json"
+            from kamotrace.datasets import admit
+            with self.assertRaisesRegex(ValueError, "one completed parse-only export"):
+                admit(case, "ambiguous", "uac", [source, source])
+            self.assertFalse(case.exists())
+            args = ["auto", "--case", str(case), "--unit", "host-A/acquisition-1", "--kind", "uac",
+                    "--source", str(source), "--no-serve"]
+            self.assertEqual(main(args), 0)
+            before = read_case(case)
+            self.assertEqual(main(args), 0)
+            self.assertEqual(read_case(case), before)
+            with duckdb.connect(before["units"][0]["raw"]["path"], read_only=True) as connection:
+                rows = connection.execute("SELECT source_record, record_sha256, raw_event FROM raw_events ORDER BY source_record").fetchall()
+                self.assertEqual([r[0] for r in rows], [1, 2])
+                self.assertNotEqual(rows[0][1], rows[1][1])
+                self.assertEqual([r[2] for r in rows], [text, text])
+                self.assertEqual(connection.execute("SELECT count(*) FROM uac_ip_attributes").fetchone()[0], 4)
+            from kamotrace.event_index import prepare
+            second = admit(case, "host-A/acquisition-2", "uac", [source])
+            second_first = second["raw"]["ranges"][0][0]
+            prepare(case, ["host-A/acquisition-1"], [[1, 2]])
+            prepare(case, ["host-A/acquisition-2"])
+            for key, count, sample in (("host-A/acquisition-1", 1, 1), ("host-A/acquisition-2", 2, second_first)):
+                store = Store(case=case, units=[key])
+                try:
+                    context = store.computers({"unit_id": key})
+                    self.assertEqual((context["unit_id"], context["records"], context["scanned"]), (key, count, count))
+                    self.assertEqual(context["imports"][0]["records"], count)
+                    self.assertFalse(context["truncated"])
+                    self.assertEqual(context["cards"][0]["sample_record"], sample)
+                    self.assertEqual(json.loads(store.detail(sample)["raw_json"])["host"]["id"], "host-A")
+                    with self.assertRaisesRegex(ValueError, "stable unit_id"):
+                        store.computers({"dataset_index": 0})
+                    with self.assertRaisesRegex(ValueError, "selected prepared UAC unit"):
+                        store.computers({"unit_id": "excluded-acquisition"})
+                finally:
+                    store.connection.close()
+                    store.reviews.close()
+                    store.selection_directory.cleanup()
+            completed = read_case(case)
+            manifest["coverage"]["events"] = 3
+            (source / "run_manifest.json").write_text(json.dumps(manifest))
+            self.assertNotEqual(main([*args[:4], "host-A/acquisition-3", *args[5:]]), 0)
+            failed = read_case(case)
+            self.assertEqual(failed["units"], completed["units"])
+            # Validation fails after insertion, so its issued block stays burned.
+            self.assertGreater(failed["next_record"], completed["next_record"])
+
+    def test_viewer_attaches_declared_coverage_without_preparing(self):
+        from kamotrace.datasets import admit
+        from kamotrace.event_index import prepare
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            case, source = root / "case.json", root / "aws.json"
+            source.write_text(json.dumps({"Records": [
+                {"eventID": "first", "eventTime": "2026-10-25T00:00:00Z", "eventName": "SendCommand",
+                 "eventSource": "ssm.amazonaws.com", "userIdentity": {"userName": "alice", "accessKeyId": "synthetic"},
+                 "requestParameters": {"instanceId": "i-synthetic", "number": 9007199254740993}},
+                {"eventID": "second", "eventTime": "2026-10-26T00:00:00Z", "eventName": "StartSession"}]}))
+            admit(case, "A", "cloudtrail", [source])
+            with self.assertRaisesRegex(ValueError, "Preparation required"):
+                Store(case=case)
+            prepare(case, ["A"], [[1, 2]])
+            admit(case, "B", "cloudtrail", [source])
+            with self.assertRaisesRegex(ValueError, "Preparation required"):
+                Store(case=case)
+            with patch("kamotrace.event_index.prepare", side_effect=AssertionError("No startup prepare")):
+                store = Store(case=case, units=["A"])
+            self.addCleanup(store.selection_directory.cleanup)
+            try:
+                self.assertEqual(store.meta["total"], 1)
+                self.assertEqual(store.meta["case_coverage"]["excluded_units"], ["B"])
+                row = store.query({"size": 25})["data"][0]
+                self.assertEqual((row["id"], row["identity"], row["key_id"], row["target"]),
+                                 (1, "alice", "synthetic", "i-synthetic"))
+                self.assertIn("9007199254740993", store.detail(1)["raw_json"])
+                self.assertIsNone(store.detail(2))
+                self.assertEqual(store.schema({})["case_coverage"], store.meta["case_coverage"])
+                server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
+                worker = threading.Thread(target=server.serve_forever, daemon=True)
+                worker.start()
+                url = f"http://127.0.0.1:{server.server_port}"
+                try:
+                    with http_transport(url) as transport:
+                        server.mcp_request = transport
+                        async def session():
+                            async with Client(url + "/mcp") as client:
+                                schema = (await client.call_tool("describe_schema")).structured_content
+                                self.assertEqual(schema["case_coverage"], store.coverage)
+                                result = (await client.call_tool("search_events", {})).structured_content
+                                self.assertEqual(result["total"], 1)
+                                context = {k: store.coverage[k] for k in ("case_id", "selection_id")}
+                                accepted = await client.call_tool("search_events", {"query": {"case_context": context}})
+                                self.assertFalse(accepted.is_error, accepted)
+                                stale = {**context, "selection_id": "another-prepared-selection"}
+                                for tool, arguments in (("search_events", {}), ("summarize_field", {"field": "event_name"}),
+                                        ("event_histogram", {}), ("create_export", {"dataset": "events"})):
+                                    rejected = await client.call_tool(tool, {**arguments, "query": {"case_context": stale}})
+                                    self.assertTrue(rejected.is_error, (tool, rejected))
+                                    self.assertIn("different case/coverage", str(rejected))
+                                exported = await client.call_tool("create_export", {"dataset": "events", "fields": ["id"],
+                                    "query": {"case_context": context}})
+                                self.assertFalse(exported.is_error, exported)
+                                with urlopen(exported.structured_content["download_url"]) as response:
+                                    manifest, row = [json.loads(line) for line in response]
+                                self.assertEqual(manifest["case_coverage"], store.coverage)
+                                self.assertEqual(row, {"type": "event", "id": 1})
+                                detail = (await client.call_tool("get_event", {"id": 1})).structured_content
+                                self.assertIn("9007199254740993", detail["raw_json"])
+                        anyio.run(session)
+                finally:
+                    server.shutdown()
+                    worker.join()
+                    server.server_close()
+            finally:
+                if store.exports is not None:
+                    store.exports.close()
                 store.connection.close()
                 store.reviews.close()
 
-            store = open_store([second])
+    def test_selected_preparation_is_narrow_reusable_and_replaces_partial_coverage(self):
+        from kamotrace.datasets import admit, read_case
+        from kamotrace.event_index import prepare, verify_prepared
+        from kamotrace.importer import sha256
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            case, source = root / "case.json", root / "source.jsonl"
+            source.write_text("\n".join(json.dumps({"date": f"2026-10-25T00:00:{i % 60:02d}Z",
+                "content": {"ordinal": i, "n": 9007199254740993}}) for i in range(1100)))
+            a = admit(case, "A", "generic", [source], "Synthetic")
+            b = admit(case, "B", "generic", [source], "Synthetic")
+            first = prepare(case, ["A", "B"])
+            before = json.loads(json.dumps(first["units"]))
+            c = admit(case, "C", "generic", [source], "Synthetic")
+            self.assertEqual(read_case(case)["units"][:2], before)
+            prepared = prepare(case, ["C"], [[131073, 131075], [131100, 131700]])
+            self.assertEqual(prepared["units"][:2], before)
+            self.assertEqual(prepared["units"][2]["prepared"]["records"], 602)
+            for unit in prepared["units"]:
+                with duckdb.connect(str(verify_prepared(prepared, unit)), read_only=True) as connection:
+                    columns = {r[0] for r in connection.execute("DESCRIBE event_index").fetchall()}
+                    self.assertFalse(columns & {"raw_event", "user_identity", "request_parameters", "response_elements"})
+                self.assertEqual(sha256(Path(unit["raw"]["path"])), unit["raw"]["sha256"])
+            old = prepared["units"][2]["prepared"]
+            replaced = prepare(case, ["C"], [[131074, 131077]])
+            self.assertEqual(replaced["units"][2]["prepared"]["records"], 3)
+            self.assertEqual(sha256(Path(old["path"])), old["sha256"])
+            with patch("kamotrace.datasets.durable_publish", side_effect=OSError("synthetic output failure")):
+                with self.assertRaisesRegex(OSError, "output failure"):
+                    prepare(case, ["C"])
+            self.assertEqual(read_case(case), replaced)
+            # Idempotent completed-scope retry does not create another artifact.
+            self.assertEqual(prepare(case, ["A"]), replaced)
+            artifacts = len(list(root.glob("*.prepared-*.duckdb")))
+            with patch("kamotrace.datasets.save_case", side_effect=OSError("synthetic manifest failure")):
+                with self.assertRaisesRegex(OSError, "manifest failure"):
+                    prepare(case, ["C"])
+            self.assertEqual(read_case(case), replaced)
+            self.assertEqual(len(list(root.glob("*.prepared-*.duckdb"))), artifacts + 1)
+            # Corrupt only a disposable synthetic derived artifact, never source evidence.
+            damaged = Path(replaced["units"][2]["prepared"]["path"])
+            damaged.write_bytes(b"synthetic corrupt derived output")
+            with self.assertRaisesRegex(ValueError, "artifact changed"):
+                prepare(case, ["C"], [[131074, 131077]])
+            rebuilt = prepare(case, ["C"], [[131074, 131077]], rebuild=True)
+            self.assertEqual(rebuilt["units"][:2], before)
+            self.assertNotEqual(rebuilt["units"][2]["prepared"]["path"], str(damaged))
+            self.assertEqual(damaged.read_bytes(), b"synthetic corrupt derived output")
+
+    def test_raw_units_retry_duplicates_and_manifest_last_failure(self):
+        from kamotrace.datasets import admit, read_case, verify_artifact
+        from kamotrace.importer import sha256
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            case, source = root / "case.json", root / "source.jsonl"
+            raw = '{"date":"2026-10-25T23:59:59Z","content":{"n":9007199254740993,"d":0.1234567890123456789}}'
+            source.write_text(raw + "\n" + raw, encoding="utf-8")
+            original = sha256(source)
+            a = admit(case, "A", "generic", [source], "Synthetic")
+            self.assertEqual(a["raw"]["ranges"], [[1, 3]])
+            info = read_case(case)
+            with duckdb.connect(str(verify_artifact(info, a, "raw")), read_only=True) as connection:
+                rows = connection.execute("SELECT source_record, source_ordinal, raw_event FROM raw_events ORDER BY source_record").fetchall()
+                self.assertEqual([r[:2] for r in rows], [(1, 1), (2, 2)])
+                self.assertIn("9007199254740993", rows[0][2])
+                self.assertIn("0.1234567890123456789", rows[0][2])
+            before = case.read_bytes()
+            self.assertEqual(admit(case, "A", "generic", [source], "Synthetic"), a)
+            self.assertEqual(case.read_bytes(), before)
+            b = admit(case, "B", "generic", [source], "Synthetic")
+            self.assertEqual(b["raw"]["ranges"], [[65537, 65539]])
+            self.assertEqual(sha256(Path(a["raw"]["path"])), a["raw"]["sha256"])
+            # Fail AFTER raw publication, before registering it. Never auto-adopt it.
+            from kamotrace.datasets import save_case
+            def fail_registration(path, info, revision):
+                if any(u["unit_id"] == "C" for u in info["units"]):
+                    raise OSError("synthetic manifest publication failure")
+                return save_case(path, info, revision)
+            with patch("kamotrace.datasets.save_case", side_effect=fail_registration):
+                with self.assertRaisesRegex(OSError, "publication failure"):
+                    admit(case, "C", "generic", [source], "Synthetic")
+            self.assertEqual([u["unit_id"] for u in read_case(case)["units"]], ["A", "B"])
+            self.assertEqual(len(list(root.glob("*.raw-*.duckdb"))), 3)
+            c = admit(case, "C", "generic", [source], "Synthetic")
+            self.assertEqual(c["raw"]["ranges"], [[196609, 196611]])
+            self.assertEqual(len(list(root.glob("*.raw-*.duckdb"))), 4)
+            self.assertEqual(sha256(source), original)
+            source.write_text(raw + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "different inputs"):
+                admit(case, "A", "generic", [source], "Synthetic")
+            with self.assertRaisesRegex(ValueError, "Preparation required"):
+                verify_artifact(read_case(case), a, "prepared")
+
+    def test_reservations_are_durable_sparse_and_fail_closed(self):
+        from kamotrace.datasets import case_writer, read_case, reserve, save_case
+        from kamotrace.other_events import MANUAL_BASE
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "case.json"
+            with case_writer(path) as info:
+                initial = json.loads(path.read_text())
+                with self.assertRaises(BlockingIOError):
+                    with case_writer(path):
+                        self.fail("Concurrent writer entered")
+                self.assertEqual(reserve(path, info, 7), (1, 8))
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    save_case(path, initial, initial["revision"])
+            # A killed writer never returns its reservation, even without a unit.
+            subprocess.run([sys.executable, "-c", """
+import os, sys
+from kamotrace.datasets import case_writer, reserve
+with case_writer(sys.argv[1]) as info:
+    reserve(sys.argv[1], info, 13)
+    os._exit(0)
+""", str(path)], check=True)
+            with case_writer(path) as info:
+                self.assertEqual(reserve(path, info, 2), (21, 23))
+                old = path.read_bytes()
+                with patch("kamotrace.datasets.publish", side_effect=OSError("synthetic disk full")):
+                    with self.assertRaisesRegex(OSError, "disk full"):
+                        reserve(path, info, 31)
+                self.assertEqual(path.read_bytes(), old)
+            with case_writer(path) as info:
+                self.assertEqual(info["next_record"], 23)
+                info["next_record"] = MANUAL_BASE - 2
+                save_case(path, info, info["revision"])
+                self.assertEqual(reserve(path, info, 2), (MANUAL_BASE - 2, MANUAL_BASE))
+                with self.assertRaises(ValueError):
+                    reserve(path, info, 1)
+                with self.assertRaises(ValueError):
+                    reserve(path, info, True)
+            self.assertEqual(read_case(path)["units"], [])
+
+    def test_manifest_readers_and_post_replace_io_failure_keep_complete_revisions(self):
+        from kamotrace.datasets import case_writer, read_case, reserve
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "case.json"
+            with case_writer(path):
+                pass
+            stop = threading.Event()
+            started = threading.Event()
+            observed = []
+
+            def reader():
+                while not stop.is_set():
+                    info = read_case(path)
+                    observed.append((info["revision"], info["next_record"]))
+                    started.set()
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(reader)
+                self.assertTrue(started.wait(5))
+                try:
+                    with case_writer(path) as info:
+                        for _ in range(20):
+                            reserve(path, info, 7)
+                finally:
+                    stop.set()
+                future.result()
+            self.assertTrue(observed)
+            self.assertTrue(all(next_record == 1 + revision * 7 for revision, next_record in observed))
+            self.assertEqual(read_case(path)["next_record"], 141)
+            # Rename has happened before this injected directory-fsync error.
+            # Its outcome is uncertain to the writer, so reload, never reuse IDs.
+            with self.assertRaisesRegex(OSError, "directory sync"):
+                with case_writer(path) as info, patch("kamotrace.datasets.sync_directory",
+                        side_effect=OSError("synthetic directory sync failure")):
+                    reserve(path, info, 11)
+            self.assertEqual(read_case(path)["next_record"], 152)
+            with case_writer(path) as info:
+                self.assertEqual(reserve(path, info, 3), (152, 155))
+
+    def test_legacy_and_invalid_manifests_are_not_adopted(self):
+        from kamotrace.datasets import case_writer, read_case, reserve, validate_case
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "case.json"
+            path.write_text('{"kind":"kamotrace-datasets-v1"}')
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "re-ingest"):
+                with case_writer(path):
+                    self.fail("Legacy manifest adopted")
+            self.assertEqual(path.read_bytes(), before)
+            path = Path(folder) / "fresh.json"
+            with case_writer(path) as info:
+                reserve(path, info, 20)
+            base = read_case(path)
+            raw = {"path": str(Path(folder) / "raw.duckdb"), "sha256": "a" * 64,
+                   "records": 2, "ranges": [[1, 3]]}
+            unit = {"unit_id": "host-A/acquisition-1", "kind": "uac", "labels": {},
+                    "input": {"sha256": "b" * 64}, "raw": raw, "prepared": None}
+            base["units"] = [unit]
+            validate_case(base, path)
+            for ranges in ([[True, 3]], [[1, 3], [3, 5]], [[1, 6], [5, 9]], [[1, 22]]):
+                invalid = json.loads(json.dumps(base))
+                invalid["units"][0]["raw"]["ranges"] = ranges
+                with self.subTest(ranges=ranges), self.assertRaises(ValueError):
+                    validate_case(invalid, path)
+            duplicate = json.loads(json.dumps(unit))
+            duplicate["unit_id"] = "host-B/acquisition-1"
+            duplicate["raw"]["path"] = str(Path(folder) / "second.duckdb")
+            base["units"].append(duplicate)
+            with self.assertRaisesRegex(ValueError, "share issued IDs"):
+                validate_case(base, path)
+
+
+class OtherEventsContract(unittest.TestCase):
+    call = BrowserContract.call
+
+    def test_explicit_preparation_reuse_precision_and_read_only_originals(self):
+        from kamotrace.datasets import admit, read_case
+        from kamotrace.event_index import prepare
+        from kamotrace.importer import sha256
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            case, source = root / "case.json", root / "source.jsonl"
+            raw = '{"date":"2026-10-25T00:00:00.123456Z","content":{"n":9007199254740993,"d":0.123456789012345678901234567890,"text":"日本語"}}'
+            source.write_text(raw + "\n" + raw, encoding="utf-8")
+            admit(case, "A", "generic", [source], "Synthetic repeated observations")
+            prepare(case, ["A"])
+            first = read_case(case)
+            prepare(case, ["A"])
+            self.assertEqual(read_case(case), first)
+            store = Store(case=case)
             try:
-                self.assertEqual(store.event_index_status, "built")
-                expected = [store.detail(i) for i in (1, 2, 3)]
+                self.assertEqual(store.event_index_status, "attached")
+                expected = [store.detail(i) for i in (1, 2)]
                 self.assertEqual(expected[0]["record_sha256"], expected[1]["record_sha256"])
-                self.assertEqual([d["source_ordinal"] for d in expected], [1, 2, 1])
+                self.assertEqual([d["source_ordinal"] for d in expected], [1, 2])
                 self.assertIn("0.123456789012345678901234567890", expected[0]["raw_json"])
                 self.assertIn("9007199254740993", expected[0]["raw_json"])
-                for table in ("evidence.raw_events", "normalized_cache.event_index"):
+                for table in ("case_raw_0.raw_events", "case_prepared_0.event_index"):
                     with self.assertRaises(duckdb.Error):
                         store.connection.execute("DELETE FROM " + table)
-                manual = store.manual_write({"record_json": '{"date":"2026-10-27T00:00:00Z","content":"live manual"}', "origin": "Investigator"})
             finally:
-                close(store)
-            cache_hash = sha256(cache)
-            store = open_store([second])
-            try:
-                self.assertEqual(store.event_index_status, "reused")
-                self.assertEqual([store.detail(i) for i in (1, 2, 3)], expected)
-                self.assertEqual(store.meta["total"], 4)
-                self.assertEqual(store.detail(manual["id"])["event_type"], "manual")
-                self.assertEqual(sha256(cache), cache_hash)
-            finally:
-                close(store)
-            # Changing membership must not reuse a cache with obsolete global ID offsets.
-            store = open_store()
-            try:
-                self.assertEqual(store.event_index_status, "built")
-                self.assertEqual(store.meta["total"], 3)
-                self.assertIsNone(store.detail(3))
-            finally:
-                close(store)
-            # An even-row association change used to cancel out of the XOR checksum.
-            with duckdb.connect(str(cache)) as connection:
-                connection.execute("UPDATE event_index SET dataset_index=99")
-            store = open_store()
-            try:
-                self.assertEqual(store.event_index_status, "built")
-                self.assertEqual([store.detail(i) for i in (1, 2)], expected[:2])
-                self.assertEqual(store.meta["total"], 3)
-            finally:
-                close(store)
-            # Cache v1 used the unsafe XOR signature and must never be reused as v2.
-            with duckdb.connect(str(cache)) as connection:
-                run = json.loads(connection.execute("SELECT metadata FROM index_run").fetchone()[0])
-                run["schema_version"] = run["identity"]["schema_version"] = 1
-                connection.execute("UPDATE index_run SET metadata=?", [json.dumps(run)])
-            store = open_store()
-            try:
-                self.assertEqual(store.event_index_status, "built")
-                self.assertEqual([store.detail(i) for i in (1, 2)], expected[:2])
-            finally:
-                close(store)
-            # A same-size dataset change must invalidate even unchanged build_info metadata.
-            with duckdb.connect(str(database)) as connection:
-                connection.execute("CREATE OR REPLACE VIEW events AS SELECT * REPLACE ('changed producer' AS origin) FROM (" +
-                    EVENTS_VIEW + ")")
-            before[database] = sha256(database)
-            store = open_store()
-            try:
-                self.assertEqual(store.event_index_status, "built")
-                self.assertEqual(store.detail(1)["origin"], "changed producer")
-            finally:
-                close(store)
-            # An identifiable but damaged/incomplete derived cache can be rebuilt safely.
-            with duckdb.connect(str(cache)) as connection:
+                store.connection.close()
+                store.reviews.close()
+                store.selection_directory.cleanup()
+            artifact = first["units"][0]["prepared"]
+            self.assertEqual(sha256(Path(artifact["path"])), artifact["sha256"])
+            with duckdb.connect(artifact["path"]) as connection:
                 connection.execute("UPDATE event_index SET origin='damaged'")
-            store = open_store()
-            try:
-                self.assertEqual(store.event_index_status, "built")
-                self.assertEqual(store.detail(2)["origin"], "changed producer")
-            finally:
-                close(store)
-            for path, digest in before.items():
-                self.assertEqual(sha256(path), digest)
-            with duckdb.connect(str(cache)) as connection:
-                run = json.loads(connection.execute("SELECT metadata FROM index_run").fetchone()[0])
-                run["complete"] = False
-                connection.execute("UPDATE index_run SET metadata=?", [json.dumps(run)])
-            store = open_store()
-            try:
-                self.assertEqual(store.event_index_status, "built")
-                self.assertEqual(store.meta["total"], 3)
-            finally:
-                close(store)
-            cache_hash = sha256(cache)
-            # A failed rebuild must leave the previous completed cache byte-for-byte intact.
-            with duckdb.connect(str(database)) as connection:
-                connection.execute("CREATE OR REPLACE VIEW events AS " + EVENTS_VIEW + " UNION ALL " + EVENTS_VIEW)
-            with self.assertRaisesRegex(ValueError, "preserve source occurrences"):
-                open_store()
-            self.assertEqual(sha256(cache), cache_hash)
-            self.assertFalse(list(root.glob(".events.event-index.duckdb.*.staging")))
-            # A competing preparation writer and an unrecognized file must fail closed.
-            with write_lock(cache), self.assertRaises(BlockingIOError):
-                open_store()
-            cache.unlink()
-            cache.write_bytes(b"not a cache; do not overwrite")
-            with self.assertRaisesRegex(ValueError, "refusing to replace"):
-                open_store()
-            self.assertEqual(cache.read_bytes(), b"not a cache; do not overwrite")
+            with self.assertRaisesRegex(ValueError, "artifact changed"):
+                Store(case=case)
+            # Explicit rebuild, never viewer repair; retain the old published file.
+            prepare(case, ["A"], rebuild=True)
+            self.assertTrue(Path(artifact["path"]).is_file())
+            self.assertNotEqual(read_case(case)["units"][0]["prepared"]["path"], artifact["path"])
 
     def test_dense_key_positions_are_bounded_and_narrowable(self):
         from kamotrace.other_events import build as import_other

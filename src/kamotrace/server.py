@@ -1,4 +1,4 @@
-"""Local, read-only CloudTrail browser. Run with: kamotrace serve --database events.duckdb"""
+"""Local investigation browser. Open explicitly prepared coverage with: kamotrace serve --case case.json"""
 import argparse
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
@@ -112,8 +112,11 @@ def parse_time(value):
     return parsed
 
 
-def build_query(body, scalar_function):
+def build_query(body, scalar_function, coverage=None):
     """Only allowlisted SQL fragments; all user values remain bound parameters."""
+    if body.get("case_context") is not None and body["case_context"] != (
+            {k: coverage[k] for k in ("case_id", "selection_id")} if coverage else None):
+        raise ValueError("Saved query belongs to different case/coverage; reopen its declared selection")
     raw = raw_fields(body)
     conditions, params = [], [query_timezone(body)]
     extracts = []
@@ -233,7 +236,15 @@ def build_query(body, scalar_function):
 
 
 class Store:
-    def __init__(self, database, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=(), eks_export=None):
+    def __init__(self, database=None, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=(), eks_export=None, *, case=None, units=None):
+        if case is None or database is not None or other_events:
+            raise ValueError("Legacy databases are not served; re-ingest original inputs into a new case with "
+                             "import --case CASE --unit UNIT, run prepare, then serve --case CASE. "
+                             "Existing evidence and sidecars are not migrated or modified")
+        from .datasets import read_case
+        database = Path(case).resolve()
+        self.case_manifest = read_case(database)
+        self.coverage = None
         with ExitStack() as startup:
             # Disposable disk storage, never an index or a write to original evidence.
             self.selection_directory = tempfile.TemporaryDirectory(prefix="kamotrace-selection-")
@@ -245,8 +256,8 @@ class Store:
             self.connection = duckdb.connect(str(Path(self.selection_directory.name) / "selection.duckdb"))
             startup.callback(self.connection.close)
             self.connection.execute("SET TimeZone='UTC'; SET threads=2; SET memory_limit='2GB'")
-            self.connection.execute(f"ATTACH '{str(database).replace(chr(39), chr(39)*2)}' AS evidence (READ_ONLY)")
-            self.connection.execute("USE evidence")
+            from .event_index import attach_case
+            self.event_sources, self.coverage = attach_case(self.connection, self.case_manifest, units)
             # DuckDB's JSON numbers use doubles. This scalar accessor keeps exact numeric
             # lexemes; SQL still owns selection/grouping. Function catalogs are shared by
             # connections, so each Store owns a distinct application-generated function name.
@@ -260,7 +271,18 @@ class Store:
             self.log_revision = f"{secrets.token_hex(4)}-0"
             self.annotation_revision = self.log_revision
             logger.info("Opening findings/tags sidecar: %s", annotations or database.with_suffix(".annotations.sqlite3"))
-            self.reviews = sqlite3.connect(str(annotations or database.with_suffix(".annotations.sqlite3")), check_same_thread=False)
+            reviews_path = Path(annotations or database.with_suffix(".annotations.sqlite3")).resolve()
+            identity = json.dumps([self.case_manifest["case_id"]])
+            if reviews_path.exists():
+                try:
+                    with sqlite3.connect(reviews_path.as_uri() + "?mode=ro", uri=True) as previous:
+                        binding = previous.execute("SELECT value FROM sidecar_meta WHERE key='evidence'").fetchone()
+                        if binding is None or binding[0] != identity:
+                            raise ValueError("Findings sidecar belongs to a different evidence database or legacy case; "
+                                             "use a new --annotations path; no annotation migration is performed")
+                except sqlite3.Error as error:
+                    raise ValueError("Unrecognized or legacy Findings sidecar; use a new --annotations path") from error
+            self.reviews = sqlite3.connect(str(reviews_path), check_same_thread=False)
             startup.callback(self.reviews.close)
             self.reviews.row_factory = sqlite3.Row
             self.reviews.create_function("unicode_lower", 1, lambda value: value.lower(), deterministic=True)
@@ -282,11 +304,8 @@ class Store:
                     new_updated TEXT NOT NULL, basis TEXT NOT NULL, reason TEXT NOT NULL,
                     old_review TEXT NOT NULL, old_source TEXT);
             """)
-            # Bind the sidecar to its evidence on first use (older sidecars too), so another case's notes
-            # can't be mixed in silently, as detections and enrichment sidecars already refuse.
-            from .suzaku import evidence_identity
+            # Only new sidecars receive a binding; existing ones were checked read-only.
             logger.info("Validating findings/tags evidence identity")
-            identity = json.dumps(list(evidence_identity(self.connection)))
             self.reviews.execute("INSERT OR IGNORE INTO sidecar_meta VALUES ('evidence', ?)", (identity,))
             self.reviews.commit()
             if self.reviews.execute("SELECT value FROM sidecar_meta WHERE key='evidence'").fetchone()[0] != identity:
@@ -311,7 +330,6 @@ class Store:
             self.reference_enrichment = {row[0]: dict(zip(("country", "city", "asn", "isp", "ip_info"), row[1:]))
                 for row in self.connection.execute("SELECT ip, country, city, asn, isp, ip_info FROM ip_enrichment").fetchall()}
             self.startup_timing("enrichment", stage_started)
-            # AWS-only sidecars load against the primary immutable database before the combined view.
             browse_view = """
                 CREATE TEMP VIEW browse_events AS
                 SELECT e.source_record AS id, e.record_sha256, e.event_id, e.event_time,
@@ -319,16 +337,12 @@ class Store:
                     e.event_source, e.event_name, e.source_ip, e.identity_type,
                     coalesce(e.event_name, e.content_preview) AS summary,
                     coalesce(e.event_source, e.origin) AS source_label,
-                    coalesce(e.generic_identity, e.identity_arn, e.user_identity->>'$.userName',
-                        e.user_identity->>'$.principalId', e.user_identity->>'$.invokedBy', '(unattributed)') AS identity,
-                    e.user_identity->>'$.accessKeyId' AS key_id,
-                    coalesce(e.request_parameters->>'$.target', e.request_parameters->>'$.instanceIds',
-                        e.request_parameters->>'$.instanceId') AS target,
-                    e.request_parameters->>'$.documentName' AS document_name,
+                    e.core_identity AS identity, e.key_id,
+                    e.target, e.document_name,
                     e.error_code, e.aws_region AS region, e.user_agent, e.raw_event,
                     e.event_type, e.origin, e.content_preview, e.updated,
                     (SELECT f.sample_status FROM guardduty_findings f
-                        WHERE e.event_type='guardduty' AND f.finding_record=e.source_ordinal) AS guardduty_sample,
+                        WHERE e.event_type='guardduty' AND f.finding_record=e.source_record) AS guardduty_sample,
                     coalesce(g.country, '(unmapped / service / private)') AS country, g.isp, g.city, g.asn, g.ip_info
                 FROM events e LEFT JOIN ip_enrichment g ON e.source_ip = g.ip
             """
@@ -366,7 +380,7 @@ class Store:
             stage_started = time.monotonic()
             self.guardduty_run = load_guardduty(self.connection, guardduty)
             self.startup_timing("guardduty", stage_started)
-            self.prepare_other_events(database, other_events, identity)
+            self.attach_case_manual(database, identity)
             self.connection.execute(browse_view)
             # No endpoint accepts arbitrary SQL or paths. Also disable subsequent filesystem/network access.
             self.connection.execute("SET enable_external_access=false")
@@ -377,77 +391,46 @@ class Store:
             # The Store owns both connections after initialization succeeds.
             startup.pop_all()
 
-    def prepare_other_events(self, database, paths, identity):
-        from .other_events import EVENTS_VIEW, FORMAT, MANUAL_BASE, RAW_SCHEMA, manual_rows
-        from .computer_registry import registered
-        from .datasets import read as dataset_bindings
-        self.uac_registry = registered(database)
-        binding = dataset_bindings(database)
-        saved = [Path(r["database"]).resolve() for r in binding["datasets"]]
-        discovered = [Path(p).resolve() for p in (*paths, *(r["database"] for r in self.uac_registry["imports"]))]
-        if saved and set(discovered) - set(saved):
-            raise ValueError("New datasets must be registered with kamotrace auto before reopening this bound case; "
-                             "startup never changes saved dataset order")
-        paths = [*saved, *discovered]
-        paths = list(dict.fromkeys(Path(p).resolve() for p in paths))
+    def attach_case_manual(self, database, identity):
+        from .other_events import EVENTS_VIEW, RAW_SCHEMA, manual_rows
         self.case_identity = json.loads(identity)
         self.manual_path = database.with_suffix(".manual.duckdb")
         self.connection.execute(f"CREATE TEMP TABLE manual_raw ({RAW_SCHEMA})")
         rows = manual_rows(self.manual_path, self.case_identity)
         if rows:
             self.connection.executemany("INSERT INTO manual_raw VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
-        catalog = self.connection.execute("SELECT current_database()").fetchone()[0].replace('"', '""')
-        primary = f'"{catalog}".main.events'
-        info = json.loads(self.connection.execute("SELECT metadata FROM build_info").fetchone()[0])
-        self.event_sources = [info]
+        manual = ("SELECT *, coalesce(generic_identity, '(unattributed)') AS core_identity, "
+                  "NULL::VARCHAR AS key_id, NULL::VARCHAR AS target, NULL::VARCHAR AS document_name, "
+                  "-1 AS dataset_index, NULL::VARCHAR AS unit_id FROM (" +
+                  EVENTS_VIEW.replace("FROM raw_events", "FROM manual_raw") + ")")
+        # Snapshots already occur in prepared units, with reserved IDs. The sidecar
+        # supplies context, never additional browsable rows outside that selection.
+        if self.connection.execute("SELECT count(*) FROM prepared_events WHERE event_type='guardduty' "
+                "AND source_record NOT IN (SELECT finding_record FROM guardduty_findings)").fetchone()[0]:
+            raise ValueError("GuardDuty context preparation required for this declared selection; run kamotrace guardduty --case")
+        self.connection.execute("CREATE OR REPLACE TEMP VIEW events AS SELECT * FROM prepared_events UNION ALL BY NAME " + manual)
+        self.event_index_status = "attached"
         self.computer_cache = {}
         self.eks_pod_sources = None
-        aws_extra = """, 'cloudtrail'::VARCHAR AS event_type, NULL::VARCHAR AS origin,
-            NULL::VARCHAR AS generic_identity, NULL::VARCHAR AS content_preview,
-            NULL::VARCHAR AS author, NULL::VARCHAR AS created, NULL::VARCHAR AS updated,
-            record_sha256 AS content_sha256"""
-        selects = ["SELECT *" + ("" if info.get("format") == FORMAT else aws_extra) + ", 0 AS dataset_index FROM " + primary]
-        raw_selects = [f'SELECT source_record, raw_event, record_sha256, source_file, source_ordinal FROM "{catalog}".main.raw_events']
-        sources = [(database, selects[0], raw_selects[0], int(info["records"]), 0)]
-        offset = int(info["records"])
-        for index, path in enumerate(paths):
-            alias = f"other_{index}"
-            # Only trusted startup CLI paths; HTTP requests never supply paths.
-            self.connection.execute(f"ATTACH '{str(Path(path).resolve()).replace(chr(39), chr(39)*2)}' AS {alias} (READ_ONLY)")
-            metadata = json.loads(self.connection.execute(f"SELECT metadata FROM {alias}.build_info").fetchone()[0])
-            if metadata.get("format") != FORMAT:
-                raise ValueError("--other-events requires a dataset built by import-other")
-            self.event_sources.append(metadata)
-            selects.append(f"SELECT * REPLACE (source_record + {offset} AS source_record), {index + 1} AS dataset_index FROM {alias}.events")
-            raw_selects.append(f"SELECT source_record + {offset} AS source_record, raw_event, record_sha256, source_file, source_ordinal FROM {alias}.raw_events")
-            sources.append((path, selects[-1], raw_selects[-1], int(metadata["records"]), offset))
-            offset += int(metadata["records"])
-        if offset >= MANUAL_BASE:
-            raise ValueError("Too many imported events for exact browser row identifiers")
-        from .event_index import bind
-        stage_started = time.monotonic()
-        self.event_index_status = bind(self.connection, database, sources)
-        self.startup_timing("event_index_" + self.event_index_status, stage_started)
-        self.connection.execute("CREATE TEMP VIEW event_raw AS " + " UNION ALL ".join(raw_selects))
-        manual = "SELECT * EXCLUDE(raw_event), -1 AS dataset_index, raw_event FROM (" + EVENTS_VIEW.replace("FROM raw_events", "FROM manual_raw") + ")"
-        # Derived snapshots stay outside the immutable-import cache; existing IDs stay unchanged.
-        self.guardduty_offset = offset
-        finding_count = self.connection.execute("SELECT count(*) FROM guardduty_raw").fetchone()[0]
-        if offset + finding_count >= MANUAL_BASE:
-            raise ValueError("Too many GuardDuty events for exact browser row identifiers")
-        guardduty = ("SELECT * EXCLUDE(raw_event), -2 AS dataset_index, raw_event FROM "
-            f"(SELECT * REPLACE (source_record + {offset} AS source_record) FROM guardduty_events)")
-        self.connection.execute("CREATE TEMP VIEW events AS SELECT i.*, r.raw_event FROM normalized_cache.event_index i "
-            "JOIN event_raw r USING(source_record) UNION ALL " + guardduty + " UNION ALL " + manual)
+        self.uac_registry = {"format": "kamotrace-case-v1", "imports": [
+            {"unit_id": s["unit_id"], "records": s["records"]} for s in self.event_sources
+            if s.get("adapter") == "tracequarry-parse-only-v1"], "attempts": []}
 
     def computers(self, body):
         from .computers import summarize
-        imports = [{"dataset_index": i, "run_id": s["tracequarry"]["manifest"].get("run_id"),
+        imports = [{"dataset_index": i, "unit_id": s.get("unit_id"), "run_id": s["tracequarry"]["manifest"].get("run_id"),
                     "collection_id": s["tracequarry"]["manifest"].get("collection_id"),
                     "acquisition_id": s["tracequarry"]["manifest"].get("settings", {}).get("acquisition_id"),
-                    "records": s["records"], "imported_at": s.get("imported_at")}
+                    "records": s["prepared_coverage"]["records"], "imported_at": s.get("imported_at")}
                    for i, s in enumerate(self.event_sources) if s.get("adapter") == "tracequarry-parse-only-v1"]
         dataset = body.get("dataset_index", imports[0]["dataset_index"] if imports else None)
+        if self.coverage and imports:
+            if "dataset_index" in body:
+                raise ValueError("Select acquired computer context by stable unit_id, not dataset_index")
+            key = body.get("unit_id", imports[0]["unit_id"])
+            dataset = next((i["dataset_index"] for i in imports if i["unit_id"] == key), None)
+            if dataset is None:
+                raise ValueError("unit_id must identify a selected prepared UAC unit")
         page = body.get("page", 1)
         if type(page) is not int or page < 1:
             raise ValueError("page must be a positive integer")
@@ -923,6 +906,11 @@ class Store:
                         if context is not None:
                             if not isinstance(context, dict):
                                 raise ValueError("Note context must be a JSON object")
+                            if self.coverage:
+                                expected = {k: self.coverage[k] for k in ("case_id", "selection_id")}
+                                if context.get("case_context", expected) != expected:
+                                    raise ValueError("Note query belongs to different case/coverage")
+                                context = {**context, "case_context": expected}
                             context = json.dumps(context, ensure_ascii=False)
                             if len(context) > 20000:
                                 raise ValueError("Note context is too large")
@@ -997,7 +985,7 @@ class Store:
     def key_positions(self, body, *, count_sql=None, params=None):
         # Keep every ordinary milestone visible without unbounded JSON/SVG for mass tagging.
         if count_sql is None:
-            _, _, count_sql, params, _ = build_query(body, self.raw_function)
+            _, _, count_sql, params, _ = build_query(body, self.raw_function, self.coverage)
         sql = count_sql
         sql = sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS ms, record_sha256", 1)
         positions = self.rows("SELECT DISTINCT ms FROM (" + sql + ") matching WHERE ms IS NOT NULL AND record_sha256 IN "
@@ -1024,8 +1012,10 @@ class Store:
 
     def metadata(self, body=None):
         zone = query_timezone(body or {})
+        # epoch_ms(TIMESTAMPTZ) may round up; display bounds must enclose the
+        # original instant, including submillisecond and pre-epoch timestamps.
         bounds = self.rows("""SELECT count(*) AS total, count(*) FILTER (WHERE event_time IS NULL) AS undated,
-            min(epoch_ms(event_time)) AS start_ms,
+            min(epoch_ms(date_trunc('milliseconds', event_time))) AS start_ms,
             max(epoch_ms(event_time)) + 1000 AS end_ms FROM browse_events""", operation="metadata.bounds")[0]
         histogram = self.daily_histogram(zone)
         facets = {field: [r["value"] for r in self.rows(
@@ -1040,7 +1030,7 @@ class Store:
                 "enrichment": self.enrichment_run,
                 "timezone": zone, "timezones": TIMEZONES, "database": "events.duckdb", "read_only": True,
                 "manual_events_writable": True,
-                "source_coverage": self.source_coverage(), "uac": self.uac_registry}
+                "source_coverage": self.source_coverage(), "uac": self.uac_registry, "case_coverage": self.coverage}
 
     def source_coverage(self):
         return [{"origin": source["origin"], "records": source["records"], "undated": source["undated"],
@@ -1059,6 +1049,7 @@ class Store:
             return datetime.fromtimestamp(ms / 1000, ZoneInfo(zone)).isoformat() if ms is not None else None
         return {"events": self.meta["total"], "timezone": zone,
             "undated": self.meta["undated"], "source_coverage": self.source_coverage(), "uac": self.uac_registry,
+            "case_coverage": self.coverage,
             "first_event": instant(self.meta["start_ms"]), "end_exclusive": instant(self.meta["end_ms"]),
             "evidence_read_only": True, "annotations_writable": True, "manual_events_writable": True,
             "fields": FIELDS, "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS),
@@ -1075,7 +1066,7 @@ class Store:
         if dataset not in ("events", "ssm") or not isinstance(selection, dict):
             raise ValueError("dataset must be events or ssm; selection must be an ordinary query object")
         selection_keys = ({"timezone", "search", "filters", "tags", "annotation_id", "command_key", "start", "end",
-                           "rules", "min_level", "sorters", "pipeline", "pipeline_version", "raw_fields"} if dataset == "events"
+                           "rules", "min_level", "sorters", "pipeline", "pipeline_version", "raw_fields", "case_context"} if dataset == "events"
                           else {"search", "search_scope", "start", "end"})
         if set(selection) - selection_keys:
             raise ValueError("Unknown export selection fields: " + ", ".join(sorted(set(selection) - selection_keys)))
@@ -1094,6 +1085,7 @@ class Store:
                 emit({"type": "manifest", "format": "kamotrace-ndjson-v1", "dataset": dataset,
                       "selection": selection, "fields": fields, "created_at": datetime.now(timezone.utc).isoformat(),
                       "evidence": {"source_sha256": source_hash, "records": records},
+                      "case_coverage": self.coverage,
                       "annotation_revision": self.annotation_revision,
                       "provenance": {"raw_json": "Exact original stored JSON text, never reserialized",
                           "supplemental": "Supplemental SSM export JSON is reconstructed, not original evidence",
@@ -1118,7 +1110,7 @@ class Store:
         return self.exports.prepare(write, base_url)
 
     def query(self, body, *, interactive=True):
-        sql, params, count_sql, count_params, size = build_query(body, self.raw_function)
+        sql, params, count_sql, count_params, size = build_query(body, self.raw_function, self.coverage)
         paths = raw_fields(body)
         started = time.monotonic()
         with self.locked("events"):
@@ -1146,13 +1138,13 @@ class Store:
             raise ValueError("Bucket width must be 1 to 525,600 whole minutes")
         minutes = int(width)
         if self.meta["start_ms"] is None and not (body.get("start") and body.get("end")):
-            build_query(body, self.raw_function)  # Empty evidence does not bypass query validation.
+            build_query(body, self.raw_function, self.coverage)  # Empty evidence does not bypass query validation.
             return {"data": [], "total": 0, "bucket_minutes": minutes, "sql": "", "params": [],
                     "overview": [], "key_positions": {"positions_ms": [], "truncated": False},
                     "overview_key_positions": {"positions_ms": [], "truncated": False}}
         start = body.get("start") or datetime.fromtimestamp(self.meta["start_ms"] / 1000, timezone.utc).isoformat()
         end = body.get("end") or datetime.fromtimestamp(self.meta["end_ms"] / 1000, timezone.utc).isoformat()
-        _, _, count_sql, params, _ = build_query(body, self.raw_function)
+        _, _, count_sql, params, _ = build_query(body, self.raw_function, self.coverage)
         if parse_time(start) >= parse_time(end):
             raise ValueError("Start must be before end (the end is exclusive)")
         if (parse_time(end) - parse_time(start)).total_seconds() / (minutes * 60) > 2000:
@@ -1184,7 +1176,7 @@ class Store:
             count_sql = self.selected_count(count_sql, params) + " WHERE event_time >= ?::TIMESTAMPTZ AND event_time < ?::TIMESTAMPTZ"
             params = [start, end]
             sql = """WITH matching AS (
-        """ + count_sql.replace("SELECT count(*)", "SELECT epoch_ms(event_time) AS event_ms, "
+        """ + count_sql.replace("SELECT count(*)", "SELECT event_time, epoch_ms(event_time) AS event_ms, "
             "record_sha256 IN (SELECT hash FROM review_tags WHERE slug='key-event') AS is_key", 1) + """
         ), buckets AS (
             SELECT unnest(?::BIGINT[]) AS start_ms, unnest(?::BIGINT[]) AS end_ms
@@ -1194,7 +1186,8 @@ class Store:
                count(m.event_ms) FILTER (WHERE m.is_key) AS key_events,
                min(m.event_ms) FILTER (WHERE m.is_key) AS key_first_ms,
                max(m.event_ms) FILTER (WHERE m.is_key) AS key_last_ms
-        FROM buckets b LEFT JOIN matching m ON m.event_ms >= b.start_ms AND m.event_ms < b.end_ms
+        FROM buckets b LEFT JOIN matching m ON m.event_time >= make_timestamptz(b.start_ms * 1000)
+            AND m.event_time < make_timestamptz(b.end_ms * 1000)
         GROUP BY b.start_ms, b.end_ms ORDER BY b.start_ms"""
             bound = params + [[a for a, _ in ranges], [b for _, b in ranges], zone]
             rows = self.rows(sql, bound, operation="histogram.buckets")
@@ -1212,7 +1205,7 @@ class Store:
             raise ValueError("Unknown summary column")
         is_raw = field in paths
         field = paths[field] + ".value" if field in paths else field
-        _, _, count_sql, params, _ = build_query(body, self.raw_function)
+        _, _, count_sql, params, _ = build_query(body, self.raw_function, self.coverage)
         if "value" in body:
             value = body["value"]
             if value is not None and not isinstance(value, str):
@@ -1262,24 +1255,24 @@ class Store:
                 dataset = row.pop("dataset_index")
                 row["provenance"]["imports"] = [self.event_sources[dataset]] if dataset >= 0 else []
                 if row["event_type"] == "guardduty":
-                    row["provenance"]["imports"] = [self.guardduty_run]
-                    row["provenance"]["ordinal_basis"] = "source array position" if self.guardduty_run["schema_version"] == 2 else "legacy sidecar ARN order (original position unavailable)"
+                    row["provenance"]["guardduty_context"] = self.guardduty_run
+                    row["provenance"]["ordinal_basis"] = "source array position"
                     row["guardduty"] = self.rows("""SELECT sample_status, time_basis, link_status
-                        FROM guardduty_findings WHERE finding_record=?""", [record - self.guardduty_offset])[0]
+                        FROM guardduty_findings WHERE finding_record=?""", [record])[0]
                     row["guardduty"]["link_basis"] = self.guardduty_run["link_basis"]
                     row["related_events"] = self.rows("""SELECT e.source_record AS id, e.event_id,
                         e.event_type, e.event_time::VARCHAR AS event_time, epoch_ms(e.event_time) AS event_time_ms, e.event_name AS summary
                         FROM events e WHERE e.source_record IN
                         (SELECT source_record FROM guardduty_event_links WHERE finding_record=?)
-                        ORDER BY e.source_record LIMIT 100""", [record - self.guardduty_offset])
+                        ORDER BY e.source_record LIMIT 100""", [record])
                     row["related_events_total"] = self.connection.execute("""SELECT count(DISTINCT source_record)
-                        FROM guardduty_event_links WHERE finding_record=?""", [record - self.guardduty_offset]).fetchone()[0]
+                        FROM guardduty_event_links WHERE finding_record=?""", [record]).fetchone()[0]
                 else:
-                    row["related_events"] = self.rows("""SELECT g.source_record + ? AS id,
+                    row["related_events"] = self.rows("""SELECT g.source_record AS id,
                         g.event_id, g.event_type, g.event_time::VARCHAR AS event_time, epoch_ms(g.event_time) AS event_time_ms, g.content_preview AS summary
                         FROM guardduty_events g WHERE g.source_record IN
                         (SELECT finding_record FROM guardduty_event_links WHERE source_record=?)
-                        ORDER BY g.source_record LIMIT 100""", [self.guardduty_offset, record])
+                        ORDER BY g.source_record LIMIT 100""", [record])
                     row["related_events_total"] = self.connection.execute("""SELECT count(DISTINCT finding_record)
                         FROM guardduty_event_links WHERE source_record=?""", [record]).fetchone()[0]
                 # Return exact content text separately so the manual editor never parses JSON numbers.
@@ -1324,7 +1317,7 @@ class Store:
                     any_value(technique_ids) AS techniques, count(DISTINCT source_record) AS events
                 FROM detections GROUP BY rule_id ORDER BY level_rank DESC, events DESC, title""")
             snapshots = self.rows("""SELECT f.rule_id, r.record_sha256,
-                    min(f.finding_record) + ? AS id, any_value(f.title) AS title,
+                    min(f.finding_record) AS id, any_value(f.title) AS title,
                     any_value(f.level) AS level, any_value(f.level_rank) AS level_rank,
                     epoch_ms(any_value(e.event_time)) AS event_time_ms,
                     count(DISTINCT f.finding_record) AS occurrences,
@@ -1332,7 +1325,7 @@ class Store:
                 FROM guardduty_findings f JOIN guardduty_raw r ON r.source_record=f.finding_record
                 JOIN guardduty_events e ON e.source_record=f.finding_record
                 LEFT JOIN guardduty_event_links l ON l.finding_record=f.finding_record
-                GROUP BY f.rule_id, r.record_sha256 ORDER BY level_rank DESC, id""", [self.guardduty_offset])
+                GROUP BY f.rule_id, r.record_sha256 ORDER BY level_rank DESC, id""")
             for rule in rules:
                 retained = [snapshot for snapshot in snapshots if snapshot["rule_id"] == rule["rule_id"]]
                 if retained:
@@ -1551,7 +1544,10 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace serve", description=__doc__)
-    parser.add_argument("--database", type=Path, required=True, help="Primary DuckDB built by `kamotrace import` or `import-other`")
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--database", type=Path, help=argparse.SUPPRESS)
+    destination.add_argument("--case", type=Path, help="Fresh case manifest; attach declared prepared coverage only")
+    parser.add_argument("--unit", action="append", dest="units", help="Explicit unit subset (default: all; unprepared units fail)")
     parser.add_argument("--enrichment", type=Path,
                         help="IP enrichment from `kamotrace enrich` (default: <database>.enrichment.duckdb if present)")
     parser.add_argument("--port", type=int, default=8765)
@@ -1563,7 +1559,7 @@ def main(argv=None):
     parser.add_argument("--bind", default=os.environ.get("KAMOTRACE_BIND", "127.0.0.1"),
                         help="Listening address (default: 127.0.0.1, or $KAMOTRACE_BIND inside the container)")
     parser.add_argument("--annotations", type=Path, help="SQLite sidecar (default: beside the evidence database)")
-    parser.add_argument("--other-events", type=Path, action="append", default=[], help="Additional immutable import-other DuckDB (repeatable)")
+    parser.add_argument("--other-events", type=Path, action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--ssm-export", type=Path, help="Local ssm_command_session_activity[.enriched].json export")
     parser.add_argument("--inventory-export", type=Path,
                         help="AWS inventory export folder containing report.json; current configuration, not historical evidence")
@@ -1577,6 +1573,9 @@ def main(argv=None):
                         default=os.environ.get("KAMOTRACE_LOG_LEVEL", "info"),
                         help="Application log verbosity (default: info, or $KAMOTRACE_LOG_LEVEL)")
     args = parser.parse_args(argv)
+    if args.database is not None or args.other_events:
+        parser.error("Legacy database startup is unsupported; re-ingest original inputs into a new case, "
+                     "run prepare --case CASE --unit UNIT, then serve --case CASE. Existing evidence is never migrated")
     if args.export_base_url:
         base_parts = urlsplit(args.export_base_url)
         if (base_parts.scheme not in ("http", "https") or not base_parts.hostname or base_parts.username
@@ -1589,7 +1588,7 @@ def main(argv=None):
     logging.getLogger("kamotrace").setLevel(args.log_level.upper())
     started = time.monotonic()
     logger.info("Starting KamoTrace; loading local data before accepting requests")
-    for name in ("database", "enrichment", "ssm_export", "detections", "guardduty"):
+    for name in ("database", "case", "enrichment", "ssm_export", "detections", "guardduty"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             parser.error(f"--{name.replace('_', '-')} not found: {path}")
@@ -1598,10 +1597,10 @@ def main(argv=None):
     if args.eks_export is not None and not args.eks_export.is_dir():
         parser.error(f"--eks-export folder not found: {args.eks_export}")
     try:
-        store = Store(args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
+        store = Store(args.database and args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
                       args.ssm_export, args.detections and args.detections.resolve(), inventory_export=args.inventory_export,
                       guardduty=args.guardduty and args.guardduty.resolve(), other_events=args.other_events,
-                      eks_export=args.eks_export)
+                      eks_export=args.eks_export, case=args.case, units=args.units)
     except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
         parser.error(str(error))
     logger.info("Binding HTTP server to %s:%s", args.bind, args.port)

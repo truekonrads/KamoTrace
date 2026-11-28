@@ -9,6 +9,18 @@ For installation and commands, use the [README](../README.md),
 [preparation reference](preparation.md) and [user guide](user-guide.md).
 [AGENTS.md](../AGENTS.md) holds contributor guardrails, not component specifications.
 
+## Fresh-case unit preparation
+
+`datasets.py` also owns the explicit `kamotrace-case-v1` JSON manifest. A case has a stable UUID, revision, durable next-unissued ordinary `source_record` and caller-named immutable units. Each raw/prepared artifact binds its case UUID, unit identity, physical-ID intervals and actual occurrence count in build metadata. IDs are persisted directly, never added through offsets. The separate manual namespace retains its own nonrecycling high-water mark. No second catalog database, occurrence-ID mapping or workflow/checkpoint service is introduced.
+
+Admission reserves blocks of 65,536 IDs under one case writer lock before insertion, validates originals/provenance and publishes a raw unit before referencing it in the manifest. Failed builds burn reservations. Unregistered published outputs are retained rather than silently adopted or deleted. POSIX publication synchronizes files and parent directories; Windows atomic replacement has no Python directory-fsync guarantee. These are not universal power-loss guarantees.
+
+`event_index.prepare` publishes one selected `core-v1` scalar projection per unit. Its identity depends on raw hash, exact scope, SQL semantics and DuckDB version, not other units or ordering. It excludes original/nested JSON payloads; identity/key/target/document fields needed by browsing are prepared once. SQL NULL/type/time extraction retains the original producer semantics. Raw field filters and original detail still read exact original text through stored-ID joins. Physical predicates precede JSON projection; statements admit at most 512 selected rows or approximately 4 MiB of raw text, with one oversized record attempted intact. Validation/sorting/checkpoint and native memory remain separately materialized work, not bounded by those admission limits.
+
+`Store(case=...)` pins, verifies and attaches declared raw/prepared files read-only. It does not normalize, repair, register or implicitly omit unprepared selected units. All query consumers share its `events`/`browse_events` selection. Coverage identity is order-independent and includes case UUID, raw identities and selected scopes; enrichment, detection and GuardDuty links bind to that identity. GuardDuty snapshots themselves are allocated raw units, not sidecar rows appended with computed offsets. Findings/manual stores bind to the stable case UUID; saved query contexts additionally carry the selection identity. Acquired computer selectors use stable unit keys in case mode. An explicit reopen adopts later preparation; no hot rebind exists.
+
+Legacy database startup fails before evidence/sidecar access with instructions to re-ingest original inputs into a new case. There is no migration, automatic legacy sidecar adoption or dual-format viewer.
+
 ## Ownership map
 
 Python modules live in `src/kamotrace/`; frontend files are in its `static/` directory.
@@ -22,13 +34,13 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `trailcheck.py`, `ssmcheck.py`, `aws_policy.py` | Audit collection configuration/coverage and generate reviewable permission templates; never grant permissions or change AWS configuration. |
 | `importer.py` | Stream CloudTrail JSON into evidence DuckDB, verify canonical hashes and provenance, and provide output locking/staging/publication helpers. |
 | `other_events.py` | Stream provider-neutral JSONL into immutable DuckDB datasets and publish revisioned investigator-entered manual events separately. |
-| `datasets.py` | Persist evidence-bound append-only dataset startup bindings; preserve source order/offsets as EKS, UAC or other inputs arrive. |
+| `datasets.py` | Own the JSON case manifest, durable block reservations and immutable raw-unit registration. |
 | `suzaku.py`, `guardduty.py`, `enrich.py` | Build evidence-bound derived sidecars and load them read-only for investigation. |
 | `get_suzaku.py`, `get_dbip.py` | Download and verify optional external tools/data, separately from the application distribution. |
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
-| `computers.py`, `computer_registry.py` | Summarize bounded historical computer facts from attached prepared ECS datasets; discover evidence-bound registered acquisitions read-only without owning preparation, registration or recovery. |
+| `computers.py` | Summarize bounded historical computer facts from declared prepared acquisitions, selected by stable unit key. |
 | `server.py`, `pipeline.py` | Own investigation state and REST validation/query execution; parse and compile the versioned filter language. |
-| `event_index.py` | Build and validate a disposable persistent normalized-field cache; never own raw originals or investigator state. |
+| `event_index.py` | Explicitly prepare and validate per-unit scalar core outputs; verify and attach declared coverage without building at startup. |
 | `ssm.py` | Load JSON-backed command/output data, preserve system/plugin structure and link exact command identities to CloudTrail. |
 | `mcp_server.py` | Map MCP tools to the running server's REST API, without owning evidence or annotations. |
 | `static/app.js`, `index.html`, `app.css` | Event and SSM workspaces, query state, Findings and Event tags. |
@@ -74,54 +86,15 @@ annotations sidecar: another process would have its own stale temporary copy.
 Browser and MCP writes go through that Store, including optimistic note-edit
 checks. Sidecars and exports are loaded at startup, not live-watched.
 
-`other_events.py` uses the same event-column contract for immutable JSONL datasets, with explicit `other` labels, origin manifests, exact JSON numbers and namespaced review keys. Store attaches additional datasets read-only, then builds one temporary `events`/`browse_events` projection used by the shared query compiler, tag/Findings joins, histograms, exports and MCP. AWS linkage loaders run against the primary dataset before this union, so generic events cannot acquire guessed SSM or detection links. A generic import can also be the primary dataset of an AWS-free case.
+`other_events.py` uses the same event-column contract for immutable JSONL units, with explicit `other` labels, origin manifests, exact JSON numbers and namespaced review keys. Store composes the declared prepared selection into one temporary `events`/`browse_events` projection used by the shared query compiler, tag/Findings joins, histograms, exports and MCP. AWS linkage loaders use that same selection and explicit CloudTrail type restrictions, so generic events cannot acquire guessed SSM or detection links. A case can contain only generic acquisitions without AWS logs.
 
-`auto` records additional immutable inputs in `<database stem>.datasets.json`
-under the shared lock/staging/publication discipline. The binding keeps the primary
-evidence identity and each source's path, file hash, record count and physical
-offset. Existing entries remain in order; only new paths append, independent of
-source type. Store reads and verifies this binding first; new explicit or UAC-discovered
-paths must be registered through auto before a bound case can reopen. Legacy cases
-without bindings retain their existing startup order. Startup never registers or
-repairs data. Auto persists new registrations; missing or changed
-bound sources fail rather than disappearing. This preserves existing row IDs as
-new datasets arrive without changing content-addressed review identities. New
-sources invalidate the derived event cache normally; active viewers still need
-a coordinated restart, not an implicit live rebind.
+`auto --case` admits one explicitly named raw acquisition and invokes explicit preparation. Existing completed unit artifacts are verified and reused; new units never invalidate other units. The manifest alone declares visibility. Startup cannot discover additional files or repair missing preparation. Active viewers pin their selected artifacts until explicitly reopened.
 
-The immutable normalized columns (excluding `raw_event`) live in a derived
-`<database stem>.event-index.duckdb` cache. The first startup uses one set-based
-`INSERT SELECT` per source, preserving physical occurrences and offset row IDs,
-and verifies the exact source-record/hash/file/ordinal multiset against raw tables.
-The cache identity binds the ordered source paths, complete source-file SHA256s
-(including metadata and producer view definitions), normalization SELECTs, column
-names/types, cache schema version and DuckDB version. Source hashes are rechecked
-before atomic publication. Cache schema v2 records a row count and SHA256 of
-fixed-size SHA256 row digests in physical-ID order, not an XOR aggregate. Fields
-are cast to text before JSON-array encoding, preserving JSON numeric lexemes and
-distinguishing SQL NULL from empty strings or the string `null`. Reuse verifies
-the schema, scans/hashes every normalized field and checks every physical ID and
-its expected dataset range. Python fetches IDs and 32-byte digests in bounded
-1,000-row batches; DuckDB performs the ordered scan/sort and may spill. This is
-not a bound on total query RSS or spill volume. DuckDB also checks pages as read.
-This detects accidental damage, not a malicious writer forging the cache and its
-manifest. An unreadable/unrecognized file is never automatically overwritten;
-an identifiable stale/incomplete cache is rebuilt under the existing output lock,
-private staging and publication discipline. Integrity validation is real work:
-reuse still reads/hashes source files and scans cached columns, not just a lazy
-attachment. Old v1 XOR-signature caches are rebuilt rather than reused. Neither
-cache existence nor attachment alone proves readiness.
+Core validation compares the source-record/hash/file/ordinal multiset and scalar projection against the selected raw scope before publication. Reuse scans ordered fixed-size SHA256 row digests, with fields cast to text before JSON-array encoding to distinguish SQL NULL, empty text and literal `null`. Complete artifact hashes and case/unit metadata are checked. This detects accidental corruption, not a malicious writer forging both artifacts and manifest. Python fetch batches do not bound native sorting, spill or total RSS.
 
-Store attaches the published cache `READ_ONLY` and queries it directly, without
-copying it into a TEMP table. A temporary `event_raw` union reads original JSON
-from the source databases and joins on exact global `source_record`, not hashes,
-times or addresses. GuardDuty snapshots are appended from the loaded sidecar
-outside this cache, after immutable imports without changing their IDs or dataset
-membership. Manual events stay in their separate live branch; reviews,
-tags, enrichment, detections and external exports are not cached by this feature.
-Request-time external file access remains disabled after startup.
+Store attaches published raw/core artifacts `READ_ONLY` and queries them without copying core rows into a temporary table. Original JSON is joined by exact persisted `source_record`, never hashes, times or addresses. GuardDuty snapshots already occupy declared prepared units; their sidecar supplies only contextual links. Manual events stay in their separate live branch. Request-time external file access remains disabled after startup.
 
-Manual key events persist in `<database stem>.manual.duckdb`, bound to the primary import identity. Create/edit validates a record, holds the existing output lock, copies a positively identified manual dataset into private staging, retains the old revision and atomically publishes the replacement. Store updates its temporary manual snapshot under the query lock. Manual events use stable namespaced review keys, separate from changing `content_sha256`; imported records remain immutable. Edits require the current `updated` stamp. Revision authors are self-reported. The small investigator-authored dataset is copied per write; large external datasets use streamed immutable imports, not this write path. One Store/server must own the case. See the [public contract](user-guide.md#other-events-and-manual-key-events).
+Manual key events persist in `<case stem>.manual.duckdb`, bound to the stable case UUID. Create/edit validates a record, holds the existing output lock, copies a positively identified manual dataset into private staging, retains the old revision and atomically publishes the replacement. Store updates its temporary manual snapshot under the query lock. Manual events use stable namespaced review keys, separate from changing `content_sha256`; imported records remain immutable. Edits require the current `updated` stamp. Revision authors are self-reported. The small investigator-authored dataset is copied per write; large external datasets use streamed immutable imports, not this write path. One Store/server must own the case. See the [public contract](user-guide.md#other-events-and-manual-key-events).
 
 The supporting components answer different questions:
 
@@ -199,8 +172,9 @@ configuration, not observed traffic or incident-time reachability. IAM review
 signals are leads, not an effective-access calculation or a declaration of safety.
 At startup, optional `serve --eks-export` verifies and overlays current EKS
 observations onto this same resource/relationship model, without modifying either
-export. Auto supplies its selected EKS export for map context as well as the
-separate timeline import. EKS timestamps/provenance and coverage remain separate
+export. Auto passes an explicitly supplied `--eks-export` for map context;
+`--kind eks --source` alone admits timeline records, not inventory context.
+EKS timestamps/provenance and coverage remain separate
 from the network snapshot; mismatched accounts fail. Cluster/component links are
 configured relationships, not workload discovery, and EKS exposure stays Unknown.
 

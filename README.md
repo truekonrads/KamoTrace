@@ -2,13 +2,25 @@
 
 # <img src="docs/kamotrace-icon.png" alt="" width="40" height="40"> KamoTrace
 
-**From AWS login to an AI-assisted investigation in one command.**
+**Immutable acquisitions, explicit preparation and AI-assisted investigation.**
 
 KamoTrace collects CloudTrail and SSM activity, adds threat detections and IP
 context, and serves a local investigation workspace. Use the browser yourself
 or connect an AI assistant through MCP to investigate and record evidence-linked
 findings. Original CloudTrail records stay read-only; findings and tags live
 separately.
+
+## Explicit acquisition-unit preparation
+
+The new `--case` mode keeps raw acquisitions immutable and prepares only explicitly selected units. It uses one JSON manifest and stored sparse numeric row IDs; opening the viewer does not build missing preparation.
+
+```powershell
+kamotrace import --case C:\case\case.json --unit aws-acquisition-1 --source C:\exports\cloudtrail.json
+kamotrace prepare --case C:\case\case.json --unit aws-acquisition-1
+kamotrace serve --case C:\case\case.json
+```
+
+Use a new case path; no old IDs, annotations or sidecars are migrated or overwritten. The [fresh-case preparation reference](docs/preparation.md#fresh-acquisition-unit-cases) covers generic JSONL, completed TraceQuarry/UAC and EKS exports, selected physical-ID ranges, retry/publication rules and coverage-bound sidecars. Legacy viewer and positional auto startup fail with re-ingestion instructions; existing evidence is left untouched.
 
 ## Get started
 
@@ -54,31 +66,27 @@ access**. Findings return a nonzero exit status; unresolved placeholders must
 be replaced first. Policy files are never overwritten. If you already have
 exports, skip AWS access setup and use the offline example below.
 
-### 2. Run auto mode
+### 2. Collect, then prepare a case
 
 Log in with your usual AWS tooling using the investigation role, then choose
 a new case folder:
 
 ```powershell
 aws sso login --profile investigation
-kamotrace auto C:\cases\example --profile investigation
+kamotrace download --dest C:\cases\example\download --profile investigation --regions all --services cloudtrail ssm
+kamotrace auto --case C:\cases\example\case.json --unit aws-acquisition-1 --kind cloudtrail --source C:\cases\example\download\cloudtrail.json --ssm-export C:\cases\example\download\ssm.json
 ```
 
-**Auto handles the preparation:** collect CloudTrail and SSM across enabled
-regions, import the events, add Suzaku Sigma detections and offline DB-IP Lite
-enrichment, collect a current network and IAM inventory (users, roles, groups and
-customer policies; AWS-managed policy metadata only), then start the browser UI and MCP.
-Suzaku and DB-IP Lite are downloaded and verified if needed.
+**Auto handles explicit offline preparation:** admit one named acquisition, prepare its scalar core fields, optionally build supplied offline enrichment/detection sidecars, then start the browser UI and MCP. Collection, inventory snapshots and tool installation are separate commands. Nothing is collected or downloaded by opening a case.
 
 Open **http://127.0.0.1:8765** on the computer running KamoTrace. Leave the command
-running while you investigate. Interrupted? **Rerun the same command** to resume;
-use a new case folder for a fresh collection.
+running while you investigate. Interrupted? **Rerun the same command**: committed acquisitions are reused, while an unfinished unit restarts in private staging. Use a new destination for a fresh collection and a new unit key for a later acquisition.
 
 By default, collection requests the maximum available history: CloudTrail Event
 History retains 90 days of management events; SSM command and terminated session
 history generally retain 30 days. For a specific window, add
 `--start 2026-10-01 --end 2026-10-02` (both UTC dates included). With `--start`,
-auto prefers discovered S3 trail locations with readable listings for every requested
+`download` prefers discovered S3 trail locations with readable listings for every requested
 Region, allowing empty days and unused Regions; otherwise it uses Event History.
 Empty days are reported, not treated as proof of missing logs or complete coverage.
 Omit `--end` to collect through now
@@ -87,7 +95,7 @@ Omit `--end` to collect through now
 Already have a CloudTrail JSON export? Skip AWS collection:
 
 ```powershell
-kamotrace auto C:\cases\offline --source C:\exports\cloudtrail.json
+kamotrace auto --case C:\cases\offline\case.json --unit aws-acquisition-1 --kind cloudtrail --source C:\exports\cloudtrail.json
 ```
 
 See [auto options and recovery](docs/user-guide.md#full-auto-preparation) or
@@ -98,21 +106,21 @@ the [manual preparation and collection reference](docs/preparation.md) for more 
 Opt in to retained GuardDuty findings alongside the normal collection:
 
 ```powershell
-kamotrace auto C:\cases\example-gd --profile investigation --services cloudtrail ssm guardduty
+kamotrace download --dest C:\cases\gd-export --profile investigation --regions all --services cloudtrail ssm guardduty
 ```
 
 Or download findings separately and import them against existing evidence:
 
 ```powershell
 kamotrace download --dest C:\cases\gd-export --profile investigation --regions all --services guardduty
-kamotrace guardduty --database C:\cases\example\case.duckdb --findings C:\cases\gd-export\guardduty.json
+kamotrace guardduty --case C:\cases\example\case.json --snapshot-unit alerts-acquisition-1 --findings C:\cases\gd-export\guardduty.json
 ```
 
 Existing AWS `GetFindings` JSON (`Findings` array), or a bare findings array, works
-offline too. Auto accepts `--guardduty-findings FILE` with existing CloudTrail inputs.
-The derived `<database>.guardduty.duckdb` sidecar is picked up by `serve` on restart
+offline too. Auto accepts `--guardduty-findings FILE --snapshot-unit KEY` with explicit CloudTrail inputs.
+The derived `<case stem>.guardduty.duckdb` sidecar is picked up by `serve` on restart
 (or pass `--guardduty PATH`). Use `--replace` to rebuild a recognised GuardDuty
-sidecar; original evidence is never modified. Auto reuses verified unchanged inputs.
+sidecar; raw snapshot units are immutable and require a new acquisition key for changed input. Original evidence is never modified.
 
 The **Detections** tab and MCP `list_detections` / `query.rules` include explicitly
 labelled **GuardDuty context (not exact)** leads. Context requires the finding's

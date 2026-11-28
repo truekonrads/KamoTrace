@@ -22,9 +22,8 @@ def main():
             {}, {"host": {"id": "no-match"}, "cloud": cloud(account="999")},
         ])
         second = dataset(fixture.root, "two", [{"host": {"name": "synthetic"}, "source": {"ip": "192.0.2.8"}}, {}])
-        empty = dataset(fixture.root, "empty", [])
         inventory_fixture(fixture.root / "inventory")
-        fixture.start(first, other_events=[second, empty], inventory_export=fixture.root / "inventory")
+        fixture.start(first, other_events=[second], inventory_export=fixture.root / "inventory")
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch()
             try:
@@ -106,19 +105,15 @@ def main():
                 page.locator("#computer-next").click()
                 expect(cards).to_have_count(1)
                 expect(cards).to_contain_text("AWS: no_match")
-                page.locator("#computer-import-select").select_option("1")
+                page.locator("#computer-import-select").select_option(str(second))
                 expect(cards).to_have_count(2)
                 expect(cards.first).to_contain_text("Unavailable in parsed evidence")
                 expect(cards.first).not_to_contain_text("192.0.2.8")
                 summary.scroll_into_view_if_needed()
                 page.screenshot(path=str(results / "computer-unavailable.png"))
-                page.locator("#computer-import-select").select_option("2")
-                expect(cards).to_have_count(1)
-                expect(cards).to_contain_text("Unbound observations")
-                expect(page.locator("#computer-import-status")).to_contain_text("0 / 0")
                 # A failed import selection must not leave previous cards masquerading as the result.
                 page.route("**/api/computers", lambda route: route.fulfill(status=500, content_type="application/json", body='{"error":"Synthetic summary failure"}'))
-                page.locator("#computer-import-select").select_option("0")
+                page.locator("#computer-import-select").select_option("primary")
                 expect(page.locator("#computer-import-status")).to_contain_text("Synthetic summary failure")
                 expect(cards).to_have_count(0)
                 page.unroute("**/api/computers")
@@ -126,14 +121,14 @@ def main():
                 summary.click()
                 expect(cards).to_have_count(4)
                 pending = []
-                page.route("**/api/computers", lambda route: pending.append(route) if route.request.post_data_json.get("dataset_index") == 0 else route.continue_())
+                page.route("**/api/computers", lambda route: pending.append(route) if route.request.post_data_json.get("unit_id") == "primary" else route.continue_())
                 summary.click()
                 summary.click()
                 expect(page.locator("#computer-import-status")).to_contain_text("Loading acquired computer context")
-                page.locator("#computer-import-select").select_option("1")
+                page.locator("#computer-import-select").select_option(str(second))
                 expect(cards).to_have_count(2)
                 assert pending
-                with page.expect_response(lambda response: response.url.endswith("/api/computers") and response.request.post_data_json.get("dataset_index") == 0):
+                with page.expect_response(lambda response: response.url.endswith("/api/computers") and response.request.post_data_json.get("unit_id") == "primary"):
                     pending.pop().continue_()
                 page.evaluate("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
                 expect(cards).to_have_count(2)

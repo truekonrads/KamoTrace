@@ -82,24 +82,24 @@ def prepare(connection, sources):
                                              "observation_role", "namespace_basis", "node", "node_uid", "target_resource", "target_namespace")},
                "status_code": "INTEGER", "outcome": "VARCHAR", "actor": "VARCHAR", "source_type": "VARCHAR",
                "source": "JSON"}
-    datasets, offset = [], 0
+    datasets = []
     connection.execute("BEGIN TRANSACTION")
     try:
         connection.execute("CREATE TEMP TABLE eks_pod_observations (" + ",".join(f'"{key}" {kind}' for key, kind in columns.items()) + ")")
         connection.execute("CREATE TEMP TABLE eks_pod_log_counts (account VARCHAR, region VARCHAR, cluster VARCHAR, time TIMESTAMPTZ, malformed BOOLEAN, unrecognized BOOLEAN)")
         for index, info in enumerate(sources):
-            source_offset = offset
-            offset += int(info["records"])
             if info.get("origin") != ORIGIN:
                 continue
-            dataset = {"dataset_index": index, "origin": info["origin"], "records": info["records"],
+            dataset = {"dataset_index": index, "origin": info["origin"], "records": info["prepared_coverage"]["records"],
                        "source_sha256": info.get("source_sha256"), "manifest": None, "coverage_records": []}
             datasets.append(dataset)
             # Attached evidence catalogs are shared by cursors; the Store's TEMP views are not.
-            catalog = "evidence" if index == 0 else f"other_{index - 1}"
+            from .event_index import scope_sql
+            catalog = info["case_catalog"]
+            predicate = scope_sql(info["prepared_coverage"]["ranges"])
             cursor = connection.cursor()
             try:
-                cursor.execute(f"SELECT source_record + ?, record_sha256, raw_event->>'$.date', raw_event::VARCHAR FROM {catalog}.raw_events ORDER BY source_record", [source_offset])
+                cursor.execute(f"SELECT source_record, record_sha256, raw_event->>'$.date', raw_event::VARCHAR FROM {catalog}.raw_events WHERE {predicate} ORDER BY source_record")
                 while batch := cursor.fetchmany(500):
                     observations, counts = [], []
                     for record, digest, stamp, raw in batch:

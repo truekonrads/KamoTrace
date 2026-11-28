@@ -23,7 +23,8 @@ from mcp import Client, StdioServerParameters
 from kamotrace.cli import main
 from kamotrace import eks
 from kamotrace.importer import sha256
-from kamotrace.server import Handler, Store
+from kamotrace.server import Handler
+from case_fixtures import open_fixture as Store
 from kamotrace.mcp_server import http_transport
 from kamotrace.suzaku import evidence_identity
 
@@ -130,6 +131,31 @@ class EKSContract(unittest.TestCase):
             *(["--log-group", REGION + ":/workloads/app"] if extra else []))
         return output, database
 
+    def test_fresh_case_offline_auto_retains_export_identity_and_sparse_ids(self):
+        from kamotrace.datasets import read_case
+        export, _ = self.collect(extra=True)
+        case = self.root / "case.json"
+        arguments = ("auto", "--case", case, "--unit", "eks-acquisition-1", "--kind", "eks",
+                     "--source", export, "--no-serve")
+        self.run_cli(*arguments)
+        first = read_case(case)
+        self.assertEqual(len(first["units"][0]["input"]["sources"]), 3)
+        self.run_cli(*arguments)
+        self.assertEqual(read_case(case), first)
+        self.run_cli("auto", "--case", case, "--unit", "eks-acquisition-2", "--kind", "eks",
+                     "--source", export, "--no-serve")
+        store = Store(case=case, units=["eks-acquisition-2"], eks_export=export)
+        self.stack.callback(store.selection_directory.cleanup)
+        self.stack.callback(store.connection.close)
+        self.stack.callback(store.reviews.close)
+        selected = store.query({"search": "CloudWatch log event", "start": START, "end": END})
+        self.assertEqual(selected["last_row"], 3)
+        self.assertTrue(all(r["id"] >= 65537 for r in selected["data"]))
+        self.assertEqual(store.coverage["excluded_units"], ["eks-acquisition-1"])
+        self.assertIn("9007199254740993", store.detail(selected["data"][-1]["id"])["raw_json"])
+        for stub in self.stubs.values():
+            stub.assert_no_pending_responses()
+
     def test_collection_offline_import_auto_and_real_mcp(self):
         export, dataset = self.collect(extra=True)
         info = eks.read_export(export)
@@ -143,53 +169,30 @@ class EKSContract(unittest.TestCase):
         ct = self.root / "ct.json"
         ct.write_text('{"Records":[{"eventID":"synthetic","eventTime":"2026-10-01T00:00:00Z","eventName":"ConsoleLogin"}]}')
         target = self.root / "case"
-        database = target / "case.duckdb"
-        self.run_cli("import", "--source", ct, "--database", database)
-        additional = []
+        case = target / "case.json"
+        self.run_cli("auto", "--case", case, "--unit", "cloudtrail", "--kind", "cloudtrail", "--source", ct, "--no-serve")
         for label, count in [("explicit", 2), ("registered", 3)]:
             source = self.root / (label + ".jsonl")
             source.write_text("\n".join(json.dumps({"date": START, "content": f"existing-{label}-{i}"}) for i in range(count)))
-            path = self.root / (label + ".duckdb")
-            self.run_cli("import-other", "--source", source, "--database", path, "--origin", label)
-            additional.append(path)
-        with duckdb.connect(str(database), read_only=True) as connection:
-            identity = list(evidence_identity(connection))
-        with duckdb.connect(str(database.with_suffix(".uac.duckdb"))) as connection:
-            connection.execute("CREATE TABLE build_info(metadata JSON)")
-            connection.execute("INSERT INTO build_info VALUES (?)", [json.dumps({"format": "kamotrace-uac-registry-v1", "evidence": identity,
-                "imports": [{"database": str(additional[1]), "sha256": sha256(additional[1])}], "attempts": []})])
-        argv = ["auto", target, "--source", ct, "--eks-export", export, "--other-events", additional[0],
-                "--skip-inventory", "--skip-suzaku", "--skip-enrich", "--no-serve"]
+            self.run_cli("auto", "--case", case, "--unit", label, "--kind", "generic", "--source", source,
+                         "--origin", label, "--no-serve")
+        argv = ["auto", "--case", case, "--unit", "eks", "--kind", "eks", "--source", export, "--no-serve"]
         with patch("kamotrace.eks.boto3.Session", side_effect=AssertionError("Offline must not contact AWS")):
             text = self.run_cli(*argv)
-            self.assertIn("--other-events", text)
-            self.assertIn(f"--eks-export {export}", text)
+            self.assertIn(f"serve --case {case}", text)
             self.run_cli(*argv)
             self.run_cli("eks", "--from-export", export, "--database", self.root / "offline.duckdb")
-        command = text.split("start later with: ", 1)[1].strip()
-        attachments = [Path(path) for path in re.findall(r"--other-events (.*?)(?= --other-events |$)", command)]
-        self.assertEqual(attachments, [*additional, target / "case.eks.duckdb"])
-        binding_path = database.with_suffix(".datasets.json")
-        original_binding = json.loads(binding_path.read_text())
-        late_source, late = self.root / "late.jsonl", self.root / "late.duckdb"
+        from kamotrace.datasets import read_case
+        original_binding = read_case(case)
+        late_source = self.root / "late.jsonl"
         late_source.write_text("\n".join(json.dumps({"date": START, "content": f"later-arrival-{i}"}) for i in range(4)))
-        self.run_cli("import-other", "--source", late_source, "--database", late, "--origin", "later arrival")
-        # A UAC-style registered arrival after EKS must not move EKS or earlier datasets.
-        with duckdb.connect(str(database.with_suffix(".uac.duckdb"))) as connection:
-            value = json.loads(connection.execute("SELECT metadata FROM build_info").fetchone()[0])
-            value["imports"].append({"database": str(late), "sha256": sha256(late)})
-            connection.execute("UPDATE build_info SET metadata=?", [json.dumps(value)])
-        with self.assertRaisesRegex(ValueError, "registered with kamotrace auto"):
-            Store(database)
-        self.assertEqual(json.loads(binding_path.read_text()), original_binding)
         with patch("kamotrace.eks.boto3.Session", side_effect=AssertionError("Adding offline data must not contact AWS")):
-            self.run_cli("auto", target, "--source", ct, "--skip-inventory", "--skip-suzaku", "--skip-enrich", "--no-serve")
-        new_binding = json.loads(binding_path.read_text())
-        self.assertEqual(new_binding["datasets"][:3], original_binding["datasets"])
-        self.assertEqual(new_binding["datasets"][3]["database"], str(late))
-        # No repeated --other-events flags are needed when reopening the recorded case.
+            self.run_cli("auto", "--case", case, "--unit", "late", "--kind", "generic", "--source", late_source,
+                         "--origin", "later arrival", "--no-serve")
+        self.assertEqual(read_case(case)["units"][:4], original_binding["units"])
         with patch("kamotrace.eks.boto3.Session", side_effect=AssertionError("Inventory startup must be offline")):
-            store = Store(database, eks_export=export)
+            store = Store(case=case, eks_export=export)
+        self.stack.callback(store.selection_directory.cleanup)
         self.stack.callback(store.connection.close)
         self.stack.callback(store.reviews.close)
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, store=store))
@@ -219,7 +222,7 @@ class EKSContract(unittest.TestCase):
         query = {"pipeline_version": 1, "pipeline": 'event_type = "other" | search "CloudWatch log event"', "start": START, "end": END}
         with urlopen(Request(url + "/api/events", data=json.dumps(query).encode(), headers={"Content-Type": "application/json"})) as response:
             self.assertEqual(json.load(response)["last_row"], 3)
-        for label, ids in [("explicit", {2, 3}), ("registered", {4, 5, 6})]:
+        for label, ids in [("explicit", {65537, 65538}), ("registered", {131073, 131074, 131075})]:
             with urlopen(Request(url + "/api/events", data=json.dumps({"search": "existing-" + label}).encode(),
                                  headers={"Content-Type": "application/json"})) as response:
                 self.assertEqual({r["id"] for r in json.load(response)["data"]}, ids)
@@ -315,29 +318,21 @@ class EKSContract(unittest.TestCase):
         self.assertGreater(info["received_log_message_bytes"], 1)
         self.assertTrue(any(op["status"] == "log_limit" for op in info["operations"]))
 
-    def test_online_auto_inventory_resume_and_scope_change(self):
+    def test_collection_then_explicit_admission_reuses_frozen_export(self):
         self.stubs["eks"].add_response("list_clusters", {"clusters": []}, {})
         self.stubs["logs"].add_response("describe_log_groups", {"logGroups": []}, {"logGroupNamePrefix": "/aws/eks/"})
-        ct = self.root / "ct.json"
-        ct.write_text('{"Records":[{"eventID":"synthetic","eventTime":"2026-10-01T00:00:00Z"}]}')
-        target = self.root / "case"
-        args = ["auto", target, "--source", ct, "--regions", REGION, "--collect-eks", "--skip-inventory", "--skip-suzaku", "--skip-enrich", "--no-serve"]
+        export, _ = self.collect()
+        case = self.root / "case.json"
+        args = ["auto", "--case", case, "--unit", "eks", "--kind", "eks", "--source", export, "--no-serve"]
         self.run_cli(*args)
-        before = sha256(target / "case.duckdb")
+        before = case.read_bytes()
         with patch("kamotrace.eks.boto3.Session", side_effect=AssertionError("Resume must not contact AWS")):
             self.run_cli(*args)
-            self.run_cli(*args, "--eks-max-events", 1, status=1)
-        self.assertEqual(sha256(target / "case.duckdb"), before)
-        self.assertIn("--other-events", self.run_cli(*args))
-        binding = (target / "case.duckdb").with_suffix(".datasets.json")
-        original = binding.read_text()
-        invalid = json.loads(original)
-        invalid["datasets"][0]["offset"] += 1
-        binding.write_text(json.dumps(invalid))
-        with patch("kamotrace.eks.boto3.Session", side_effect=AssertionError("No AWS retry for an invalid local binding")):
+        self.assertEqual(case.read_bytes(), before)
+        (export / "events.jsonl").write_text("changed export")
+        with patch("kamotrace.eks.boto3.Session", side_effect=AssertionError("No AWS retry for a changed export")):
             self.run_cli(*args, status=1)
-        self.assertEqual(json.loads(binding.read_text()), invalid)
-        self.assertEqual(sha256(target / "case.duckdb"), before)
+        self.assertEqual(case.read_bytes(), before)
 
     def test_log_volume_warning_threshold_and_unknown_sizes(self):
         cases = [(399_999_999, True, False), (400_000_000, True, True),
@@ -459,7 +454,7 @@ class PodObservationsContract(unittest.TestCase):
                     self.assertEqual(pages[0]["coverage_records_total"], 12)
                     self.assertEqual([page["coverage_next_page"] for page in pages], [2, None])
                     links = [link for page in pages for link in page["coverage_records"]]
-                    self.assertEqual([link["id"] for link in links], [*range(1, 7), *range(8, 14)])
+                    self.assertEqual([link["id"] for link in links], [*range(1, 7), *range(65537, 65543)])
                     self.assertEqual({link["operations_with_gaps"] for link in links}, {1})
                     original = await client.call_tool("get_event", {"id": links[-1]["id"]})
                     self.assertTrue(original.structured_content["raw_json_matches_hash"])
@@ -613,8 +608,8 @@ class PodObservationsContract(unittest.TestCase):
                 self.assertEqual(request({**query, "pod": "reused", "namespace": "operations"})["total"], 0)
                 self.assertEqual(request({**query, "pod": "' OR true --"})["total"], 0)
                 target = next(r for r in targets if r["uid"] == "target-old")
-                self.assertEqual(target["id"], 6)  # Two CloudTrail + three unrelated rows precede this source.
-                with urlopen(url + "/api/events/6") as response:
+                self.assertEqual(target["id"], 131073)  # Third acquisition reserves its own block.
+                with urlopen(url + "/api/events/131073") as response:
                     detail = json.load(response)
                 self.assertEqual(detail["record_sha256"], target["record_sha256"])
                 self.assertEqual(json.loads(detail["raw_json"])["content"]["event"]["message"], records[0]["content"]["event"]["message"])
@@ -630,7 +625,7 @@ class PodObservationsContract(unittest.TestCase):
                         self.assertEqual(pods.structured_content["data"], result["data"])
                         self.assertEqual(pods.structured_content["contexts"], result["contexts"])
                         self.assertEqual(pods.structured_content, request({**query, "projection": "summary", "size": 10}))
-                        self.assertEqual(pods.structured_content["coverage"]["coverage_records"][0]["id"], 17)
+                        self.assertEqual(pods.structured_content["coverage"]["coverage_records"][0]["id"], 131084)
                         for filters, expected in (({"pod": "reused", "uid": "target-old"}, 1),
                                                   ({"pod": "reused", "namespace": "operations"}, 0),
                                                   ({"account": "999999999999"}, 2),

@@ -26,11 +26,13 @@ def summarize(connection, dataset, metadata, inventory):
     manifest = metadata["tracequarry"]["manifest"]
     settings = manifest.get("settings", {})
     groups = {}
-    cursor = connection.execute("""SELECT source_record, record_sha256,
+    membership = "unit_id" if metadata.get("unit_id") else "dataset_index"
+    cursor = connection.execute(f"""SELECT source_record, record_sha256,
         json_extract(raw_event, '$.host'), json_extract(raw_event, '$.cloud'),
         json_extract(raw_event, '$.uac'),
         json_extract(raw_event, '$.tracequarry.extra.host_basis')
-        FROM events WHERE dataset_index=? ORDER BY source_record LIMIT ?""", [dataset, SCAN_LIMIT + 1])
+        FROM events WHERE {membership}=? ORDER BY source_record LIMIT ?""",
+        [metadata.get("unit_id", dataset), SCAN_LIMIT + 1])
     scanned = 0
     while row := cursor.fetchone():
         if scanned == SCAN_LIMIT:
@@ -131,7 +133,9 @@ def summarize(connection, dataset, metadata, inventory):
         group["acquisition_time"] = settings.get("acquisition_time")
         group["acquisition_basis"] = settings.get("acquisition_basis")
         group["collection_label"] = settings.get("host")
-    return {"dataset_index": dataset, "imported_at": metadata.get("imported_at"),
+    return {"dataset_index": dataset, "unit_id": metadata.get("unit_id"), "imported_at": metadata.get("imported_at"),
         "manifest_sha256": metadata.get("source_sha256"), "run_id": manifest.get("run_id"),
-        "records": metadata["records"], "scanned": scanned, "scan_limit": SCAN_LIMIT,
-        "truncated": metadata["records"] > scanned, "cards": list(groups.values())}
+        "records": metadata.get("prepared_coverage", {}).get("records", metadata["records"]),
+        "scanned": scanned, "scan_limit": SCAN_LIMIT,
+        "truncated": metadata.get("prepared_coverage", {}).get("records", metadata["records"]) > scanned,
+        "cards": list(groups.values())}

@@ -34,6 +34,8 @@ def sha256(path):
 
 def evidence_identity(connection, schema="main"):
     """Provenance of an evidence database as recorded by `kamotrace import`."""
+    if connection.execute("SELECT count(*) FROM duckdb_tables() WHERE temporary AND table_name='case_binding'").fetchone()[0]:
+        return tuple(connection.execute("SELECT source_sha256, records FROM case_binding").fetchone())
     row = connection.execute(f"SELECT metadata FROM {schema}.build_info").fetchone()
     info = json.loads(row[0])
     return info["source_sha256"], int(info["records"])
@@ -83,15 +85,16 @@ def run_options(executable, rules=None, min_level=None):
             **{f"{name}_sha256": tree_sha256(path) if path.exists() else None for name, path in folders.items()}}
 
 
-def import_timeline(database, timeline, output, replace=False, source=None, label=None, options=None, lock=True):
+def import_timeline(database, timeline, output, replace=False, source=None, label=None, options=None, lock=True,
+                    *, case=False, units=None):
     """Link a Suzaku aws-ct-timeline DuckDB file to evidence records and write `output`.
 
     Pass lock=False only while already holding write_lock(output)."""
     with write_lock(output) if lock else nullcontext():
-        return _import_timeline(database.resolve(), timeline.resolve(), output.resolve(), replace, source, label, options)
+        return _import_timeline(database.resolve(), timeline.resolve(), output.resolve(), replace, source, label, options, case, units)
 
 
-def _import_timeline(database, timeline, output, replace, source, label, options):
+def _import_timeline(database, timeline, output, replace, source, label, options, case=False, units=None):
     inputs = [database, timeline, source]
     check_output(output, replace, "detections", "suzaku_run", {"detections", "suzaku_run"}, inputs)
     discard_abandoned(output, inputs)
@@ -99,7 +102,13 @@ def _import_timeline(database, timeline, output, replace, source, label, options
         connection = duckdb.connect(str(building))
         try:
             connection.execute("SET TimeZone='UTC'")
-            connection.execute("ATTACH ? AS ev (READ_ONLY)", [str(database)])
+            if case:
+                from .datasets import read_case
+                from .event_index import attach_case
+                attach_case(connection, read_case(database), units)
+            else:
+                connection.execute("ATTACH ? AS ev (READ_ONLY)", [str(database)])
+            input_events = "events" if case else "ev.events"
             connection.execute("ATTACH ? AS tl (READ_ONLY)", [str(timeline)])
             tables = {r[0] for r in connection.execute(
                 "SELECT table_name FROM duckdb_tables() WHERE database_name='tl'").fetchall()}
@@ -117,7 +126,7 @@ def _import_timeline(database, timeline, output, replace, source, label, options
             # row lists its members' eventIDs (and regions) joined by " ¦ " with the latest member's time, so
             # each member must match one of those regions at or before that time. A row links only when every
             # member matches exactly one canonical record (identical duplicate records share a hash and all link).
-            connection.execute("""
+            connection.execute(f"""
                 CREATE TABLE detections AS
                 WITH t AS (
                     SELECT row_number() OVER () AS suzaku_row, *, timezone('UTC', "Timestamp") AS event_time,
@@ -129,7 +138,7 @@ def _import_timeline(database, timeline, output, replace, source, label, options
                 ), m AS (
                     SELECT p.suzaku_row, p.member_id, p.members, e.source_record, e.record_sha256,
                         count(DISTINCT e.record_sha256) OVER (PARTITION BY p.suzaku_row, p.member_id) AS hashes
-                    FROM p JOIN ev.events e ON e.event_id = p.member_id AND CASE WHEN p.members = 1
+                    FROM p JOIN {input_events} e ON e.event_id = p.member_id AND CASE WHEN p.members = 1
                         THEN e.aws_region IS NOT DISTINCT FROM p.AwsRegion AND e.event_time = p.event_time
                         ELSE list_contains(p.regions, e.aws_region) AND e.event_time <= p.event_time END
                 ), complete AS (
@@ -166,7 +175,9 @@ def _import_timeline(database, timeline, output, replace, source, label, options
                    "ambiguous_rows": counts.get("ambiguous", 0)}
             connection.execute("CREATE TABLE suzaku_run (metadata JSON)")
             connection.execute("INSERT INTO suzaku_run VALUES (?)", [json.dumps(run)])
-            connection.execute("DETACH ev; DETACH tl; CHECKPOINT")
+            if not case:
+                connection.execute("DETACH ev")
+            connection.execute("DETACH tl; CHECKPOINT")
         finally:
             connection.close()
         # Recheck just before publication: the output may have changed while this was built.
@@ -260,7 +271,10 @@ def load_detections(connection, path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace suzaku", description=__doc__.splitlines()[0])
-    parser.add_argument("--database", type=Path, required=True, help="Evidence DuckDB built by `kamotrace import`")
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--database", type=Path, help="Legacy evidence DuckDB")
+    destination.add_argument("--case", type=Path, help="Fresh case manifest; use declared prepared coverage")
+    parser.add_argument("--unit", action="append", help="Explicit selected case units (default: all)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--timeline", type=Path, help="Existing `suzaku aws-ct-timeline -t duckdb` output (.duckdb)")
     group.add_argument("--suzaku", type=Path,
@@ -271,6 +285,9 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="Detections sidecar (default: <database>.detections.duckdb)")
     parser.add_argument("--replace", action="store_true", help="Replace an existing detections sidecar")
     args = parser.parse_args(argv)
+    if args.unit and not args.case:
+        parser.error("--unit requires --case")
+    database = args.case or args.database
     if not args.timeline and not args.suzaku:
         from .get_suzaku import installed, tools_folder
         args.suzaku = installed()
@@ -280,19 +297,20 @@ def main(argv=None):
         parser.error("running Suzaku needs --source (the export you imported), or pass --timeline")
     if (args.rules or args.min_level) and not args.suzaku:
         parser.error("--rules/--min-level only apply when running --suzaku")
-    for path in (args.database, args.timeline, args.suzaku, args.source):
+    for path in (database, args.timeline, args.suzaku, args.source):
         if path is not None and not path.exists():
             parser.error(f"not found: {path}")
-    output = args.output or args.database.with_suffix(".detections.duckdb")
+    output = args.output or database.with_suffix(".detections.duckdb")
     work = None
     try:
         with write_lock(output):  # Before running Suzaku, so a busy output fails fast
             timeline = args.timeline
             if args.suzaku:
                 work, timeline = run_suzaku(args.suzaku, args.source, args.rules, args.min_level)
-            run = import_timeline(args.database, timeline, output, args.replace, args.source,
+            run = import_timeline(database, timeline, output, args.replace, args.source,
                                   "(temporary output of the Suzaku run, deleted)" if work else None,
-                                  run_options(args.suzaku, args.rules, args.min_level) if work else None, lock=False)
+                                  run_options(args.suzaku, args.rules, args.min_level) if work else None, lock=False,
+                                  case=bool(args.case), units=args.unit)
     except (FileExistsError, BlockingIOError, ValueError, RuntimeError) as error:  # Without a KamoTrace traceback
         parser.error(str(error))
     finally:

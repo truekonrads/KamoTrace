@@ -168,6 +168,14 @@ function normalize(state) {
   const start = Number(s.start),
     end = Number(s.end);
   return {
+    case_context:
+      s.case_context ??
+      (meta.case_coverage
+        ? {
+            case_id: meta.case_coverage.case_id,
+            selection_id: meta.case_coverage.selection_id,
+          }
+        : null),
     timezone: meta.timezones.includes(s.timezone) ? s.timezone : meta.timezone,
     start: Number.isFinite(start) ? start : (meta.start_ms ?? 0),
     end: Number.isFinite(end) ? end : (meta.end_ms ?? 1000),
@@ -201,6 +209,16 @@ function normalize(state) {
 async function apply(state, push = true, guardDraft = false) {
   const requestId = ++latestApply;
   const next = normalize(state);
+  if (
+    next.case_context &&
+    (next.case_context.case_id !== meta.case_coverage?.case_id ||
+      next.case_context.selection_id !== meta.case_coverage?.selection_id)
+  ) {
+    error(
+      "Saved query belongs to different case/coverage; reopen its declared selection.",
+    );
+    return;
+  }
   if (!(next.start < next.end)) {
     error("Choose a valid time range: start must be before the exclusive end.");
     return;
@@ -278,6 +296,7 @@ function go(step) {
 
 function query() {
   return {
+    case_context: applied.case_context,
     timezone: applied.timezone,
     ...(!applied.undated
       ? {
@@ -4627,6 +4646,18 @@ async function init() {
     $(id).disabled = meta.start_ms === null;
   $("undated-events").onchange = () =>
     apply({ ...applied, undated: $("undated-events").checked });
+  $("case-coverage").hidden = !meta.case_coverage;
+  if (meta.case_coverage) {
+    const coverage = meta.case_coverage;
+    const partial = coverage.units.filter((u) => u.records < u.raw_records);
+    $("case-coverage").textContent =
+      `Prepared coverage · ${coverage.units.length} selected units · ` +
+      `${coverage.units.reduce((n, u) => n + u.records, 0)} of ` +
+      `${coverage.units.reduce((n, u) => n + u.raw_records, 0)} selected imported occurrences prepared · ` +
+      `${partial.length} partially prepared units · ` +
+      `${coverage.excluded_units.length} explicitly excluded units. ` +
+      "All queries and counts use this pinned coverage; unprepared records are not searched.";
+  }
   $("parser-coverage").hidden =
     !meta.source_coverage?.length && !meta.uac?.attempts.length;
   $("parser-coverage-json").textContent = JSON.stringify(

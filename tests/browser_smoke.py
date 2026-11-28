@@ -12,7 +12,8 @@ from playwright.sync_api import expect, sync_playwright
 from test_contract import BrowserContract, MFAContract
 from test_eks import EKSContract, REGION, START
 from kamotrace import eks, other_events
-from kamotrace.server import Handler, Store
+from kamotrace.server import Handler
+from case_fixtures import open_fixture as Store
 
 
 def event_grid_response(response):

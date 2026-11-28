@@ -25,7 +25,8 @@ import simplejson as precise_json
 from kamotrace.importer import sha256
 from kamotrace.mcp_server import http_transport
 from kamotrace.other_events import initialize, FORMAT
-from kamotrace.server import Handler, Store
+from kamotrace.server import Handler
+from case_fixtures import open_fixture as Store
 from kamotrace.suzaku import evidence_identity
 
 
@@ -138,7 +139,7 @@ class ComputerContract(unittest.TestCase):
             reviewed = json.load(response)
         self.assertEqual([t["slug"] for t in reviewed["tags"]], ["card-reviewed"])
         self.assertEqual(reviewed["annotations"], [finding["id"]])
-        other = self.call(body={"dataset_index": 1})
+        other = self.call(body={"unit_id": str(second)})
         self.assertEqual(other["cards"][0]["facts"]["hostname"]["values"][0]["value"], "different-import")
         self.assertEqual(self.call("/api/events")["last_row"], 6)
         self.assertEqual(self.call("/api/histogram")["total"], 6)
@@ -177,14 +178,16 @@ class ComputerContract(unittest.TestCase):
         first = dataset(self.root, "limited", [{"host": {"id": "same"}, "cloud": cloud()},
             {"host": {"id": "same"}, "cloud": cloud("i-other")}])
         empty = dataset(self.root, "empty", [])
-        self.start(first, other_events=[empty])
+        from case_fixtures import case_for
+        with self.assertRaisesRegex(ValueError, "Empty acquisitions"):
+            case_for(empty)
+        self.start(first)
         with patch("kamotrace.computers.SCAN_LIMIT", 1):
             result = self.call()
         self.assertEqual((result["scanned"], result["truncated"]), (1, True))
         self.assertEqual(result["cards"][0]["aws"]["status"], "ambiguous")
-        result = self.call(body={"dataset_index": 1})
-        self.assertEqual((result["records"], result["total"]), (0, 1))
-        self.assertEqual(result["cards"][0]["facts"], {})
+        with self.assertRaises(HTTPError):
+            self.call(body={"unit_id": str(empty)})
 
     def test_registered_discovery_preserves_inputs_reviews_and_mcp_navigation(self):
         primary = dataset(self.root, "primary", [{"host": {"id": "original"}}])
@@ -201,16 +204,15 @@ class ComputerContract(unittest.TestCase):
         protected = [primary, additional, primary.with_suffix(".uac.duckdb")]
         before = [(sha256(p), p.stat().st_mtime_ns) for p in protected]
         self.start(primary, other_events=[additional])  # Explicit+automatic must attach once.
-        cards = self.call(body={"dataset_index": 1})
+        cards = self.call(body={"unit_id": str(additional)})
         self.assertEqual((len(cards["imports"]), cards["total"], cards["records"]), (2, 1, 1))
         record = cards["cards"][0]["sample_record"]
-        self.assertEqual(record, 2)
+        self.assertEqual(record, 65537)
         for route in ("/api/meta", "/api/schema"):
             request = Request(self.url + route, data=b"{}", headers={"Content-Type": "application/json"})
             with urlopen(request) as response:
                 loaded = precise_json.loads(response.read(), use_decimal=True)
-            self.assertEqual(loaded["uac"], value)
-            self.assertEqual(loaded["uac"]["imports"][0]["ledger"]["omitted_links"][0]["mtime"].as_tuple(), fraction.as_tuple())
+            self.assertEqual({u["unit_id"] for u in loaded["case_coverage"]["units"]}, {"primary", str(additional)})
         self.assertEqual(self.call("/api/histogram")["total"], 1)
         self.assertEqual(self.call("/api/events", {"filters": [{"field": "time_local", "op": "missing"}]})["last_row"], 1)
         digest = cards["cards"][0]["facts"]["host_id"]["values"][0]["provenance"]["record_sha256"]
@@ -236,8 +238,7 @@ class ComputerContract(unittest.TestCase):
             self.call("/api/uac-alerts")
         self.assertEqual(error.exception.code, 404)
 
-    def test_registry_mismatch_missing_changed_and_malformed_fail_closed(self):
-        from kamotrace.computer_registry import registered
+    def test_legacy_registry_is_never_adopted_or_modified(self):
         primary = dataset(self.root, "primary", [{}])
         additional = dataset(self.root, "additional", [{}])
         with duckdb.connect(str(primary), read_only=True) as connection:
@@ -251,8 +252,16 @@ class ComputerContract(unittest.TestCase):
             with self.subTest(value=changed):
                 registry_fixture(primary, changed)
                 before = [sha256(p) for p in (primary, additional, primary.with_suffix(".uac.duckdb"))]
-                with self.assertRaises(ValueError):
-                    registered(primary)
+                from case_fixtures import case_for
+                from kamotrace.server import Store as CaseStore
+                store = CaseStore(case=case_for(primary))
+                try:
+                    self.assertEqual(store.meta["total"], 1)
+                    self.assertEqual([u["unit_id"] for u in store.coverage["units"]], ["primary"])
+                finally:
+                    store.connection.close()
+                    store.reviews.close()
+                    store.selection_directory.cleanup()
                 self.assertEqual(before, [sha256(p) for p in (primary, additional, primary.with_suffix(".uac.duckdb"))])
 
     def test_undated_only_primary_has_no_invented_histogram(self):

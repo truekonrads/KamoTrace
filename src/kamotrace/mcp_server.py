@@ -67,6 +67,7 @@ class Filter(BaseModel):
 
 
 class Query(BaseModel):
+    case_context: dict[str, str] | None = Field(None, description="Saved query's case_id and selection_id; retain both when replaying a Finding. Mismatched prepared coverage fails rather than rebinding silently. Current values are in describe_schema().case_coverage.")
     timezone: str = Field("UTC", description="IANA timezone for time_local filters, results and histogram boundaries.")
     raw_fields: list[str] = Field([], max_length=10, description="Constrained scalar projections, e.g. raw.requestParameters.name. Same paths work in filters/summaries/sorts, not pipeline v1. Values are exact text, with JSON type metadata; no SQL, wildcards or quoted keys.")
     search: str = Field("", description="Case-insensitive substring over the raw event JSON.")
@@ -86,6 +87,7 @@ class Query(BaseModel):
         return {"timezone": self.timezone, "raw_fields": self.raw_fields, "search": self.search, "filters": [f.model_dump() for f in self.filters], "tags": self.tags,
                 "annotation_id": self.note_id, "command_key": self.command_key, "start": self.start, "end": self.end,
                 "rules": self.rules, "min_level": self.min_level, "pipeline_version": self.pipeline_version,
+                **({"case_context": self.case_context} if self.case_context is not None else {}),
                 **({"pipeline": self.pipeline} if self.pipeline is not None else {})}
 
 

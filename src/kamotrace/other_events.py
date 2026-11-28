@@ -70,7 +70,7 @@ def initialize(connection):
     connection.execute("CREATE TABLE build_info(metadata JSON)")
 
 
-def build(sources, database, origin):
+def build(sources, database, origin, *, allocate=None, case_unit=None):
     """Stream immutable generic imports into a new DuckDB, with per-file provenance."""
     description(origin)
     database = Path(database).resolve()
@@ -90,7 +90,7 @@ def build(sources, database, origin):
                 for source in sources:
                     digest, size = sha256(source), source.stat().st_size
                     provenance.append({"source_file": str(source), "source_sha256": digest, "source_bytes": size})
-                    batch = []
+                    batch, batch_bytes = [], 0
                     with open_json(source) as stream:
                         for line, text in enumerate(stream, 1):
                             if not text.strip():
@@ -102,12 +102,15 @@ def build(sources, database, origin):
                             count += 1
                             content_hash = hashlib.sha256(raw.encode()).hexdigest()
                             key = hashlib.sha256((FORMAT + ":" + raw).encode()).hexdigest()
-                            batch.append((count, raw, key, str(source), line, origin, None, imported, None, content_hash))
-                            if len(batch) == 1000:
-                                connection.executemany("INSERT INTO raw_events VALUES (?,?,?,?,?,?,?,?,?,?)", batch)
+                            identifier = allocate(1) if allocate else count
+                            batch.append((identifier, raw, key, str(source), line, origin, None, imported, None, content_hash))
+                            batch_bytes += len(raw.encode())
+                            if len(batch) == 1000 or batch_bytes >= 8 * 1024 * 1024:
+                                insert_batch(connection, batch)
                                 batch.clear()
+                                batch_bytes = 0
                     if batch:
-                        connection.executemany("INSERT INTO raw_events VALUES (?,?,?,?,?,?,?,?,?,?)", batch)
+                        insert_batch(connection, batch)
                     if sha256(source) != digest:
                         raise ValueError(f"Source changed during import: {source}")
                     connection.execute("INSERT INTO import_sources VALUES (?,?,?)", [str(source), digest, size])
@@ -124,12 +127,24 @@ def build(sources, database, origin):
                 identity = hashlib.sha256(json.dumps([p["source_sha256"] for p in provenance]).encode()).hexdigest()
                 metadata = {"format": FORMAT, "schema_version": 1, "source_sha256": identity,
                             "records": count, "origin": origin, "imported_at": imported, "sources": provenance}
+                if case_unit is not None:
+                    metadata["case_unit"] = case_unit
                 connection.execute("INSERT INTO build_info VALUES (?)", [json.dumps(metadata)])
                 connection.execute("COMMIT")
             finally:
                 connection.close()
             publish(target, database)
     return metadata
+
+
+def insert_batch(connection, batch):
+    """One set-based insertion for a bounded batch, not one SQL call per row."""
+    if batch:
+        connection.execute("""INSERT INTO raw_events SELECT
+            unnest(?::BIGINT[]), unnest(?::VARCHAR[]), unnest(?::VARCHAR[]),
+            unnest(?::VARCHAR[]), unnest(?::BIGINT[]), unnest(?::VARCHAR[]),
+            unnest(?::VARCHAR[]), unnest(?::VARCHAR[]), unnest(?::VARCHAR[]),
+            unnest(?::VARCHAR[])""", list(zip(*batch)))
 
 
 def manual_rows(path, evidence):
@@ -155,7 +170,7 @@ def save_manual(path, evidence, body):
     origin = description(body.get("origin"))
     author = description(body.get("author", ""), "author", required=False)
     identifier = body.get("id")
-    if identifier is not None and (type(identifier) is not int or identifier <= MANUAL_BASE):
+    if identifier is not None and (type(identifier) is not int or not MANUAL_BASE < identifier < 2 ** 53):
         raise ValueError("Only investigator-entered manual events can be edited")
     with write_lock(path):
         manual_rows(path, evidence)  # Validate before copying/replacing anything.
@@ -169,6 +184,10 @@ def save_manual(path, evidence, body):
                     connection.execute("INSERT INTO build_info VALUES (?)", [json.dumps(
                         {"format": FORMAT + "-manual", "evidence": list(evidence)})])
                     connection.execute("CREATE TABLE revisions AS SELECT * FROM raw_events WHERE false")
+                connection.execute("CREATE TABLE IF NOT EXISTS manual_ids(next_record BIGINT)")
+                if not connection.execute("SELECT count(*) FROM manual_ids").fetchone()[0]:
+                    connection.execute("INSERT INTO manual_ids SELECT coalesce(max(source_record), ?) + 1 "
+                                       "FROM (SELECT source_record FROM raw_events UNION ALL SELECT source_record FROM revisions)", [MANUAL_BASE])
                 old = None
                 if identifier is not None:
                     old = connection.execute("SELECT * FROM raw_events WHERE source_record=?", [identifier]).fetchone()
@@ -179,7 +198,10 @@ def save_manual(path, evidence, body):
                     connection.execute("INSERT INTO revisions SELECT * FROM raw_events WHERE source_record=?", [identifier])
                     connection.execute("DELETE FROM raw_events WHERE source_record=?", [identifier])
                 else:
-                    identifier = connection.execute("SELECT coalesce(max(source_record), ?) + 1 FROM raw_events", [MANUAL_BASE]).fetchone()[0]
+                    identifier = connection.execute("SELECT next_record FROM manual_ids").fetchone()[0]
+                    if identifier >= 2 ** 53:
+                        raise ValueError("Manual event ID namespace exhausted")
+                    connection.execute("UPDATE manual_ids SET next_record=next_record+1")
                 stamp = now()
                 key = old[2] if old else hashlib.sha256(("manual:" + uuid.uuid4().hex).encode()).hexdigest()
                 row = (identifier, raw, key, "investigator-entered", 1, origin, author,
@@ -194,12 +216,21 @@ def save_manual(path, evidence, body):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, action="extend", nargs="+", required=True, help="JSONL files (plain or gzip); repeatable")
-    parser.add_argument("--database", type=Path, required=True, help="New immutable other-events DuckDB")
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--database", type=Path, help="New immutable other-events DuckDB")
+    destination.add_argument("--case", type=Path, help="Fresh case manifest; raw admission only")
+    parser.add_argument("--unit", help="Stable acquisition key (required with --case)")
     parser.add_argument("--origin", required=True, help="Where the events came from, including any transformation")
     args = parser.parse_args(argv)
+    if bool(args.case) != bool(args.unit):
+        parser.error("--case requires --unit")
     try:
-        result = build(args.source, args.database, args.origin)
+        if args.case:
+            from .datasets import admit
+            result = admit(args.case, args.unit, "generic", args.source, args.origin)["raw"]
+        else:
+            result = build(args.source, args.database, args.origin)
     except (ValueError, OSError, duckdb.Error) as error:
         parser.error(str(error))
-    print(f"Imported {result['records']:,} other events into {args.database}")
+    print(f"Imported {result['records']:,} other events into {args.case or args.database}")
     return 0

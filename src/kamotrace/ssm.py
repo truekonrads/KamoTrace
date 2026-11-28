@@ -76,6 +76,12 @@ class Commands:
             event_key = hashlib.sha256(json.dumps([event.get("recipientAccountId"), event.get("awsRegion"),
                 event.get("eventID"), hashlib.sha256(json.dumps(event, sort_keys=True,
                     ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()]).encode()).hexdigest()
+            if source_record is not None:
+                # Replace the supplemental copy, but retain every selected physical
+                # occurrence, including identical records in separate acquisitions.
+                self.events.pop(event_key, None)
+                request_values.pop(event_key, None)
+                event_key = hashlib.sha256(json.dumps([event_key, source_record]).encode()).hexdigest()
             request_values[event_key] = request
             self.events[event_key] = {"key": event_key, "event_id": event.get("eventID"),
                 "id": source_record, "raw_json": raw, "record_sha256": record_hash,

@@ -144,22 +144,26 @@ def read_geolite2(folder, ips):
     return rows, provenance
 
 
-def build(database, output, sources, replace=False, lock=True):
+def build(database, output, sources, replace=False, lock=True, *, case=False, units=None):
     """Write `output` from `sources`, a list of ("geolite2", folder) or ("jsonl", file), highest priority first.
 
     Pass lock=False only while already holding write_lock(output)."""
     with write_lock(output) if lock else nullcontext():
-        return _build(database.resolve(), output.resolve(), sources, replace)
+        return _build(database.resolve(), output.resolve(), sources, replace, case, units)
 
 
-def _build(database, output, sources, replace):
+def _build(database, output, sources, replace, case=False, units=None):
     inputs = [database, *(path for _, path in sources)]
     check_output(output, replace, "enrichment", "enrichment_run", {"ip_enrichment", "enrichment_run"}, inputs)
     labels = ["geolite2" if kind == "geolite2" else path.stem for kind, path in sources]
     if len(set(labels)) != len(labels):
         raise ValueError(f"Source labels must be unique: {labels} (JSONL labels are file names without extension)")
-    evidence = duckdb.connect(str(database), read_only=True)
+    evidence = duckdb.connect() if case else duckdb.connect(str(database), read_only=True)
     try:
+        if case:
+            from .datasets import read_case
+            from .event_index import attach_case
+            attach_case(evidence, read_case(database), units)
         source_sha256, records = evidence_identity(evidence)
         # Rows are keyed by the evidence's own source_ip text, so the server's join is exact.
         by_ip = {}
@@ -256,7 +260,10 @@ class Source(argparse.Action):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="kamotrace enrich", description=__doc__.splitlines()[0])
-    parser.add_argument("--database", type=Path, required=True, help="Evidence DuckDB built by `kamotrace import`")
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--database", type=Path, help="Legacy evidence DuckDB")
+    destination.add_argument("--case", type=Path, help="Fresh case manifest; use declared prepared coverage")
+    parser.add_argument("--unit", action="append", help="Explicit selected case units (default: all)")
     parser.add_argument("--geolite2", dest="sources", action=Source, metavar="FOLDER",
                         help="Folder with GeoLite2-format City (or Country) and/or ASN .mmdb files, "
                              "e.g. MaxMind GeoLite2/GeoIP2 or DB-IP Lite from `kamotrace get-dbip`")
@@ -265,14 +272,17 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="Enrichment sidecar (default: <database>.enrichment.duckdb)")
     parser.add_argument("--replace", action="store_true", help="Replace an existing enrichment sidecar")
     args = parser.parse_args(argv)
+    if args.unit and not args.case:
+        parser.error("--unit requires --case")
+    database = args.case or args.database
     if not args.sources:
         parser.error("give at least one --geolite2 FOLDER or --jsonl FILE (earlier sources take priority)")
-    for path in (args.database, *(p for _, p in args.sources)):
+    for path in (database, *(p for _, p in args.sources)):
         if not path.exists():
             parser.error(f"not found: {path}")
-    output = args.output or args.database.with_suffix(".enrichment.duckdb")
+    output = args.output or database.with_suffix(".enrichment.duckdb")
     try:
-        run = build(args.database, output, args.sources, args.replace)  # Locks the output
+        run = build(database, output, args.sources, args.replace, case=bool(args.case), units=args.unit)
     except (FileExistsError, BlockingIOError, ValueError) as error:  # Invalid input: report it without a traceback.
         parser.error(str(error))
     print(json.dumps({"output": str(output.resolve()), **run}, indent=2))

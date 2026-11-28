@@ -7,6 +7,14 @@ findings. For a first-time setup, [start with the README](../README.md#get-start
 For implementation responsibilities and rationale, see
 [components and design choices](architecture.md).
 
+## Declared prepared coverage
+
+Cases open with `serve --case case.json`, after explicit `prepare --case case.json --unit KEY`. Follow the [fresh acquisition-unit preparation reference](preparation.md#fresh-acquisition-unit-cases). A raw-complete unit may still be preparation-pending. Opening all units fails clearly when a selected unit is missing preparation; choose an explicit prepared subset with repeatable `serve --unit KEY` rather than assuming missing units disappeared. Legacy database startup is rejected without migrating evidence or adopting old sidecars.
+
+The persistent coverage line above the query controls states selected unit/occurrence counts, partial preparation and explicitly excluded units. Counts, sorting, pagination, time buckets, exports and MCP search all refer to this pinned coverage, not all raw evidence on disk. Missing/unprepared records have not been searched; partial parser or collection coverage is a separate limitation. Numeric row IDs may have gaps and are opaque case-local locators, not counts or timestamps.
+
+The viewer does not activate newly admitted/prepared units until reopened. Findings and manual events remain attached to the stable case identity; saved Finding query contexts additionally remember their prepared selection. Reopening a query after that selection changes reports a coverage mismatch rather than silently changing its meaning. Existing linked evidence and saved text remain available. Old formats/links are not migrated into fresh cases, and source evidence is never replaced to make a case compatible.
+
 ## Contents
 
 - [Follow a worked investigation](#end-to-end-example)
@@ -33,18 +41,7 @@ For implementation responsibilities and rationale, see
 
 ## Acquired computer cards
 
-Prepared TraceQuarry-compatible generic evidence databases can show **Computers /
-UAC imports** in the investigation view. This release browses existing prepared
-data; it does not run TraceQuarry, prepare archives, register or recover imports.
-TraceQuarry remains an independent tool. Attach prepared databases with the
-existing `serve --other-events` option. When the startup evidence has a
-`<database>.uac.duckdb` registry, the server also discovers its completed entries
-automatically. It opens that registry read-only, verifies its format and primary
-evidence identity, hashes each registered database and attaches it read-only.
-A missing or changed registered database or mismatched registry fails startup;
-the server does not silently ignore, repair or adopt it. Registry writes and
-unfinished-attempt resume are not available here. Restart explicitly to load
-newly prepared data; opening a card never runs preparation.
+Completed external TraceQuarry parse-only acquisitions can show **Computers / UAC imports**. Admit them with `import-uac --case case.json --unit HOST_ACQUISITION --source COMPLETED_EXPORT`, then explicitly `prepare` that unit. TraceQuarry remains an independent tool; KamoTrace never runs its parsers or recovers an unfinished archive. Cards select declared prepared acquisitions by stable unit key, not attachment order. Old `.uac.duckdb` registries are not discovered or adopted. Reopen explicitly to load newly prepared coverage; opening a card never runs preparation.
 
 Expand the cards to inspect one import at a time, four computer/label groups per
 page. The compact default shows hostname, OS, interface addresses and historical
@@ -85,7 +82,7 @@ opening a case:
 
 ```powershell
 kamotrace inventory --profile investigation --regions all --output C:\cases\acme\inventory
-kamotrace serve --database C:\cases\acme\case.duckdb --inventory-export C:\cases\acme\inventory
+kamotrace serve --case C:\cases\acme\case.json --inventory-export C:\cases\acme\inventory
 # Emit the static inventory IAM policy without AWS calls:
 kamotrace inventory --emit-policy C:\cases\acme\inventory-policy.json
 # Or emit it alongside a normal collection, outside the snapshot directory:
@@ -222,7 +219,7 @@ Other events are counted by `sessionContext.attributes.mfaAuthenticated=true`,
 MFA challenge for each API call; upstream IdP / Identity Center MFA may not be
 represented. Supporting canonical event hashes are supplied per observed group.
 
-The comparison reports the imported database's event-time extent and requested
+The comparison reports the selected prepared coverage's event-time extent and requested
 account/Region; it is independent of the active event-grid search/time filters.
 That extent does not prove uninterrupted or complete log collection. IAM user
 history requires exact ARN and stable user ID, excluding recreated users and
@@ -241,10 +238,9 @@ kamotrace download --dest C:\cases\iam-snapshot --regions all --services invento
 The snapshot is published under `DEST/inventory`, including `iam.json`, raw
 responses, `report.json`, CSV network reports and a hash manifest. A verified
 snapshot is reused on resume, not refreshed; use a new destination for current
-configuration. Online `auto` includes IAM in its normal inventory stage. With
-`auto --services cloudtrail ssm inventory`, it reuses `TARGET/download/inventory`
-instead of collecting twice; `--skip-download` can reuse this saved inventory
-without AWS calls. `--skip-inventory` cannot be combined with the inventory service.
+configuration. Attach the completed snapshot with `serve --case CASE.json
+--inventory-export DEST/inventory`; offline `auto` accepts the same attachment
+flag but never collects or refreshes inventory.
 Older snapshots remain readable but have no newly collected IAM details. Use a
 new output, or `inventory --from-export OLD --enrich-iam --output NEW` to collect
 current IAM explicitly (the authenticated account must match the original export).
@@ -272,9 +268,9 @@ not that a service was listening or a connection succeeded. No active network
 probes or DNS lookups are performed. See the snapshot's limitations for network
 paths the analysis cannot verify.
 
-Online `kamotrace auto` also prepares inventory. Use `--skip-inventory` to omit it,
-or `--inventory-export FOLDER` to attach an existing snapshot. Offline preparation
-with `--source` or `--skip-download` does not collect inventory from AWS.
+Use `--inventory-export FOLDER` with `serve --case` or offline `auto` to attach
+an existing snapshot. AWS acquisition remains a separate `inventory` or
+`download --services inventory` command.
 
 Hover over, focus, or click an identity, machine, or IP reference in event and SSM
 views to inspect known context. Click keeps a card open; Escape dismisses it.
@@ -330,23 +326,23 @@ with a top-level `Records` array. A download covers one region and up to
 
 ### 3. Import the events
 
-Import into a new evidence database. Loading data is always a command-line
-step; the browser never imports files and opens the database read-only.
+Admit a named acquisition into a new case JSON, then explicitly prepare it.
+Loading data is always a command-line step; the browser never imports files
+and opens raw/prepared artifacts read-only.
 
 ```powershell
 mkdir C:\cases\acme; cd C:\cases\acme
-kamotrace import --source event_history.json --database case.duckdb
-```
-```text
-"records": 320,  "all_record_hashes_verified": true,  "source_sha256": "...", ...
+kamotrace import --source event_history.json --case case.json --unit cloudtrail-1
+kamotrace prepare --case case.json --unit cloudtrail-1
 ```
 
 The importer preserves nested JSON and numeric precision, hashes every record,
-records every source file's hash, and refuses to overwrite an existing database.
+records every source file's hash, and never overwrites existing evidence.
 A UTF-8 byte-order mark is fine. Combine regions using repeatable `--source`
-arguments or pass a CloudTrail-only folder; `.json.gz` files and binary stdin
-(`--source -`) work too. See the [multi-file and stream examples](preparation.md#multiple-files-gzip-and-stdin).
-Existing databases are never appended to; select the whole set for a new import.
+arguments or pass a CloudTrail-only folder; `.json.gz` files work directly.
+Case admission requires rereadable files, so retain stdin in a new file first.
+See the [multi-file and stream examples](preparation.md#multiple-files-gzip-and-stdin).
+Add later acquisitions under new keys; raw artifacts are never appended to.
 The downloader's `--compress` option produces gzip CloudTrail and SSM exports
 that `import` and `serve --ssm-export` can read directly.
 
@@ -357,7 +353,7 @@ Download Suzaku once, then run it on the same export
 
 ```powershell
 kamotrace get-suzaku
-kamotrace suzaku --database case.duckdb --source event_history.json
+kamotrace suzaku --case case.json --source event_history.json
 ```
 ```text
 "suzaku_version": "3.0.0",  "linked_rows": 300,  "no_match_rows": 0,  "ambiguous_rows": 0
@@ -371,7 +367,7 @@ JSONL, highest priority first ([details](#ip-enrichment)):
 
 ```powershell
 kamotrace get-dbip
-kamotrace enrich --database case.duckdb --geolite2 $HOME\.kamotrace\tools\dbip-lite-2026-10
+kamotrace enrich --case case.json --geolite2 $HOME\.kamotrace\tools\dbip-lite-2026-10
 ```
 
 `get-dbip` prints the folder it installed (named by DB-IP's monthly release).
@@ -379,7 +375,7 @@ kamotrace enrich --database case.duckdb --geolite2 $HOME\.kamotrace\tools\dbip-l
 ### 6. Investigate in the browser
 
 ```powershell
-kamotrace serve --database case.duckdb
+kamotrace serve --case case.json
 ```
 
 Open **http://127.0.0.1:8765**. The histogram shows the burst on 25 October,
@@ -429,19 +425,21 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 
 | Command | Purpose |
 | --- | --- |
-| `kamotrace auto CASE_FOLDER [options]` | [Full-auto](#full-auto-preparation): tools, AWS download, import, enrichment, detections, then `serve`; rerun to resume |
-| `kamotrace import --source FILE_OR_FOLDER... --database NEW.duckdb` | Combine CloudTrail JSON/gzip exports; repeat `--source`, or use `-` for binary stdin |
-| `kamotrace import-other --source FILE.jsonl... --database NEW.duckdb --origin TEXT` | Import provider-neutral events with documented origin; plain or gzip JSONL |
+| `kamotrace auto --case CASE.json --unit KEY --kind KIND --source INPUT [options]` | [Offline orchestration](#full-auto-preparation): raw admission, explicit preparation, optional supplied sidecars and `serve` |
+| `kamotrace import --source FILE_OR_FOLDER... --case CASE.json --unit KEY` | Admit an immutable CloudTrail acquisition; repeat `--source` |
+| `kamotrace import-other --source FILE.jsonl... --case CASE.json --unit KEY --origin TEXT` | Admit provider-neutral events with documented origin; plain or gzip JSONL |
+| `kamotrace import-uac --source FOLDER --case CASE.json --unit KEY` | Admit completed external TraceQuarry parse-only output; no tool execution or discovery |
+| `kamotrace prepare --case CASE.json --unit KEY [--range START END]` | Publish selected scalar preparation; repeat `--unit` or physical-ID ranges |
 | `kamotrace download --dest FOLDER --regions all --start ISO --end ISO [--compress]` | Resume selected CloudTrail, SSM, GuardDuty or inventory collection with an existing AWS login; CloudTrail/SSM by default |
 | `kamotrace inventory [--output FOLDER] [--emit-policy PATH\|-]` | [Current network and IAM inventory](#aws-inventory-and-map); policy-only mode without `--output` makes no AWS calls |
 | `kamotrace policy [--output PATH\|-] [--bucket NAME]... [--kms-key ARN]... [--validate \| --validate-file PATH]` | [Combined collection policy](preparation.md#aws-collection-iam-policy) for CloudTrail, SSM and inventory; offline generation, optional AWS IAM Access Analyzer validation |
 | `kamotrace trailcheck [--regions all] [--json PATH\|-] [--emit-policy PATH\|-] [--max-items N] [--max-s3-calls N] [--probe-buckets]` | [Read-only audit](#cloudtrail-trail-check) of trails, logging/delivery state, S3 destinations and observed log dates |
 | `kamotrace get-suzaku [--version X.Y.Z]` | Download and verify the official Suzaku 3.x release for this platform |
-| `kamotrace suzaku --database DB (--source FILE [--suzaku EXE] \| --timeline FILE)` | Run or import Suzaku detections into `<database>.detections.duckdb` |
-| `kamotrace guardduty --database DB --findings FILE [--output PATH] [--replace]` | Import [contextual GuardDuty leads](#guardduty-context) into a separate sidecar |
+| `kamotrace suzaku --case CASE.json --timeline FILE` | Link an offline Suzaku timeline within declared prepared coverage |
+| `kamotrace guardduty --case CASE.json --snapshot-unit KEY --findings FILE [--replace]` | Admit/prepare snapshots and build [contextual GuardDuty leads](#guardduty-context) |
 | `kamotrace get-dbip [--dest FOLDER]` | Download and verify the free DB-IP Lite City and ASN databases (CC BY 4.0, no account) |
-| `kamotrace enrich --database DB (--geolite2 FOLDER \| --jsonl FILE)...` | Add offline IP enrichment into `<database>.enrichment.duckdb` |
-| `kamotrace serve --database DB [options]` | Start the browser UI on `127.0.0.1` |
+| `kamotrace enrich --case CASE.json (--geolite2 FOLDER \| --jsonl FILE)...` | Add offline IP enrichment bound to declared coverage |
+| `kamotrace serve --case CASE.json [--unit KEY] [options]` | Start the browser UI on `127.0.0.1` without building preparation |
 | `kamotrace mcp --url http://127.0.0.1:8765` | Stdio MCP adapter for agents, backed by a running `serve` |
 | `kamotrace ssmcheck [--regions all] [--json FILE\|-] [--emit-policy PATH\|-] [--max-items 200]` | [Read-only report](#ssm-logging-check) of where SSM session and command output is logged |
 
@@ -451,53 +449,37 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 
 | Option | Purpose | Default |
 | --- | --- | --- |
-| `--database PATH` | Imported evidence database (required) | — |
-| `--enrichment PATH` | IP enrichment sidecar from `kamotrace enrich` | `<database stem>.enrichment.duckdb` if present; otherwise special-use addresses are classified and other countries show as unmapped |
-| `--annotations PATH` | Notes and tags SQLite sidecar | `<database stem>.annotations.sqlite3` |
-| `--detections PATH` | Suzaku detections sidecar | `<database stem>.detections.duckdb` if present |
-| `--guardduty PATH` | GuardDuty contextual-lead sidecar | `<database stem>.guardduty.duckdb` if present |
+| `--case PATH` | Fresh JSON case manifest (required) | — |
+| `--unit KEY` | Explicit prepared unit subset; repeatable | All units, failing if one is unprepared |
+| `--enrichment PATH` | IP enrichment sidecar from `kamotrace enrich` | `<case stem>.enrichment.duckdb` if present; otherwise special-use addresses are classified and other countries show as unmapped |
+| `--annotations PATH` | Notes and tags SQLite sidecar | `<case stem>.annotations.sqlite3` |
+| `--detections PATH` | Suzaku detections sidecar | `<case stem>.detections.duckdb` if present |
+| `--guardduty PATH` | GuardDuty contextual-lead sidecar | `<case stem>.guardduty.duckdb` if present |
 | `--ssm-export PATH` | Consolidated SSM command/output JSON | None; optional |
 | `--inventory-export FOLDER` | Current network/IAM inventory export containing `report.json` | None; optional |
+| `--eks-export FOLDER` | Verified EKS export for current map context; timeline events require a prepared EKS unit | None; optional |
 | `--port NUMBER` | Local listening port | `8765` |
-| `--mcp-transport http\|stdio` | Serve MCP at `/mcp`, or print local stdio adapter setup commands; also accepted by `auto` | `http` |
+| `--mcp-transport http\|stdio` | Serve MCP at `/mcp`, or print local stdio adapter setup commands (`serve` only) | `http` |
 | `--bind ADDRESS` | Listening address; only for containers (see [Docker](#docker)) | `127.0.0.1` (`0.0.0.0` in the image) |
 | `--log-level debug\|info\|warning\|error` | Application logging; see [request diagnostics](#investigating-slow-requests) | `info`, or `$KAMOTRACE_LOG_LEVEL` |
 
 Paths are relative to your terminal's current folder unless absolute. Quote
-paths containing spaces. The evidence database and any explicitly supplied
+paths containing spaces. The case manifest, its referenced artifacts and any explicitly supplied
 enrichment, detections, GuardDuty or SSM input files must exist; an inventory
 export must be an existing folder. The server creates the annotations file if needed.
 
-For example, load an SSM export alongside the evidence database:
+For example, load an SSM export alongside the prepared case:
 
 ```powershell
-kamotrace serve --database "C:\evidence\case.duckdb" --ssm-export "C:\evidence\ssm_command_session_activity.enriched.json"
+kamotrace serve --case "C:\evidence\case.json" --ssm-export "C:\evidence\ssm_command_session_activity.enriched.json"
 ```
 
 The server never calls external services. Suzaku, GuardDuty and IP enrichment
-sidecars beside the database are picked up automatically. Changing a sidecar,
+sidecars beside the case JSON are picked up automatically only when bound to
+the same prepared selection. Changing a sidecar,
 the inventory snapshot or the SSM export requires restarting the server.
 
-Startup automatically creates `<database stem>.event-index.duckdb`, a disposable
-cache of normalized fields from the primary database and its ordered additional
-datasets. The first build performs set-based normalization; subsequent starts
-validate and query the persistent cache read-only instead of normalizing again.
-Validation still hashes the complete source files and scans cached fields in
-physical-ID order with SHA256 and explicit dataset-membership checks, so restart
-cost is not zero. Old v1 caches using XOR checksums are automatically rebuilt.
-Source content, membership/order, producer definitions,
-schema or DuckDB version changes invalidate the cache. Raw originals remain in
-the read-only evidence databases; manual events, Findings and Event tags remain
-separate and live. The cache is not a raw-text search index.
-
-Allow space beside the evidence for this derived file and its private build,
-plus runtime temporary/spill storage on the system temporary filesystem.
-Startup logs distinguish `event_index_built` from `event_index_reused` timings.
-After stopping the server, you may remove only the derived event-index cache to
-force a fresh build; never remove evidence or investigator sidecars. An unknown
-or unreadable file at that path is refused, not overwritten: inspect/move it
-yourself before retrying. As with other prepared sidecars, keep one server owner
-per case and do not change attached source databases while serving them.
+Startup verifies and attaches only declared raw/prepared artifacts read-only. It never builds a cache, normalizes missing units or silently drops unavailable coverage. File hashing and ordered scalar integrity scans still cost time and memory. Incompatible or damaged prepared output requires explicit `prepare --rebuild`; old published artifacts remain untouched. Keep space for private preparation, retained artifacts and runtime temporary/spill storage. Keep one server owner per case and do not change attached artifacts while serving them.
 
 Only code, synthetic tests and third-party browser assets belong in this
 repository. Databases, `event_history*.json`, enrichment JSONL, `.mmdb` files and
@@ -505,90 +487,54 @@ the `data/` directory are gitignored; keep evidence outside the repository.
 
 ## Full-auto preparation
 
-`kamotrace auto CASE_FOLDER` prepares a whole case with one command. It runs the
-other commands' code in dependency order, printing `[N/9 stage]` progress to stderr
-(including skipped stages):
+`kamotrace auto --case CASE.json --unit KEY --kind KIND --source INPUT` admits and prepares one explicitly named offline acquisition, then optionally serves the declared case. `KIND` is `cloudtrail`, `generic` (requires `--origin`), `uac` or `eks`. Use `--no-serve` for preparation only. Collection, tool installation and inventory acquisition remain independent commands; positional legacy auto startup is rejected.
 
 | Stage | Default | Override or skip |
 | --- | --- | --- |
-| 1. `get-suzaku` | Newest Suzaku installed in the tools folder; otherwise download and verify the latest 3.x | `--suzaku EXE`, `--suzaku-version X.Y.Z` (that exact version, installed or downloaded), `--timeline FILE`, `--skip-suzaku` |
-| 2. `get-dbip` | Newest complete DB-IP Lite folder in the tools folder; otherwise download and verify | `--geolite2 FOLDER` and/or `--jsonl FILE` (earlier wins), `--skip-enrich` |
-| 3. `download` | `CASE_FOLDER/download`, all enabled regions, CloudTrail and SSM, maximum available history; with `--start`, prefer readable S3 locations, allowing empty days and unused Regions; omitted `--end` means now, frozen on resume | `--download-dir`, `--profile`, `--regions`, `--start`, `--end`, `--cloudtrail-source auto\|history`, `--services`, `--compress`, `--progress`, `--session-s3`, `--session-log-group`; `--source FILE...` or `--skip-download` to use existing data |
-| 4. `import` | `CASE_FOLDER/case.duckdb` from `cloudtrail.json[.gz]` | `--database` |
-| 5. `enrich` | `<database stem>.enrichment.duckdb` from DB-IP Lite | as stage 2 |
-| 6. `suzaku` | `<database stem>.detections.duckdb`, running Suzaku on the imported CloudTrail file | `--rules`, `--min-level` |
-| 7. `guardduty` | Skipped unless findings were collected or supplied; writes `<database stem>.guardduty.duckdb` | Include `guardduty` in `--services`, or pass `--guardduty-findings FILE` for existing JSON |
-| 8. `inventory` | Current network/IAM snapshot in `CASE_FOLDER/inventory` for online runs; reuses `download/inventory` when collected there; offline runs do not collect | `--inventory-export FOLDER`, `--skip-inventory` (omit `inventory` from `--services` too) |
-| 9. `serve` | `127.0.0.1:8765`, with prepared sidecars, SSM export and inventory | `--port`, `--mcp-transport http\|stdio`, `--ssm-export FILE` (with existing data), `--no-serve` |
+| Raw admission | Explicit acquisition key/input identity; matching committed units reused | `--case`, `--unit`, `--kind`, `--source`, optional generic `--origin` |
+| Core preparation | Selected unit only; other units remain unchanged | Use standalone `prepare` for partial physical-ID ranges |
+| GuardDuty snapshots | Optional raw unit, preparation and contextual links | `--guardduty-findings FILE --snapshot-unit KEY` |
+| Offline enrichment | Optional supplied lookup files | `--jsonl FILE`, `--geolite2 FOLDER` |
+| Suzaku links | Optional completed offline timeline | `--timeline FILE` |
+| Serve | Entire declared case, never an implicit prepared subset | `--no-serve`, `--port`, `--ssm-export`, `--inventory-export`, `--eks-export` |
 
-The tools folder defaults to `$KAMOTRACE_TOOLS` or `~/.kamotrace/tools`
-(`--tools`), so installed tools are shared between cases. Tools are set up
-before collection, so a tool problem appears before a long download. Suzaku
-and DB-IP Lite are still downloaded only from their official sources and
-verified as described for [`get-suzaku`](#download-and-run-suzaku) and
-[IP enrichment](#ip-enrichment). Credit DB-IP Lite data (CC BY 4.0).
-
-When running Suzaku, auto compares the selected executable's `--version` with
-GitHub's latest stable release and warns if it is older (including pinned versions
-and `--suzaku` executables). This is advisory: it never upgrades an installed tool.
-If the check fails, for example offline or because of GitHub rate limits, auto
-warns and continues. A newer unsupported major is reported without recommending
-an incompatible upgrade. `--skip-suzaku` and `--timeline` skip this check.
-
-AWS access uses your existing login, exactly as [`download`](preparation.md#download-from-an-existing-aws-login)
-does; there is no login prompt, so it is safe for unattended use with `--no-serve`
-and `--progress log`. `--services` must include `cloudtrail`. Running Suzaku needs a
-single CloudTrail file or folder; with several `--source` files, pass `--timeline`
-or `--skip-suzaku`.
+Install optional tools separately with [`get-suzaku`](#download-and-run-suzaku) and [`get-dbip`](#ip-enrichment); credit DB-IP Lite data (CC BY 4.0). Run [`download`](preparation.md#download-from-an-existing-aws-login) or `eks` separately with your existing AWS login. Auto itself is offline and does not contact AWS or download tools.
 
 ### Retry and recovery
 
-If a stage fails or you press Ctrl+C, the command stops with a nonzero status
-and names the stage. Fix the cause, such as an expired AWS login, and **rerun the same
-command**. Each stage checks what already exists:
+If offline auto preparation fails, fix the reported input/preparation problem
+and **rerun the same command**. Collection and tool installation have separate
+retry behavior:
 
-- **Tools** are reused only when complete: Suzaku installs are published
-  atomically, and a DB-IP folder counts only once its download record lists
-  both verified files.
-- **Collection** resumes from the downloader's checkpoint. Its default end time
+- **Separate tool installation** reuses verified complete outputs; auto does not install or upgrade tools.
+- **Standalone collection** resumes from the downloader's checkpoint. Its default end time
   is frozen at the first run, so later reruns finish the same snapshot instead
   of moving the range. A completed collection with the same options is reused
   without contacting AWS only while every export it lists is present (and S3
   objects still match their SHA-256). If one is missing, the downloader
-  regenerates it from the checkpoint after checking your AWS login; with
-  `--skip-download` the run refuses instead. Different options are refused; use
+  regenerates it from the checkpoint after checking your AWS login. Different options are refused; use
   a new case folder for a fresh snapshot.
-- **Evidence** is imported only after the collection is marked complete. An existing
-  database is reused only if its recorded source files and SHA-256 hashes match
-  the current inputs; otherwise the run stops and the database is never overwritten.
-  Every database and sidecar is built in a new private folder beside it,
-  `.<name>.<random>.staging`, and published by an atomic rename. A folder left
-  by a killed run is removed on the next run, but only if it is positively
-  KamoTrace's: it has the staging marker for that output, holds only regular
-  staging files and contains no input. Anything else, including files named
-  like an old `case.duckdb.building`, is left alone. `auto` refuses, before
-  writing anything, any input, download folder or tools folder inside a folder
-  named `.<name>.staging`, since a later stage could remove it.
-- **Enrichment and detections** are derived sidecars, written atomically.
-  They are reused only if they are bound to this evidence database. Enrichment
-  must also have the same source files and hashes. Suzaku detections must have
-  the same CloudTrail input and the same executable, rules, config and
-  `--min-level` (or the same `--timeline` hash). Otherwise they are rebuilt.
-  Rules updated in place in Suzaku's own `rules` folder count as a change.
-  GuardDuty context is reused only with the same findings-file hash and evidence
-  identity; changed findings rebuild that derived sidecar, not the evidence.
-  To force a rebuild anyway, pass `--rebuild-sidecars`.
+- **Raw acquisitions** are reused only for the same unit key, source paths/hashes and options. Changed input requires a new key. Reserve blocks durably before use; a failed attempt burns its IDs. Each unit builds in unique private staging and publishes before its manifest reference. A published-but-unregistered file is retained, never silently adopted. Retrying restarts the unfinished unit, not a mid-unit checkpoint.
+- **Preparation** is explicit and per unit/scope. Failure retains the previous selected artifact. A replacement partial scope replaces the old selection rather than unioning with it. Reopen the viewer to activate later preparation; startup never repairs missing outputs.
+- **Enrichment, detections and GuardDuty context** are derived sidecars, written
+  atomically and bound to the declared prepared selection. Standalone producers
+  require `--replace` for an existing output; auto rebuilds explicitly requested
+  sidecars with replacement enabled when their paths exist. It does not discover
+  missing source files or run Suzaku. Changed GuardDuty inputs require a new
+  snapshot unit key. Prepare every intended unit before generating sidecars;
+  a changed selected scope requires regenerating sidecars, not adopting old links.
+  Core preparation uses `prepare --rebuild` for an already selected scope.
   A file at a sidecar path that is not that kind of KamoTrace sidecar is never
-  replaced, and no output may be one of the inputs: move it or pick another `--database`.
+  replaced, and no output may be one of the inputs: choose a separate output path.
   Each output is checked again just before publication; without `--replace`
   publication never overwrites a file that appeared meanwhile.
-- **Inventory** is reused only as a verified completed snapshot with matching
+- **Standalone inventory collection** is reused only as a verified completed snapshot with matching
   scope. Existing incomplete or mismatched destinations are refused, not
   overwritten. Use a new case folder for fresh configuration, or explicitly
   attach an existing snapshot with `--inventory-export`.
 - One process at a time writes each output: database/sidecar preparation commands,
   including `guardduty`, lock their outputs with `<output stem>.lock` beside them
-  (`auto` locks the database and derived sidecars). A second writer of the same
+  (auto admission/preparation holds the case writer lock). A second writer of the same
   database or sidecar, even from another case folder or with a custom
   `--output`, stops with a "being prepared by another KamoTrace process" error.
   Locks are released when the UI starts and if the process dies.
@@ -638,8 +584,8 @@ nonempty log object. This is independent of unreadable bucket settings that may
 make the overall audit partial. Verification samples at most 20 objects per day,
 within the shared S3 call budget: an unverified day is not proof of absence.
 
-`auto` and `download --cloudtrail-source auto`, when given `--start`,
-select S3 when every requested Region has at least one discovered current-account
+`download --cloudtrail-source auto`, when given `--start`,
+selects S3 when every requested Region has at least one discovered current-account
 root with successful listings for all requested days. Empty days are allowed,
 including Regions with no existing prefix; matching log objects on every day are
 not required. Samples without matching objects and unknown samples are reported
@@ -653,9 +599,8 @@ After the readability gate passes, every requested date at every discovered
 current-account/Region root is fully listed, not just dates whose 20-object
 sample verified. Failed or denied collection listings stop the run; they do
 not silently remove a root from the collection. Existing history checkpoints
-keep their original source, even when resuming a pre-S3 dated auto run with the
-new default. Completed legacy cases still reuse without AWS calls.
-`auto --cloudtrail-source history` disables discovery. Known destinations can
+keep their original source on resume; use a new destination to change sources.
+`download --cloudtrail-source history` disables discovery. Known destinations can
 instead be collected directly with `download --cloudtrail-s3
 s3://BUCKET/[prefix/]AWSLogs/[o-org/]ACCOUNT/CloudTrail/` and explicit dates.
 The account must match the authenticated account. See the
@@ -746,17 +691,18 @@ at `/case`. In these commands, `kamotrace` is the Docker image name. The image
 already starts the KamoTrace command:
 
 ```powershell
-docker run --rm -v C:\case:/case kamotrace import --source /case/event_history.json --database /case/case.duckdb
+docker run --rm -v C:\case:/case kamotrace import --source /case/event_history.json --case /case/case.json --unit cloudtrail-1
+docker run --rm -v C:\case:/case kamotrace prepare --case /case/case.json --unit cloudtrail-1
 docker run --rm -v kamotrace-tools:/tools kamotrace get-suzaku
-docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace suzaku --database /case/case.duckdb --source /case/event_history.json
+docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace suzaku --case /case/case.json --source /case/event_history.json
 docker run --rm -v kamotrace-tools:/tools kamotrace get-dbip
-docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace enrich --database /case/case.duckdb --geolite2 /tools/dbip-lite-2026-10
-docker run --rm --name kamotrace -p 127.0.0.1:8765:8765 -v C:\case:/case kamotrace serve --database /case/case.duckdb
+docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace enrich --case /case/case.json --geolite2 /tools/dbip-lite-2026-10
+docker run --rm --name kamotrace -p 127.0.0.1:8765:8765 -v C:\case:/case kamotrace serve --case /case/case.json
 ```
 
 Then open **http://127.0.0.1:8765**. Sidecars (notes/tags, detections,
-enrichment) are written beside the database in the case folder, so stop the
-container before backing it up. The evidence database is still opened read-only.
+enrichment) are written beside the case JSON, so stop the container before
+backing it up with all referenced artifacts. Evidence remains read-only.
 
 Inside the container the server must listen on all interfaces
 (`KAMOTRACE_BIND=0.0.0.0`) so Docker can publish the port. **Always publish it
@@ -805,7 +751,7 @@ with `$KAMOTRACE_TOOLS` or `--dest`.
 
 ```powershell
 kamotrace get-suzaku
-kamotrace suzaku --database C:\evidence\case.duckdb --source C:\evidence\event_history.json
+kamotrace suzaku --case C:\evidence\case.json --source C:\evidence\event_history.json
 ```
 
 Without `--suzaku`, `kamotrace suzaku` runs the most recent version installed
@@ -819,14 +765,14 @@ repository. Rerun `get-suzaku` to update; each version keeps its own folder.
 To use your own Suzaku binary and rules:
 
 ```powershell
-kamotrace suzaku --database C:\evidence\case.duckdb --suzaku C:\tools\suzaku\suzaku-3.0.0-win-x64.exe --source C:\evidence\event_history.json --rules C:\tools\suzaku\rules
+kamotrace suzaku --case C:\evidence\case.json --suzaku C:\tools\suzaku\suzaku-3.0.0-win-x64.exe --source C:\evidence\event_history.json --rules C:\tools\suzaku\rules
 ```
 
 or import a timeline you already produced with
 `suzaku aws-ct-timeline -f event_history.json -o timeline -t duckdb` (without `-l`):
 
 ```powershell
-kamotrace suzaku --database C:\evidence\case.duckdb --timeline C:\evidence\timeline.duckdb
+kamotrace suzaku --case C:\evidence\case.json --timeline C:\evidence\timeline.duckdb
 ```
 
 KamoTrace runs Suzaku from its own folder (so its default `rules` and `config`
@@ -848,13 +794,16 @@ Detections are stored separately from the original records:
   than that time. The row links to all its member events only when every
   member matches exactly one record; otherwise it is kept unlinked like any
   other row.
-- Output goes to a separate `<database stem>.detections.duckdb`. The evidence
-  database is attached read-only and never modified. An existing sidecar is
+- Output goes to a separate `<case stem>.detections.duckdb`. Declared prepared
+  evidence is attached read-only and never modified. An existing sidecar is
   only replaced with `--replace`.
 - The sidecar records provenance: Suzaku version, command line, rules revision
-  and count, timeline SHA-256, evidence source SHA-256 and record count, whether
-  `--source` matches the imported file, and linked/unmatched/ambiguous counts.
-  `serve` refuses a sidecar built for a different evidence database.
+  and count, timeline SHA-256, selected evidence identity and record count,
+  supplied source information and linked/unmatched/ambiguous counts. In a case,
+  the evidence identity is a digest of declared prepared coverage, not the hash
+  of one export file; a source-file hash comparison is not proof of case membership.
+  `serve` refuses a sidecar built for a different selection. Repeat `--unit KEY` on the producer
+  to match an explicitly selected viewer subset.
 
 ### Review detections in the browser
 
@@ -872,23 +821,22 @@ Detections are automated leads: tag events or record a finding about what you ob
 ## GuardDuty context
 
 GuardDuty findings are optional, contextual leads alongside Suzaku detections.
-To collect them during preparation, opt in explicitly:
-
-```powershell
-kamotrace auto C:\cases\example-gd --profile investigation --services cloudtrail ssm guardduty
-```
-
-Or collect and import findings against an existing evidence database:
+Collect them separately, then admit/prepare snapshots and build context for a
+prepared case:
 
 ```powershell
 kamotrace download --dest C:\cases\gd-export --profile investigation --regions all --services guardduty
-kamotrace guardduty --database C:\cases\example\case.duckdb --findings C:\cases\gd-export\guardduty.json
+kamotrace guardduty --case C:\cases\example\case.json --snapshot-unit guardduty-1 --findings C:\cases\gd-export\guardduty.json
 ```
 
 The importer also accepts an AWS `GetFindings` object with a `Findings` array,
 or a bare findings array, without AWS access. For offline auto preparation, pass
-`--guardduty-findings FILE` alongside `--source`. The default output is
-`<database stem>.guardduty.duckdb`; `--output PATH` changes it. `--replace` rebuilds
+`--guardduty-findings FILE --snapshot-unit KEY` alongside the required
+`--case`, `--unit`, `--kind` and `--source`. Snapshot IDs are persisted raw
+occurrences, not count-derived offsets. Adding snapshots changes the prepared
+selection: generate enrichment/detections only after all intended snapshot units
+are prepared. The default output is
+`<case stem>.guardduty.duckdb`; `--output PATH` changes it. `--replace` rebuilds
 only a recognised GuardDuty sidecar, never the original evidence. Restart
 `serve` to load it automatically, or select a custom path with `--guardduty PATH`.
 
@@ -939,19 +887,18 @@ in `Service.AdditionalInfo.Sample` and parsed `Service.AdditionalInfo.Value.samp
 missing, malformed or conflicting flags remain unknown, never presumed real.
 The timeline summary and detail show this status. Archived status remains in raw JSON.
 
-New schema-2 sidecars preserve every input-array occurrence, including identical
+GuardDuty raw units preserve every input-array occurrence, including identical
 duplicates and multiple updates with the same ARN. ARN identifies the provider
 finding; the namespaced canonical-content review hash identifies an immutable
 snapshot. Identical repeats have distinct physical rows but share reviews, as
 CloudTrail duplicates do. Changed content has a new review key; it never inherits
 an older snapshot's annotations automatically. `content_sha256` hashes the exact
-stored JSON text. Row `id` is a navigation handle for this loaded dataset, not a
-cross-import identity. Rebuilding replaces the derived snapshot set with the
-supplied source; it does not fetch or accumulate history. Preserve earlier source
-exports if history is needed. Legacy schema-1 sidecars load read-only without a
-rebuild; their original source-array position is unavailable and explicitly labelled
-as legacy ARN order. Existing attached dataset order/IDs and CloudTrail hashes
-are unchanged; GuardDuty rows are appended after other imported datasets.
+stored JSON text. Row `id` is a persisted case-local navigation handle, not a
+cross-import identity. Rebuilding contextual links does not replace raw snapshot
+records or fetch history. Preserve original source exports. Fresh cases never
+adopt old sidecars. Snapshot units receive ordinary reserved IDs and declared
+preparation coverage. A later acquisition uses a new snapshot unit key; open an
+explicit subset to exclude earlier acquisitions rather than rewriting them.
 
 MCP example: `search_events(query={pipeline_version: 1, pipeline: 'event_type = "guardduty" | guardduty_sample = "sample=unknown"'})`.
 Use `get_event(id)` for the snapshot's exact raw JSON and hash check, `guardduty`
@@ -1013,8 +960,8 @@ You can use either or both of these formats:
 
 ```powershell
 kamotrace get-dbip
-kamotrace enrich --database C:\evidence\case.duckdb --geolite2 $HOME\.kamotrace\tools\dbip-lite-2026-10
-kamotrace enrich --database C:\evidence\case.duckdb --jsonl C:\evidence\spur.jsonl --geolite2 C:\geoip --replace
+kamotrace enrich --case C:\evidence\case.json --geolite2 $HOME\.kamotrace\tools\dbip-lite-2026-10
+kamotrace enrich --case C:\evidence\case.json --jsonl C:\evidence\spur.jsonl --geolite2 C:\geoip --replace
 ```
 
 ### Combine sources and set their priority
@@ -1028,11 +975,12 @@ which) or the JSONL file name without its extension (`spur`),
 and labels must be unique. Only addresses that appear as a source IP in the
 evidence are stored; AWS service names such as `ec2.amazonaws.com` are skipped.
 
-Output goes to `<database stem>.enrichment.duckdb` (or `--output`), which `serve`
+Output goes to `<case stem>.enrichment.duckdb` (or `--output`), which `serve`
 loads automatically. An existing sidecar is only rebuilt with `--replace`. It
-records the evidence database it was built for (and `serve` refuses another),
+records the case and prepared selection it was built for (and `serve` refuses another),
 the build time, and per source the file SHA-256 (or each `.mmdb` file's hash,
-type and build date), entries, evidence IPs matched and attribute names.
+type and build date), entries, evidence IPs matched and attribute names. Repeat
+`--unit KEY` to match an explicit viewer subset; regenerate after changing scope.
 
 ### JSONL schema
 
@@ -1105,7 +1053,7 @@ Filter key events with the ordinary tag controls or `tag = "key-event"` in Pipel
 ### Browse event tags
 
 The **Event tags** tab lists every tag, its colour and its event count across
-the whole database, not just the current query.
+the pinned prepared selection, not just the current query.
 
 - Select a tag name to add it to the query. Select it again to remove it.
 - Selecting several tags builds a pipeline any-of list. To require all tags,
@@ -1169,18 +1117,20 @@ Use the bar above the grid to work with selected events:
 ### Store findings separately from evidence
 
 - Reviews persist in a separate SQLite file (a sidecar), defaulting to
-  `<evidence-stem>.annotations.sqlite3` beside the DuckDB file. Use `--annotations`
+  `<case stem>.annotations.sqlite3` beside the case JSON. Use `--annotations`
   to override its location. Back it up along with the evidence (stop the server
-  before copying it). Notes/tags are keyed by canonical record SHA-256, not row
-  order; identical canonical records share reviews. The evidence remains read-only.
+  before copying it). Notes/tags are keyed by review identity, not row order.
+  CloudTrail/generic content duplicates share reviews; TraceQuarry uses
+  manifest-and-line occurrences. The evidence remains read-only.
   The sidecar can contain sensitive investigator notes and is gitignored. Each
-  new note also stores the browser query it was written from (as inert JSON that
-  is re-validated when reopened); older sidecars gain that column automatically
-  and their existing notes simply have no saved query.
-- The first time a sidecar is opened, it records which evidence database it
-  belongs to (the import's source hash and record count), older sidecars
-  included. Opening it with a different database is refused, so one case's
-  notes can't be mixed into another's.
+  new note also stores the browser query it was written from as inert JSON,
+  re-validated when reopened and bound to its original prepared selection.
+  A saved query refuses silent reopening under a different selection.
+- Findings/manual state binds to the stable case UUID, not a unit's hash/count
+  or the current prepared selection. Adding units preserves existing reviews;
+  opening a sidecar from another case or an unrecognized/old binding is refused.
+  No annotation migration or adoption is performed; choose a new sidecar path
+  rather than replacing old investigator state.
 
 <a id="other-events-and-manual-key-events"></a>
 
@@ -1197,21 +1147,22 @@ Use UTF-8 JSONL, one object per nonblank line. Required fields are `date` (RFC 3
 ```
 
 ```powershell
-kamotrace import-other --source payments.jsonl tickets.jsonl.gz --database other.duckdb --origin "Synthetic ledger and ticket exports; converted to JSONL by the investigator"
-kamotrace serve --database case.duckdb --other-events other.duckdb
+kamotrace import-other --source payments.jsonl tickets.jsonl.gz --case case.json --unit application-1 --origin "Synthetic ledger and ticket exports; converted to JSONL by the investigator"
+kamotrace prepare --case case.json --unit application-1
+kamotrace serve --case case.json
 ```
 
-`--other-events` is repeatable and accepts only `import-other` databases. For a case without AWS logs, use `kamotrace serve --database other.duckdb` instead. Imports stream in batches to a new immutable DuckDB; an invalid line rejects the entire import without publishing a partial database. Existing datasets are never overwritten. Every import requires an origin description; retain originals for reproducibility. Details and exports include schema version, origin, import time, source-file byte hashes/sizes and the one-based original line locator (including blank lines). Gzip hashes cover compressed bytes. Restart the server to load newly imported datasets.
+Cases may contain only other events; no CloudTrail unit is required. Imports stream in batches to a new immutable raw artifact; an invalid line rejects the entire import without publishing a partial database. Existing units are never overwritten. Every import requires an origin description; retain originals for reproducibility. Details and exports include schema version, origin, import time, source-file byte hashes/sizes and the one-based original line locator (including blank lines). Gzip hashes cover compressed bytes. Explicitly prepare new units, then reopen the server to include them; startup never imports or prepares them.
 
 ### Add and edit manual events
 
 Choose **Add manual event**. Enter its date with timezone offset, text or JSON content, required origin/basis and optional self-reported author, IP and identity. Open a manual event and choose **Edit manual event** to change it. Nested JSON is edited as text, so opening and saving never rounds numbers through JavaScript. **Save event and refresh** explicitly reruns the current timeline selection; it does not clear filters or widen the time range. A saved event outside that selection will not appear until you adjust it.
 
-Manual events are investigator statements, not imported source evidence. They persist in `<database stem>.manual.duckdb`, separate from the primary evidence and SQLite reviews. Each edit retains prior content, origin, author and timestamps, viewable under **Previous revisions**. An edit must supply the current `updated` stamp; conflicting edits fail without replacing the draft. Cancel and reopen the event before reconciling a conflict. Author is self-reported, not authenticated. Deletion is not supported.
+Manual events are investigator statements, not imported source evidence. They persist in `<case stem>.manual.duckdb`, separate from raw/prepared evidence and SQLite reviews, and bind to the case UUID. Each edit retains prior content, origin, author and timestamps, viewable under **Previous revisions**. An edit must supply the current `updated` stamp; conflicting edits fail without replacing the draft. Cancel and reopen the event before reconciling a conflict. Author is self-reported, not authenticated. Deletion is not supported.
 
-Tags and Findings work across all three types. `record_sha256` remains the review key: CloudTrail uses its existing canonical hash, imported other records use a namespaced canonical-content hash, and manual events use a stable identity that does not change when edited. Identical imported other records share reviews; separately created manual events do not. `content_sha256` checks the current stored JSON. The inspector displays both where they differ and always renders content as plaintext. AWS-only fields and exact SSM/detection links are not invented for other events.
+Tags and Findings work across event types. `record_sha256` remains the review key: CloudTrail uses its existing canonical hash, imported generic records use a namespaced canonical-content hash, and manual events use a stable identity that does not change when edited. Identical imported generic records share reviews; separately created manual events do not. TraceQuarry reviews identify manifest-and-line occurrences instead of merging identical content. `content_sha256` checks the current stored JSON. The inspector displays both where they differ and always renders content as plaintext. AWS-only fields and exact SSM/detection links are not invented for other events.
 
-The primary database still binds the SQLite annotation sidecar to the case. Additional explicitly supplied other-event datasets can be added or removed without discarding existing CloudTrail reviews; reviews for absent records remain stored. Numeric row IDs are opaque runtime locators and may change when attached dataset order changes. Back up the primary/other DuckDB files, `.manual.duckdb` and `.annotations.sqlite3` together with the server stopped; one server must own a case's writable state.
+The case UUID binds the SQLite annotation sidecar. Reviews for records outside the selected prepared coverage remain stored. Numeric browse IDs are persisted sparse `source_record` values, not runtime attachment-order offsets; provider event IDs and review identities remain separate. Never assume counts imply a contiguous ID range. Back up the case JSON, all referenced raw/prepared artifacts, source exports, derived sidecars, `.manual.duckdb` and `.annotations.sqlite3` together with the server stopped; one server must own a case's writable state.
 
 MCP clients use the same timeline tools and `event_type`/`origin` filters. `create_manual_event(record_json, origin, author?)` creates one manual event; `edit_manual_event(id, updated, record_json, origin, author?)` replaces a manual event while preserving its reviews. Pass exact record JSON as a string; read `get_event` before editing. Neither API accepts paths, SQL or imported-record modifications.
 
@@ -1377,7 +1328,7 @@ downloaded transcripts remain separate from the Run Command viewer.
 Load the local consolidated SSM export, preferably the base64-enriched version:
 
 ```powershell
-kamotrace serve --database C:\\evidence\\case.duckdb --ssm-export C:\evidence\ssm_command_session_activity.enriched.json
+kamotrace serve --case C:\evidence\case.json --ssm-export C:\evidence\ssm_command_session_activity.enriched.json
 ```
 
 The file has `account_id`, `commands`, `invocations`, `invocation_details`, and
@@ -1664,7 +1615,7 @@ project `.mcp.json`; Amp's settings file uses the key `amp.mcpServers`):
 }
 ```
 
-For a local subprocess connection, start `serve` (or `auto`) with
+For a local subprocess connection, start `serve --case CASE.json` with
 `--mcp-transport stdio`. This disables `/mcp` and prints commands to register the
 stdio adapter instead:
 
@@ -1695,11 +1646,13 @@ your own: review them in the sidebar's **Findings** and **Event tags** tabs.
 
 ### Identify events and handle note conflicts
 
-Tags and notes attach to `record_sha256`, the canonical SHA-256
-of the original record (identical duplicate records share it, as in the browser).
-`id` is the record's 1-based position in the imported export. It is stable for
-that evidence database and is used to fetch raw detail. Write tools change only
-the hashes passed to them, 1 to 5,000 per call; there is no "tag the whole
+Tags and notes attach to `record_sha256`, the review identity. CloudTrail and
+generic records use canonical content hashes (identical duplicates share reviews);
+TraceQuarry uses manifest-and-line occurrences, and manual events keep a stable
+identity across revisions. `id` is a persisted case-local `source_record` locator
+for acquired evidence, not a source ordinal, provider ID or count. IDs may have
+gaps and do not change with attachment order. Use returned IDs to fetch raw detail.
+Write tools change only the hashes passed to them, 1 to 5,000 per call; there is no "tag the whole
 query" tool, so an agent must page through results and pass the events it means.
 Note edits and deletes need the note's current `updated` value (returned by
 `get_note`, `list_notes` and every note write). If the browser or another agent
@@ -1731,8 +1684,10 @@ changed the note since, the call fails without writing; re-read it and retry.
 | `create_export` | Immutable NDJSON snapshot of an event `query` or SSM `ssm_selection` with allowlisted fields. Returns readiness, row/byte counts, SHA-256, expiry and an opaque download URL, never a filesystem path. |
 
 EKS configuration requires a verified `--eks-export` at server startup. Historical
-pod searches require the separately imported EKS database attached through
-`--other-events`; `auto` with EKS selection prepares both. No result is proof that
+pod searches require a prepared EKS acquisition in the selected case coverage;
+use `auto --case CASE.json --unit KEY --kind eks --source FOLDER --no-serve`
+to admit and prepare a verified existing export. `--eks-export` attaches current
+configuration separately; it does not admit timeline logs. No result is proof that
 no pods exist: inspect coverage, unsupported messages and missing UIDs. Inventory
 is collection-time AWS configuration, not incident-time state or effective access.
 
@@ -1903,17 +1858,20 @@ To scope it to one case instead, put it in that case folder's
 
 | Data | Where it lives | Written by the browser? |
 | --- | --- | --- |
-| CloudTrail events and provenance | Imported DuckDB file | No; opened read-only |
-| Annotations, event links and coloured tags | `<evidence-stem>.annotations.sqlite3` (or `--annotations`) | Yes (browser and MCP agents, through the same server) |
-| Suzaku detections and their provenance | `<evidence-stem>.detections.duckdb` (or `--detections`), written by `kamotrace suzaku` | No; read-only, rebuilt from Suzaku output |
-| GuardDuty findings, contextual links and provenance | `<evidence-stem>.guardduty.duckdb` (or `--guardduty`), written by `kamotrace guardduty` | No; read-only, derived from finding JSON |
+| Case identity, units, coverage and ID reservations | One case JSON, written by admission/preparation commands | No |
+| Raw events/provenance and prepared scalar coverage | Immutable per-unit artifacts referenced by the case JSON | No; opened read-only |
+| Annotations, event links and coloured tags | `<case stem>.annotations.sqlite3` (or `--annotations`), bound to case UUID | Yes (browser and MCP agents, through the same server) |
+| Manual events and revision history | `<case stem>.manual.duckdb`, bound to case UUID | Yes (browser and MCP agents) |
+| Suzaku detections and their provenance | `<case stem>.detections.duckdb` (or `--detections`), bound to prepared selection | No; read-only, rebuilt from Suzaku output |
+| GuardDuty contextual links and provenance | `<case stem>.guardduty.duckdb` (or `--guardduty`), bound to prepared selection; snapshots are raw/prepared units | No; read-only, derived from finding JSON |
 | Current network/IAM configuration and coverage | Inventory export folder (passed with `--inventory-export`), including raw responses, report and manifest | No; loaded at startup |
 | SSM commands, outputs and enrichment | Original JSON export, loaded into memory | No; **not imported into persistent DuckDB tables** |
-| IP enrichment and its provenance | `<evidence-stem>.enrichment.duckdb` (or `--enrichment`), written by `kamotrace enrich` | No; read-only, rebuilt from DB-IP/GeoLite2 `.mmdb` and/or JSONL; no online lookups |
+| IP enrichment and its provenance | `<case stem>.enrichment.duckdb` (or `--enrichment`), bound to prepared selection | No; read-only, rebuilt from DB-IP/GeoLite2 `.mmdb` and/or JSONL; no online lookups |
 | SSM-to-CloudTrail query links | Temporary DuckDB table | Memory only; rebuilt on startup |
 
-Stop the server before backing up the annotation sidecar. Keep it with the exact
-evidence database it describes, plus the source exports and enrichment cache.
+Stop the server before backup. Keep the case JSON, every referenced raw/prepared
+artifact, Findings/manual state, derived sidecars, source exports and lookup files
+together. Do not delete retained artifacts or reset ID reservations to close gaps.
 The running browser server does not collect AWS data or refresh exports: prepare
 new data with the CLI and restart to reload it. It does not fetch output URLs
 or run shell commands. See [evidence and state ownership](architecture.md#evidence-derived-context-and-investigator-state)
@@ -1940,7 +1898,7 @@ requests finish, including response parsing. With no pointer in the page it
 appears below the top bar instead. It does not block clicks, and reduced-motion
 preferences disable its animation.
 
-`kamotrace serve --database case.duckdb --log-level debug` enables detailed
+`kamotrace serve --case case.json --log-level debug` enables detailed
 application timings. Set `KAMOTRACE_LOG_LEVEL=debug` in the environment instead
 when launching through `kamotrace auto`. The default is `info`; `warning` and
 `error` reduce output. Debug logging is limited to KamoTrace, not third-party
@@ -1989,9 +1947,13 @@ startup messages still contain local file paths. Review logs before sharing.
 
 ### Common problems
 
-- **Missing database:** import a CloudTrail `Records` JSON export first, or pass
-  `--database` with the correct path. An arbitrary DuckDB file will not have the
-  required schema. The importer intentionally refuses to overwrite evidence.
+- **Missing case or preparation:** admit original exports with `import`,
+  `import-other` or `import-uac --case CASE.json --unit KEY`, then run
+  `prepare --case CASE.json --unit KEY` and `serve --case CASE.json`.
+  Startup does not adopt old databases or build missing preparation. To open
+  a deliberate prepared subset, repeat `serve --unit KEY`; otherwise all units
+  must be prepared. Rebuild incompatible/damaged derived output explicitly
+  with `prepare --rebuild`; original evidence remains untouched.
 - **Port already in use:** stop the previous server, or use `--port 8766` and open
   that port instead. Avoid leaving multiple instances on the same port.
 - **No SSM commands:** supply `--ssm-export` with the consolidated format described
@@ -1999,7 +1961,7 @@ startup messages still contain local file paths. Review logs before sharing.
   are not a substitute for the consolidated export.
 - **Countries unmapped:** run `kamotrace enrich` (private and service addresses
   stay unmapped), or pass `--enrichment` if the sidecar is elsewhere. A sidecar
-  built for another database is refused: rebuild it with `--replace`. IP geography
+  built for another prepared selection is refused: rebuild it with `--replace`. IP geography
   is not proof of a person's location; proxies and service IPs can mislead.
 - **No matching results:** widen the time range and clear filters. CloudTrail
   and SSM command search/filter selections are separate.
@@ -2097,10 +2059,9 @@ invalid input, raw-hash check) whose writes are checked through the browser API,
 and Suzaku import (exact eventID/region/time linkage, correlation rows linked to
 every member or not at all, unmatched rows kept but not shown, rule AND filters,
 minimum level, refusal to overwrite) against the
-DuckDB schema Suzaku 3.0.0 writes. Full-auto tests run every stage on stubbed AWS
-and tool downloads: a target-only run that fails mid-collection, resumes with the
-same frozen range, then reruns as a no-op; stage failures, refreshed sidecars,
-refusal of different evidence and of concurrent runs.
+DuckDB schema Suzaku 3.0.0 writes. Offline auto tests cover explicit admission,
+preparation, retries, writer contention and rejection of unsupported startup. Collection
+and tool download tests exercise the standalone commands rather than online auto.
 They never modify the real CloudTrail evidence database. For contributor
 ownership and design rationale, see [components and design choices](architecture.md);
 for safety and recurring-mistake guardrails, see [AGENTS.md](../AGENTS.md).
