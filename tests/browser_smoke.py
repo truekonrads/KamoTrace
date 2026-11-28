@@ -116,19 +116,26 @@ def cancellation_browser_check(browser, results):
     """Browser controls against real HTTP and genuinely executing native DuckDB work."""
     store = BrowserContract.store
     slow = threading.Event()
+    slow_running = threading.Event()
     original = store.rows
 
     def rows(sql, params=None, *, operation="rows"):
         if slow.is_set() and operation in ("events.page", "column_values.summary"):
             slow.clear()
-            original("SELECT sum(sin(i)) FROM range(10000000000) t(i)")
+            slow_running.set()
+            try:
+                original("SELECT sum(sin(i)) FROM range(10000000000) t(i)")
+            finally:
+                slow_running.clear()
         return original(sql, params, operation=operation)
 
     def running(page):
         until = time.monotonic() + 5
-        while time.monotonic() < until and store.connection.query_progress() < 0:
+        # A histogram or previous reload can report progress before this injected
+        # query starts; do not let its delay spill into the replacement search.
+        while time.monotonic() < until and (not slow_running.is_set() or store.connection.query_progress() < 0):
             page.wait_for_timeout(20)
-        assert store.connection.query_progress() >= 0, "Native query never started"
+        assert slow_running.is_set() and store.connection.query_progress() >= 0, "Injected native query never started"
         expect(page.locator("#operations")).to_contain_text("ETA unavailable")
 
     context = browser.new_context(viewport={"width": 1440, "height": 1000}, device_scale_factor=2)
