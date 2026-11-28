@@ -13,7 +13,9 @@ function positionBusyDuck() {
   duck.style.top = `${pointer ? Math.max(8, Math.min(pointer.y + 18, innerHeight - 40)) : document.querySelector(".topbar").getBoundingClientRect().bottom + 8}px`;
 }
 document.addEventListener("pointermove", (event) => {
-  pointer = { x: event.clientX, y: event.clientY };
+  pointer = event.target.closest("#operations")
+    ? null
+    : { x: event.clientX, y: event.clientY };
   if (!$("query-busy").hidden) positionBusyDuck();
 });
 document.documentElement.addEventListener("pointerleave", () => {
@@ -48,6 +50,7 @@ let meta,
   nextPage = 2,
   loadingMore = false,
   loadingFirst = true,
+  eventResultsStale = false,
   summaryRequest = 0,
   updating = false,
   latestQuery = 0,
@@ -208,6 +211,10 @@ function normalize(state) {
 
 async function apply(state, push = true, guardDraft = false) {
   const requestId = ++latestApply;
+  if (eventOperation) {
+    cancelOperation(eventOperation);
+    setLoading();
+  }
   const next = normalize(state);
   if (
     next.case_context &&
@@ -3349,20 +3356,116 @@ const error = (message) => {
   $("error").hidden = !message;
 };
 
-async function request(url, body) {
+const runningOperations = new Set();
+let operationTimer;
+let eventOperation;
+let pageOperation;
+let summaryOperation;
+function newOperation(label) {
+  return {
+    label,
+    started: performance.now(),
+    cancelled: false,
+    requests: new Set(),
+  };
+}
+async function cancelOperation(operation) {
+  operation.cancelled = true;
+  operation.cancelError = false;
+  renderOperations();
+  await Promise.all(
+    [...operation.requests].map(async (item) => {
+      if (!item.token) return; // Registration will send cancellation when it returns.
+      try {
+        const res = await fetch("/api/operations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "cancel", token: item.token }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch {
+        operation.cancelError = true;
+        renderOperations();
+      }
+    }),
+  );
+}
+function renderOperations() {
+  const panel = $("operations");
+  const host = document.querySelector("dialog:modal") || document.body;
+  if (panel.parentElement !== host) host.append(panel);
+  panel.hidden = !runningOperations.size;
+  for (const row of [...panel.children]) {
+    if (![...runningOperations].some((operation) => operation.row === row))
+      row.remove();
+  }
+  for (const operation of runningOperations) {
+    if (!operation.row) {
+      operation.row = document.createElement("div");
+      const text = document.createElement("span");
+      const button = document.createElement("button");
+      button.textContent = "Cancel";
+      button.setAttribute("aria-label", `Cancel ${operation.label}`);
+      button.onclick = () => cancelOperation(operation);
+      operation.row.append(text, button);
+      panel.append(operation.row);
+    }
+    const [text, button] = operation.row.children;
+    text.textContent = `${operation.label} · ${((performance.now() - operation.started) / 1000).toFixed(1)} s elapsed · ETA unavailable${operation.cancelError ? " · Cancel unconfirmed; results will be discarded" : operation.cancelled ? " · Cancelling…" : ""}`;
+    button.textContent = operation.cancelError ? "Retry cancel" : "Cancel";
+    button.disabled = operation.cancelled && !operation.cancelError;
+  }
+}
+
+async function request(url, body, operation = null) {
+  const cancellable = [
+    "/api/events",
+    "/api/histogram",
+    "/api/column-values",
+  ].includes(url);
+  const item = {};
+  if (cancellable) {
+    operation ||= newOperation(
+      url === "/api/column-values" ? "Column summary" : "Event query",
+    );
+    operation.requests.add(item);
+    runningOperations.add(operation);
+    renderOperations();
+    operationTimer ||= setInterval(renderOperations, 100);
+  }
   queryActivity(1);
   try {
+    if (cancellable) {
+      const registration = await fetch("/api/operations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "start" }),
+      });
+      const result = await registration.json();
+      if (!registration.ok)
+        throw new Error(result.error || "Could not register operation");
+      item.token = result.token;
+      if (operation.cancelled) await cancelOperation(operation);
+    }
     const res = await fetch(
       url,
       body === undefined
         ? {}
         : {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...(item.token ? { "X-KamoTrace-Operation": item.token } : {}),
+            },
             body: JSON.stringify(body),
           },
     );
     const result = await res.json();
+    if (operation?.cancelled || result.cancelled)
+      throw Object.assign(
+        new Error("Operation cancelled; previous results are not updated"),
+        { cancelled: true },
+      );
     if (!res.ok)
       throw Object.assign(new Error(result.error || `HTTP ${res.status}`), {
         stale: result.stale === true,
@@ -3371,6 +3474,15 @@ async function request(url, body) {
       });
     return result;
   } finally {
+    if (cancellable) {
+      operation.requests.delete(item);
+      if (!operation.requests.size) runningOperations.delete(operation);
+      renderOperations();
+      if (!runningOperations.size) {
+        clearInterval(operationTimer);
+        operationTimer = null;
+      }
+    }
     queryActivity(-1);
   }
 }
@@ -3409,28 +3521,36 @@ function reload() {
   }
   error("");
   $("stale").hidden = true;
-  table.setData().catch((e) => error(e.message));
+  // ajaxRequestFunc owns errors and guards them against superseded queries.
+  table.setData().catch(() => {});
 }
 
 async function loadMore() {
   if (
     loadingFirst ||
     loadingMore ||
+    eventResultsStale ||
     !lastResult ||
     table.getDataCount() >= lastResult.last_row
   )
     return;
   const requestId = latestQuery;
+  const operation = newOperation("Load more events");
+  pageOperation = operation;
   loadingMore = true;
   $("events-loading").hidden = false;
   $("load-status").textContent = "Loading more…";
   try {
-    const result = await request("/api/events", {
-      ...lastSelection,
-      page: nextPage,
-      size: 100,
-      sorters: table.getSorters().map(({ field, dir }) => ({ field, dir })),
-    });
+    const result = await request(
+      "/api/events",
+      {
+        ...lastSelection,
+        page: nextPage,
+        size: 100,
+        sorters: table.getSorters().map(({ field, dir }) => ({ field, dir })),
+      },
+      operation,
+    );
     // Discard superseded batches before they can enter the grid.
     if (requestId !== latestQuery) return;
     nextPage++;
@@ -3444,6 +3564,7 @@ async function loadMore() {
         "Could not load more. Scroll up and down to retry.";
     }
   } finally {
+    if (pageOperation === operation) pageOperation = null;
     if (requestId === latestQuery) {
       loadingMore = false;
       $("events-loading").hidden = true;
@@ -3738,6 +3859,9 @@ function step(delta) {
 
 async function columnSummary(title, field, match) {
   if (!lastSelection) return;
+  if (summaryOperation) cancelOperation(summaryOperation);
+  const operation = newOperation("Column summary");
+  summaryOperation = operation;
   const requestId = ++summaryRequest;
   $("column-summary-title").textContent =
     `${title} · ${match ? "value prevalence" : "value frequency"}`;
@@ -3781,11 +3905,15 @@ async function columnSummary(title, field, match) {
     return wrap;
   };
   try {
-    const data = await request("/api/column-values", {
-      ...lastSelection,
-      field,
-      ...match,
-    });
+    const data = await request(
+      "/api/column-values",
+      {
+        ...lastSelection,
+        field,
+        ...match,
+      },
+      operation,
+    );
     if (requestId !== summaryRequest) return;
     if (match) {
       const percent = new Intl.NumberFormat("en-US", {
@@ -3828,6 +3956,8 @@ async function columnSummary(title, field, match) {
   } catch (e) {
     if (requestId === summaryRequest)
       $("column-summary-status").textContent = e.message;
+  } finally {
+    if (summaryOperation === operation) summaryOperation = null;
   }
 }
 
@@ -4814,9 +4944,15 @@ async function init() {
     initialSort: [{ column: "time_local", dir: "desc" }],
     ajaxURL: "/api/events",
     ajaxRequestFunc: async (_url, _config, params) => {
+      if (eventOperation) cancelOperation(eventOperation);
+      if (pageOperation) cancelOperation(pageOperation);
+      if (summaryOperation) cancelOperation(summaryOperation);
+      const operation = newOperation("Search / sort");
+      eventOperation = operation;
       const requestId = ++latestQuery;
       const applyId = latestApply;
       setLoading(`Loading events · ${meta.timezone}…`);
+      eventResultsStale = true;
       loadingFirst = true;
       loadingMore = false;
       $("events-loading").hidden = true;
@@ -4827,6 +4963,9 @@ async function init() {
       $("cell-filter-menu").hidePopover();
       try {
         $("query-time").textContent = "Running…";
+        $("result-count").textContent = lastResult
+          ? `${number(lastResult.last_row)} matching · previous results`
+          : "Loading events…";
         $("load-status").textContent = "Loading…";
         $("frequency-summary").textContent =
           "Updating selected event frequency…";
@@ -4836,29 +4975,48 @@ async function init() {
             ? $("custom-bucket").value
             : $("bucket").value;
         const [result, histogram, context] = await Promise.all([
-          request("/api/events", {
-            ...selection,
-            page: 1,
-            size: 100,
-            sorters: params.sort,
-          }),
-          request("/api/histogram", { ...selection, bucket_minutes }).catch(
-            (e) => ({ error: e.message }),
+          request(
+            "/api/events",
+            {
+              ...selection,
+              page: 1,
+              size: 100,
+              sorters: params.sort,
+            },
+            operation,
           ),
+          request(
+            "/api/histogram",
+            { ...selection, bucket_minutes },
+            operation,
+          ).catch((e) => ({ error: e.message })),
           $("show-context").checked
-            ? request("/api/histogram", {
-                timezone: selection.timezone,
-                start: selection.start,
-                end: selection.end,
-                bucket_minutes,
-              }).catch((e) => ({ error: e.message }))
+            ? request(
+                "/api/histogram",
+                {
+                  timezone: selection.timezone,
+                  start: selection.start,
+                  end: selection.end,
+                  bucket_minutes,
+                },
+                operation,
+              ).catch((e) => ({ error: e.message }))
             : null,
         ]);
         // Tabulator ignores stale row loads; keep the count and SQL in sync with it.
-        if (requestId !== latestQuery) return [];
+        if (
+          requestId !== latestQuery ||
+          applyId !== latestApply ||
+          operation.cancelled
+        )
+          throw Object.assign(
+            new Error("Operation cancelled; previous results are not updated"),
+            { cancelled: true },
+          );
         // Agents (MCP) write the same sidecar: every run also refreshes tag/note lists.
         refreshReviews().catch((e) => error(e.message));
         lastResult = result;
+        eventResultsStale = false;
         lastSelection = selection;
         lastHistogram = histogram;
         lastContext = context;
@@ -4878,11 +5036,25 @@ async function init() {
         return result.data;
       } catch (e) {
         if (requestId === latestQuery) {
-          $("query-time").textContent = "Query failed";
+          $("query-time").textContent = e.cancelled
+            ? "Cancelled"
+            : "Query failed";
+          $("result-count").textContent = lastResult
+            ? `${number(lastResult.last_row)} matching · previous results`
+            : "Query not applied";
+          $("frequency-summary").textContent =
+            "Query not applied · previous frequency, if shown";
+          $("stale").hidden = false;
           error(e.message);
         }
         throw e;
       } finally {
+        if (operation.requests.size) cancelOperation(operation);
+        if (eventOperation === operation) eventOperation = null;
+        if (requestId === latestQuery) {
+          loadingFirst = false;
+          loadStatus();
+        }
         // An older event load must not dismiss a newer timezone refresh.
         if (requestId === latestQuery && applyId === latestApply) setLoading();
       }
@@ -5099,7 +5271,10 @@ async function init() {
   $("close-summary").addEventListener("click", () =>
     $("column-summary").close(),
   );
-  $("column-summary").addEventListener("close", () => ++summaryRequest);
+  $("column-summary").addEventListener("close", () => {
+    ++summaryRequest;
+    if (summaryOperation) cancelOperation(summaryOperation);
+  });
   document.addEventListener("keydown", (e) => {
     if ($("manual-event-dialog").open) return;
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);

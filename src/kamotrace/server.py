@@ -30,6 +30,19 @@ from .raw_paths import CONTRACT as RAW_PATH_CONTRACT, fields as raw_fields, scal
 
 logger = logging.getLogger(__name__)
 REQUEST_ID = ContextVar("request_id", default="startup")
+UI_OPERATION = ContextVar("ui_operation", default=None)
+
+
+class OperationCancelled(Exception):
+    pass
+
+
+def check_cancelled():
+    operation = UI_OPERATION.get()
+    if operation is not None and operation["cancelled"]:
+        raise OperationCancelled("Operation cancelled; previous results are not updated")
+
+
 ROOT = Path(__file__).resolve().parent
 FIELDS = {
     "time_local": "Local time",
@@ -266,6 +279,9 @@ class Store:
                 duckdb.struct_type({"value": "VARCHAR", "json_type": "VARCHAR"}))
             # Snapshot exports reuse public Store reads under one annotation snapshot.
             self.lock = threading.RLock()
+            self.operation_lock = threading.Lock()
+            self.operations = {}
+            self.active_operation = None
             self.exports = None
             # Per-process prefix: a page-1 revision from before a restart never validates afterwards.
             self.log_revision = f"{secrets.token_hex(4)}-0"
@@ -475,22 +491,85 @@ class Store:
                 if used:
                     logger.debug("startup_memory stage=%s tag=%s bytes=%d", stage, tag, used)
 
+    def ui_operation(self, body):
+        # Unguessable, server-issued capabilities are never enumerated or logged.
+        with self.operation_lock:
+            now = time.monotonic()
+            self.operations = {key: value for key, value in self.operations.items()
+                               if value["claimed"] or now - value["created"] < 60}
+            if body.get("action") == "start":
+                if len(self.operations) >= 128:
+                    raise ValueError("Too many pending operations; retry after completion")
+                token = secrets.token_urlsafe(32)
+                self.operations[token] = {"created": now, "claimed": False, "cancelled": False}
+                return {"token": token}
+            if body.get("action") != "cancel" or not isinstance(body.get("token"), str):
+                raise ValueError("Expected start or cancel with an operation token")
+            state = self.operations.get(body["token"])
+            if state is not None:
+                was_cancelled = state["cancelled"]
+                state["cancelled"] = True
+                if self.active_operation is state:
+                    # Hold ownership guard across interrupt: lock handoff cannot race this call.
+                    self.connection.interrupt()
+                    if not was_cancelled:
+                        threading.Thread(target=self.interrupt_cancelled, args=(state,), daemon=True).start()
+            return {"cancelled": state is not None}
+
+    def interrupt_cancelled(self, state):
+        # DuckDB resets an interrupt issued before execute(). Retry across that gap,
+        # but never across the Store-lock handoff to a different request.
+        while True:
+            with self.operation_lock:
+                if self.active_operation is not state:
+                    return
+                self.connection.interrupt()
+            time.sleep(0.05)
+
+    @contextmanager
+    def ui_request(self, token):
+        with self.operation_lock:
+            state = self.operations.get(token)
+            if state is None or state["claimed"] or time.monotonic() - state["created"] >= 60:
+                raise ValueError("Unknown, expired or already used operation token")
+            state["claimed"] = True
+        context = UI_OPERATION.set(state)
+        try:
+            check_cancelled()
+            yield
+            check_cancelled()
+        except duckdb.InterruptException:
+            check_cancelled()
+            raise
+        finally:
+            UI_OPERATION.reset(context)
+            with self.operation_lock:
+                self.operations.pop(token, None)
+
     @contextmanager
     def locked(self, operation):
         """Separate serialized Store work from time spent waiting behind another request."""
         queued = time.monotonic()
         request_id = REQUEST_ID.get()
         logger.info("operation queued request_id=%s operation=%s", request_id, operation)
-        self.lock.acquire()
+        while not self.lock.acquire(timeout=0.1):
+            check_cancelled()
         acquired = time.monotonic()
         outcome = "error"
+        previous_operation = self.active_operation
         try:
+            with self.operation_lock:
+                check_cancelled()
+                self.active_operation = UI_OPERATION.get()
             logger.info("operation started request_id=%s operation=%s lock_wait_ms=%.3f",
                         request_id, operation, (acquired - queued) * 1000)
             yield
+            check_cancelled()
             outcome = "ok"
         finally:
             finished = time.monotonic()
+            with self.operation_lock:
+                self.active_operation = previous_operation
             self.lock.release()
             logger.info("operation finished request_id=%s operation=%s outcome=%s lock_wait_ms=%.3f execution_ms=%.3f total_ms=%.3f",
                         request_id, operation, outcome, (acquired - queued) * 1000,
@@ -959,6 +1038,7 @@ class Store:
                 **({"updated": stamp} if action in ("annotate", "edit", "link", "unlink") else {})}
 
     def rows(self, sql, params=None, *, operation="rows"):
+        check_cancelled()
         started = time.monotonic()
         result = self.connection.execute(sql, params or [])
         names = [column[0] for column in result.description]
@@ -969,14 +1049,18 @@ class Store:
 
     def selected_count(self, count_sql, params):
         """Reuse one validated membership for counts/histograms. Caller holds the Store lock."""
+        check_cancelled()
         key = (count_sql, tuple(params), self.annotation_revision)
         if key != self.selection_key:
             self.selection_key = None  # A failed replacement must never reuse the previous selection.
             self.connection.execute("DROP TABLE IF EXISTS selection.matches")
+            check_cancelled()
             started = time.monotonic()
             self.connection.execute("CREATE TABLE selection.matches AS " + count_sql.replace(
                 "SELECT count(*)", "SELECT id, event_time, record_sha256", 1), params)
+            check_cancelled()
             self.connection.execute("CHECKPOINT selection")
+            check_cancelled()
             self.selection_key = key
             logger.debug("query request_id=%s operation=selection.build elapsed_ms=%.3f",
                          REQUEST_ID.get(), (time.monotonic() - started) * 1000)
@@ -1359,7 +1443,7 @@ class Handler(SimpleHTTPRequestHandler):
                     route = "/api/events/:record"
                 elif route.startswith("/api/exports/"):
                     route = "/api/exports/:id"
-                elif route not in ("/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values",
+                elif route not in ("/api/operations", "/api/pipeline", "/api/meta", "/api/events", "/api/histogram", "/api/column-values",
                                    "/api/reviews", "/api/detections", "/api/inventory", "/api/reference", "/api/computers", "/api/eks-pods",
                                    "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event",
                                    "/api/ssm-log", "/api/ssm-log-review", "/mcp"):
@@ -1501,7 +1585,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/inventory", "/api/eks-pods", "/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
+        if self.path not in ("/api/operations", "/api/inventory", "/api/eks-pods", "/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1511,6 +1595,9 @@ class Handler(SimpleHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object")
+            if self.path == "/api/operations":
+                self.respond(self.store.ui_operation(body))
+                return
             operation = {"/api/meta": self.store.timezone_metadata, "/api/events": self.store.query, "/api/histogram": self.store.histogram,
                          "/api/manual-events": self.store.manual_write,
                          "/api/computers": self.store.computers,
@@ -1529,7 +1616,17 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/ssm-log": self.store.ssm_log, "/api/ssm-log-review": self.store.ssm_log_review,
                          "/api/ssm": self.store.commands.list, "/api/ssm-detail": self.store.commands.detail,
                          "/api/ssm-event": self.store.commands.event, "/api/ssm-sheet": self.store.commands.sheet}[self.path]
-            self.respond(operation(body))
+            token = self.headers.get("X-KamoTrace-Operation")
+            if token is not None:
+                if self.path not in ("/api/events", "/api/histogram", "/api/column-values"):
+                    raise ValueError("Cancellation is supported for events, histogram and column values only")
+                with self.store.ui_request(token):
+                    result = operation(body)
+            else:
+                result = operation(body)
+            self.respond(result)
+        except OperationCancelled as error:
+            self.respond({"error": str(error), "cancelled": True}, 409)
         except StaleSelection as error:
             self.respond({"error": str(error), "stale": True}, 409)
         except PipelineError as error:

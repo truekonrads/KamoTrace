@@ -5,7 +5,10 @@ from functools import partial
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
 import threading
+import time
+from unittest.mock import patch
 
 from playwright.sync_api import expect, sync_playwright
 
@@ -109,6 +112,158 @@ def eks_browser_check(browser, results):
         print("PASS: combined EKS coverage retains earlier gaps; source detail is usable above explorer, including an already-open inspector; filters/results preserved.")
 
 
+def cancellation_browser_check(browser, results):
+    """Browser controls against real HTTP and genuinely executing native DuckDB work."""
+    store = BrowserContract.store
+    slow = threading.Event()
+    original = store.rows
+
+    def rows(sql, params=None, *, operation="rows"):
+        if slow.is_set() and operation in ("events.page", "column_values.summary"):
+            slow.clear()
+            original("SELECT sum(sin(i)) FROM range(10000000000) t(i)")
+        return original(sql, params, operation=operation)
+
+    def running(page):
+        until = time.monotonic() + 5
+        while time.monotonic() < until and store.connection.query_progress() < 0:
+            page.wait_for_timeout(20)
+        assert store.connection.query_progress() >= 0, "Native query never started"
+        expect(page.locator("#operations")).to_contain_text("ETA unavailable")
+
+    context = browser.new_context(viewport={"width": 1440, "height": 1000}, device_scale_factor=2)
+    page = context.new_page()
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    with store.lock:
+        store.connection.execute("SET enable_progress_bar=true; SET enable_progress_bar_print=false; SET progress_bar_time=1")
+    try:
+        with patch.object(store, "rows", rows):
+            page.goto(BrowserContract.url)
+            grid = page.locator("#events .tabulator-row")
+            expect(grid).to_have_count(5)
+            slow.set()
+            page.locator("#search").fill("SendCommand")
+            page.locator("#search").press("Enter")
+            running(page)
+            cancel = page.get_by_role("button", name="Cancel Search / sort", exact=True)
+            cancel.focus()
+            expect(page.locator("#operations")).to_contain_text(re.compile(r"(?:[1-9]\d*\.\d|0\.[2-9]) s elapsed"))
+            expect(cancel).to_be_focused()  # Updating elapsed time must not replace controls.
+            page.screenshot(path=str(results / "operation-running.png"))
+            page.route("**/api/operations", lambda route: route.fulfill(
+                status=503, content_type="application/json", body='{"error":"Synthetic cancellation failure"}')
+                if route.request.post_data_json.get("action") == "cancel" else route.continue_())
+            cancel.click()
+            expect(cancel).to_have_text("Retry cancel")
+            expect(cancel).to_be_enabled()
+            expect(page.locator("#operations")).to_contain_text("Cancel unconfirmed")
+            page.screenshot(path=str(results / "operation-cancel-unconfirmed.png"))
+            page.unroute("**/api/operations")
+            cancel.click()
+            expect(page.locator("#query-time")).to_have_text("Cancelled")
+            expect(page.locator("#operations")).to_be_hidden()
+            expect(page.locator("#app-loading")).to_be_hidden()
+            expect(grid).to_have_count(5)
+            expect(page.locator("#events .tabulator-alert")).to_be_hidden()
+            expect(page.locator("#error")).to_contain_text("previous results")
+            page.screenshot(path=str(results / "operation-cancelled.png"))
+            page.locator("#search").press("Enter")
+            expect(grid).to_have_count(3)
+            expect(page.locator("#error")).to_be_hidden()
+            page.screenshot(path=str(results / "operation-recovered.png"))
+
+            slow.set()
+            page.locator('.tabulator-col[tabulator-field="time_local"] .tabulator-col-sorter').click()
+            running(page)
+            cancel.click()
+            expect(page.locator("#query-time")).to_have_text("Cancelled")
+            expect(grid).to_have_count(3)
+            page.locator("#search").press("Enter")
+            expect(page.locator("#operations")).to_be_hidden()
+
+            slow.set()
+            page.locator("#search").fill("StartSession")
+            page.locator("#search").press("Enter")
+            running(page)
+            page.locator("#search").fill("UpdateInstanceInformation")
+            page.locator("#search").press("Enter")
+            expect(grid).to_have_count(1)
+            expect(grid.first).to_contain_text("UpdateInstanceInformation")
+            expect(page.locator("#operations")).to_be_hidden()
+            expect(page.locator("#error")).to_be_hidden()
+
+            slow.set()
+            page.locator("#search").fill("StartSession")
+            page.locator("#search").press("Enter")
+            running(page)
+            page.locator("#query-mode").select_option("pipeline")
+            page.locator("#search").fill("event_name =")
+            page.locator("#run").click()
+            expect(page.locator("#pipeline-error")).to_be_visible()
+            expect(page.locator("#query-time")).to_have_text("Cancelled")
+            expect(page.locator("#operations")).to_be_hidden()
+            expect(page.locator("#app-loading")).to_be_hidden()
+            page.locator("#search").fill('search "UpdateInstanceInformation"')
+            page.locator("#query-mode").select_option("text")
+            expect(page.locator("#search")).to_have_value("UpdateInstanceInformation")
+            page.locator("#search").press("Enter")
+            expect(page.locator("#error")).to_be_hidden()
+            expect(grid.first).to_contain_text("UpdateInstanceInformation")
+
+            slow.set()
+            # The existing public UI summary opens a modal; cancellation must remain reachable.
+            page.locator('.tabulator-col[tabulator-field="summary"] .column-summary-button').click()
+            running(page)
+            summary_cancel = page.get_by_role("button", name="Cancel Column summary", exact=True)
+            expect(summary_cancel).to_be_visible()
+            page.screenshot(path=str(results / "operation-summary.png"))
+            summary_cancel.click()
+            expect(page.locator("#column-summary-status")).to_contain_text("cancelled")
+            page.locator("#close-summary").click()
+
+            # Completion can win on the server while its response is still in flight.
+            held = []
+            page.route("**/api/events", lambda route: route.continue_() if held else held.append((route, route.fetch())))
+            page.locator("#search").press("Enter")
+            expect(page.locator("#app-loading")).to_be_visible()
+            until = time.monotonic() + 5
+            while not held and time.monotonic() < until:
+                page.wait_for_timeout(20)
+            assert held, "Completed response was not held"
+            cancel.click()
+            expect(page.locator("#operations")).to_contain_text("Cancelling…")
+            page.screenshot(path=str(results / "operation-cancelling.png"))
+            page.locator("#search").fill("StartSession")
+            page.locator("#search").press("Enter")
+            expect(grid.first).to_contain_text("StartSession")
+            held[0][0].fulfill(response=held[0][1])
+            page.unroute("**/api/events")
+            expect(page.locator("#operations")).to_be_hidden()
+            expect(grid.first).to_contain_text("StartSession")
+            expect(page.locator("#error")).to_be_hidden()
+
+            page.route("**/api/events", lambda route: route.fulfill(
+                status=500, content_type="application/json", body='{"error":"Synthetic database failure"}'))
+            page.locator("#search").press("Enter")
+            expect(page.locator("#query-time")).to_have_text("Query failed")
+            expect(page.locator("#operations")).to_be_hidden()
+            expect(grid.first).to_contain_text("StartSession")
+            page.screenshot(path=str(results / "operation-error.png"))
+            page.unroute("**/api/events")
+            page.locator("#refresh-stale").click()
+            expect(page.locator("#error")).to_be_hidden()
+            expect(grid).to_have_count(1)
+            assert not errors, errors
+            print("PASS: native query cancel, elapsed timer/focus, preserved rows, rerun, sort cancel, supersession, modal summary cancel, late completion and error/retry")
+    finally:
+        for token in list(store.operations):
+            store.ui_operation({"action": "cancel", "token": token})
+        context.close()
+        with store.lock:
+            store.connection.execute("SET enable_progress_bar=false; SET progress_bar_time=2000")
+
+
 def main():
     results = Path("test-results")
     results.mkdir(exist_ok=True)
@@ -117,6 +272,7 @@ def main():
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch()
+            cancellation_browser_check(browser, results)
             context = browser.new_context(
                 viewport={"width": 1440, "height": 1000}, device_scale_factor=2
             )

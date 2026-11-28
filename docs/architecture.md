@@ -145,6 +145,29 @@ contexts are inert query data, revalidated when reopened, never stored executabl
 SQL. Tag/note writes patch loaded rows in place so investigators keep their
 selection and scroll; refreshing filtered membership/counts is explicit.
 
+Browser event reads can register a single-use capability via
+`POST /api/operations {"action":"start"}` and send its returned `token` as
+`X-KamoTrace-Operation` on `/api/events`, `/api/histogram` or `/api/column-values`.
+`POST /api/operations {"action":"cancel","token":"…"}` marks only that request
+cancelled. A separate ownership mutex guards DuckDB `interrupt()` and the
+shared Store-lock handoff; queued cancellation polls cooperatively without
+interrupting the lock holder. While a cancelled request still owns the connection,
+a daemon retries interruption every 50 ms: DuckDB discards an interrupt issued
+before a statement starts. Every retry rechecks ownership under the same mutex
+and exits at handoff, so it cannot interrupt the next request.
+Cancellation is checked between query phases and
+before returning results. Completed/unknown tokens cannot interrupt new work.
+Unclaimed registrations expire after 60 seconds; at most 128 pending/active
+capabilities are retained, and claimed tokens are removed on success/error/cancel.
+Tokens are not listed or logged. Existing Host/Origin checks still apply.
+The browser groups related reads, discards cancelled responses even if completion
+wins the race, cancels superseded searches/pages/summaries, and retains usable
+retry controls without accepting previous rows as the failed selection.
+The elapsed timer includes queueing and network work. DuckDB's optional
+`query_progress()` is a single-statement, connection-level percentage (or -1),
+not operation-wide work accounting; no reliable ETA is exposed. Writes, exports,
+SSM's Python searches and MCP transports do not opt into this cancellation API.
+
 Store retains one validated selection in a disposable disk-backed DuckDB relation
 containing only row IDs, timestamps and review hashes. Events count and filtered
 histogram buckets/key positions reuse it under the existing Store lock; page

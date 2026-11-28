@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import warnings
@@ -197,6 +198,97 @@ class BrowserContract(unittest.TestCase):
         except HTTPError as error:
             with error:
                 return error.code, json.load(error)
+
+    def test_ui_cancellation_running_queued_and_late_requests(self):
+        def start():
+            status, response = self.call("/api/operations", {"action": "start"})
+            self.assertEqual(status, 200)
+            return response["token"]
+
+        def cancel(token):
+            return self.call("/api/operations", {"action": "cancel", "token": token})
+
+        def events(token):
+            return self.call("/api/events", {}, {"X-KamoTrace-Operation": token})
+
+        original = self.store.rows
+        def expensive(sql, params=None, *, operation="rows"):
+            if operation == "events.page":
+                # Real, bounded-memory DuckDB work, not a delayed/mocked response.
+                original("SELECT sum(sin(i)) FROM range(10000000000) t(i)")
+            return original(sql, params, operation=operation)
+
+        def wait_running():
+            until = time.monotonic() + 5
+            while time.monotonic() < until:
+                if self.store.connection.query_progress() >= 0:
+                    return
+                time.sleep(0.01)
+            self.fail("DuckDB query did not start")
+
+        with self.store.lock:
+            self.store.connection.execute("SET enable_progress_bar=true; SET enable_progress_bar_print=false; SET progress_bar_time=1")
+        try:
+            token = start()
+            self.assertTrue(cancel(token)[1]["cancelled"])
+            self.assertEqual(events(token)[1]["cancelled"], True)  # Cancel before dispatch.
+            self.assertEqual(events(token)[0], 400)  # Capabilities are single-use.
+            with ThreadPoolExecutor(max_workers=2) as pool, patch.object(self.store, "rows", expensive):
+                active = start()
+                future = pool.submit(events, active)
+                try:
+                    wait_running()
+                    self.assertFalse(cancel("unknown-capability")[1]["cancelled"])
+                    self.assertFalse(cancel(token)[1]["cancelled"])  # Late cancel cannot hit new work.
+                    queued = start()
+                    waiting = pool.submit(events, queued)
+                    until = time.monotonic() + 2
+                    while time.monotonic() < until:
+                        with self.store.operation_lock:
+                            claimed = self.store.operations[queued]["claimed"]
+                        if claimed:
+                            break
+                        time.sleep(0.01)
+                    self.assertTrue(claimed, "Second request never joined the queue")
+                    self.assertTrue(cancel(queued)[1]["cancelled"])
+                    self.assertEqual(waiting.result(timeout=2)[1]["cancelled"], True)
+                    self.assertFalse(future.done())  # Cancelling queued work did not interrupt its neighbor.
+                    before = time.monotonic()
+                    self.assertTrue(cancel(active)[1]["cancelled"])
+                    status, result = future.result(timeout=3)
+                    self.assertEqual(status, 409, result)
+                    self.assertTrue(result["cancelled"])
+                    self.assertLess(time.monotonic() - before, 3)
+                finally:
+                    cancel(active)
+            entered, release = threading.Event(), threading.Event()
+            def between_check_and_execute(sql, params=None, *, operation="rows"):
+                if operation == "events.page":
+                    entered.set()
+                    if not release.wait(3):
+                        raise ValueError("Test did not release statement startup")
+                    # Deliberately enter execute AFTER cancel: DuckDB ignores a prior interrupt.
+                    self.store.connection.execute("SELECT sum(sin(i)) FROM range(10000000000) t(i)").fetchall()
+                return original(sql, params, operation=operation)
+            with ThreadPoolExecutor(max_workers=1) as pool, patch.object(self.store, "rows", between_check_and_execute):
+                active = start()
+                future = pool.submit(events, active)
+                try:
+                    self.assertTrue(entered.wait(3))
+                    self.assertTrue(cancel(active)[1]["cancelled"])
+                    release.set()
+                    self.assertTrue(future.result(timeout=3)[1]["cancelled"])
+                finally:
+                    release.set()
+                    cancel(active)
+            # A real query, histogram, and review read still work after interruption.
+            self.assertEqual(events(start())[1]["last_row"], 5)
+            self.assertEqual(self.call("/api/histogram", {})[1]["total"], 5)
+            self.assertEqual(self.call("/api/reviews")[0], 200)
+            self.assertFalse(cancel(active)[1]["cancelled"])
+        finally:
+            with self.store.lock:
+                self.store.connection.execute("SET enable_progress_bar=false; SET progress_bar_time=2000")
 
     def test_pipeline_boolean_null_search_and_external_scopes(self):
         def check(text, expected, **external):

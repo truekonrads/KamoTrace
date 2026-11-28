@@ -1201,6 +1201,26 @@ stay pinned and the grid fills the rest of the window.
 
 ### Search and filter events
 
+- Event searches, sorting, loading more rows and column summaries show a running
+  operation panel with **elapsed time** and **Cancel**. A search's rows and
+  frequency/context queries share one Cancel control. Starting another search
+  cancels the superseded work. Cancellation interrupts that request's running
+  DuckDB query, or removes it from the wait for the shared query connection;
+  it cannot interrupt a different operation or another browser/MCP request.
+  Cancellation is cooperative: a native operator or Python callback may take
+  time to reach an interruption point. The panel remains until requests settle.
+  If cancellation cannot be confirmed, **Retry cancel** retries it; responses
+  from the cancelled operation are still discarded rather than applied.
+- A cancelled/failed search keeps previous rows and labels them as not updated;
+  press **Run** or **Refresh results** to retry. Loading further pages is paused
+  until a successful search, so old rows cannot mix with a new selection/sort.
+  Cancellation never undoes saved Findings, Event tags or manual edits.
+- **ETA unavailable** is intentional. DuckDB 2.0's connection-level progress
+  percentage does not reliably cover lock waiting, all statements, Python work
+  and response transfer; it cannot support an honest remaining-time estimate for
+  this operation. Elapsed time includes registration, queueing and responses.
+  These controls cover event-query reads, not preparation/collection, exports,
+  writes, SSM's in-memory searches or MCP transport cancellation.
 - Search performs a case-insensitive **literal substring search of the entire
   raw event**, including nested requests/responses. `%` and `_` are not wildcards.
   Type values as they appear: quotes and backslashes match as written

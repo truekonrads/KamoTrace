@@ -26,6 +26,7 @@
     <div id="app-loading" class="grid-loading" role="status">
       Opening local evidence…
     </div>
+    <section id="operations" aria-label="Running operations" hidden></section>
     <header class="topbar">
       <div class="brand">
         <h1>KamoTrace</h1>
@@ -638,7 +639,7 @@
               Clear selection
             </button>
             <span id="stale" hidden
-              >Events, tags or findings changed since this query ran ·
+              >Results may be out of date ·
               <button id="refresh-stale" class="text-button">
                 Refresh results
               </button></span
