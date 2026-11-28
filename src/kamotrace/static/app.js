@@ -3013,6 +3013,14 @@ function renderDetections() {
         : "") +
       ". Detections are automated leads: tag events or record a finding about what you observe."
     : "";
+  if (detections.iwatobi) {
+    const iw = detections.iwatobi;
+    const c = iw.counts;
+    $("detections-run").textContent +=
+      ` Iwatobi: ${number(iw.alerts)} retained alerts · ${number(c.linked)} linked · ` +
+      `${number(c.no_match)} no match in selected coverage · ${number(c.ambiguous)} ambiguous · ` +
+      `${number(c.unsupported)} unsupported/incomplete. Exact physical-source references, all members required; automated leads, not findings.`;
+  }
   if (detections.guardduty) {
     const gd = detections.guardduty;
     $("detections-run").textContent +=
@@ -3035,9 +3043,92 @@ function renderDetections() {
 
 async function loadDetections() {
   detections = await request("/api/detections");
-  $("detections-tab").hidden = !detections.run && !detections.guardduty;
+  $("detections-tab").hidden =
+    !detections.run && !detections.guardduty && !detections.iwatobi;
   tabLabel("detections-tab", "Detections", detections.rules.length);
   renderDetections();
+  renderIwatobiAlerts();
+}
+
+function renderIwatobiAlerts() {
+  const host = $("iwatobi-alerts");
+  host.replaceChildren();
+  if (!detections.iwatobi) return;
+  const disclosure = document.createElement("details");
+  const heading = document.createElement("summary");
+  heading.textContent = "Retained native Iwatobi alerts";
+  const provenance = document.createElement("p");
+  provenance.className = "hint";
+  provenance.textContent = `Run ${detections.iwatobi.run.id} · Bundle SHA256 ${detections.iwatobi.bundle_sha256}`;
+  const status = document.createElement("select");
+  status.setAttribute("aria-label", "Iwatobi alert status");
+  for (const value of ["", "linked", "no_match", "ambiguous", "unsupported"]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value || "All alert statuses";
+    status.append(option);
+  }
+  const list = document.createElement("ul");
+  const previous = document.createElement("button");
+  const next = document.createElement("button");
+  previous.textContent = "Previous alerts";
+  next.textContent = "Next alerts";
+  previous.type = next.type = "button";
+  let offset = 0,
+    generation = 0;
+  async function load() {
+    const current = ++generation;
+    previous.disabled = next.disabled = true;
+    list.textContent = "Loading native alert receipts…";
+    try {
+      const result = await request("/api/iwatobi", {
+        status: status.value || null,
+        offset,
+        limit: 10,
+      });
+      if (current !== generation) return;
+      list.replaceChildren();
+      if (!result.alerts.length)
+        list.textContent = "No alerts with this status.";
+      for (const alert of result.alerts) {
+        const item = document.createElement("li");
+        const label = document.createElement("span");
+        label.textContent = `#${alert.ordinal} · ${alert.title || alert.native_rule_id} · ${alert.status} · ${alert.id} `;
+        item.append(label);
+        for (const id of alert.event_ids) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = `Original event ${id}`;
+          button.onclick = () => detail({ id });
+          item.append(button);
+        }
+        list.append(item);
+      }
+      previous.disabled = offset === 0;
+      next.disabled = offset + result.alerts.length >= result.total;
+    } catch (error) {
+      if (current !== generation) return;
+      list.textContent = error.message;
+      previous.disabled = offset === 0;
+    }
+  }
+  status.onchange = () => {
+    offset = 0;
+    load();
+  };
+  previous.onclick = () => {
+    offset = Math.max(0, offset - 10);
+    load();
+  };
+  next.onclick = () => {
+    offset += 10;
+    load();
+  };
+  disclosure.ontoggle = () => {
+    if (disclosure.open) load();
+  };
+  disclosure.append(heading, provenance, status, list, previous, next);
+  host.append(disclosure);
 }
 
 function detectionCell(cell) {
@@ -3720,6 +3811,18 @@ function detailFindings() {
     }
     target.append(det);
   }
+  for (const alert of detailRow.iwatobi_alerts || []) {
+    const item = document.createElement("p");
+    item.textContent = `Iwatobi native alert #${alert.ordinal} · ${alert.id} · ${alert.kind} · ${alert.status}. `;
+    for (const id of alert.event_ids) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = `Original member event ${id}`;
+      button.onclick = () => detail({ id });
+      item.append(button);
+    }
+    target.append(item);
+  }
   for (const finding of detailRow.guardduty_findings || []) {
     const disclosure = document.createElement("details");
     const summary = document.createElement("summary");
@@ -3746,6 +3849,7 @@ async function detail(row) {
       tags: data.tags,
       annotations: data.annotations,
       detections: data.detections,
+      iwatobi_alerts: data.iwatobi_alerts,
       guardduty_findings: data.guardduty_findings,
     };
     detailRow = row;

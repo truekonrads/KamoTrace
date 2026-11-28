@@ -454,6 +454,7 @@ bypass these checks or publish the evidence with an unauthenticated tunnel.
 | `--enrichment PATH` | IP enrichment sidecar from `kamotrace enrich` | `<case stem>.enrichment.duckdb` if present; otherwise special-use addresses are classified and other countries show as unmapped |
 | `--annotations PATH` | Notes and tags SQLite sidecar | `<case stem>.annotations.sqlite3` |
 | `--detections PATH` | Suzaku detections sidecar | `<case stem>.detections.duckdb` if present |
+| `--iwatobi PATH` | Retained native Iwatobi forensic JSON attached to prepared UAC occurrences | None; explicit opt-in |
 | `--guardduty PATH` | GuardDuty contextual-lead sidecar | `<case stem>.guardduty.duckdb` if present |
 | `--ssm-export PATH` | Consolidated SSM command/output JSON | None; optional |
 | `--inventory-export FOLDER` | Current network/IAM inventory export containing `report.json` | None; optional |
@@ -731,6 +732,28 @@ For a stdio-only client, use
 
 On Linux, add `--user "$(id -u):$(id -g)"` to `docker run` so files in the case
 folder belong to you.
+
+## Native Iwatobi attachments
+
+Open an already prepared case with a retained native alert bundle:
+
+```sh
+kamotrace serve --case case.json --iwatobi retained-iwatobi.json
+```
+
+This reads `iwatobi-forensic-1.0.0` / `uac-1.0.0` JSON directly. It does **not** run Iwatobi/Sigma, ingest UAC, prepare units or rewrite the bundle. `--unit` limits attachment to that declared prepared selection. It can coexist with Suzaku and an explicitly supplied `--guardduty` sidecar. No automatic bundle discovery occurs.
+
+Native run, alert and rule IDs must be non-empty strings; an alert's `uac.run_id`, when present, must also be a non-empty string. Malformed identities are rejected at startup, not coerced into rule IDs. Optional `run.rules` and `sources` must be arrays when present, not `null`.
+
+In **Detections**, Iwatobi-prefixed rules filter the timeline using the same lead/rule and severity filters as other detections. **Retained native Iwatobi alerts** pages all alert identities, including `no_match`, `ambiguous` and `unsupported`; linked alerts have **Original event** buttons. Original event detail shows the attached native alert identity and buttons for all linked member occurrences. These are automated leads, not investigator Findings.
+
+Links require a supplied acquisition ID/status and exact collection ID, canonical source path, source SHA256 and the **complete physical source location**. Only the three-field locator `{kind, coordinate, line}` is supported: `kind` must be `text_line`, `coordinate` must be `decoded_decompressed_1_based` (one-based line counting in decoded/decompressed text), and `line` must be a positive integer. Additional locator fields are unsupported, never discarded to manufacture a match. Original JSON is parsed losslessly so integer line numbers are never rounded. Every reference of a member must resolve uniquely to the same occurrence; every member of an alert must resolve. Repeated text at different physical lines stays distinct. Multiple candidate occurrences remain ambiguous even when their record content is equal. There is no timestamp, IP, text-similarity or producer-ID fallback. Truncated, inexact, unbound or unsupported alerts never attach. A partial correlation stays unattached even when some members resolve.
+
+Event provenance `source_ordinal` is the position in the normalized observation input. The original physical source line lives in the retained JSON's `uac.source_refs[].locator.line`; these line numbers need not agree. Neither is the case-global numeric event ID. Original detail retains all three without renumbering.
+
+`GET /api/detections` includes `iwatobi` bundle SHA256, compact native run provenance, selection identity and alert/member status counts. Large native rule manifests remain in the original hash-bound bundle, not repeated in that summary. `POST /api/iwatobi` accepts optional `status`, `offset` (default 0) and `limit` (1–50, default 10), returning native IDs, ordinals, per-member statuses/candidate counts and linked `event_ids`. Bundle SHA256 + run ID + ordinal identifies a retained alert even when native IDs repeat. `GET /api/events/ID` includes `iwatobi_alerts`. MCP exposes the same reads through `list_detections`, `list_iwatobi_alerts`, `search_events` and `get_event`.
+
+Attachment is rebuilt in disposable runtime state on explicit reopen, streaming provenance from selected prepared UAC units at startup. It scans no unselected units and makes no external requests. `no_match` means no exact occurrence in **this selection**, not a false alert or proof of absent activity. Source collection/parser gaps remain separate from match counts. Initially only this native schema and physical text-line locator are supported.
 
 ## Suzaku detections
 

@@ -800,6 +800,8 @@ If startup is slow, the last stage message identifies the work still in progress
 
 ### 6. Find events and save findings
 
+An existing prepared UAC case can optionally attach retained native Iwatobi alerts at startup with `kamotrace serve --case case.json --iwatobi retained-iwatobi.json`. This does not recollect, re-ingest, prepare or rerun detections. Only exact physical references within the selected prepared coverage attach; unresolved, ambiguous and unsupported alerts stay accounted for but unlinked. See [native attachment and navigation](user-guide.md#native-iwatobi-attachments).
+
 1. Choose a **Timezone** and time range. The default timezone is UTC.
 2. Enter a search term or use **+ Filter**, then choose **Run**.
 3. Select a row to inspect the original JSON and record hash.

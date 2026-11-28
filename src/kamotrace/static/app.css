@@ -120,6 +120,16 @@ summary:focus-visible {
   font-size: 11px;
   color: var(--muted);
 }
+#iwatobi-alerts {
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+#iwatobi-alerts ul {
+  padding-left: 16px;
+}
+#iwatobi-alerts li {
+  margin: 8px 0;
+}
 h2 {
   font-size: 13px;
   margin: 0;

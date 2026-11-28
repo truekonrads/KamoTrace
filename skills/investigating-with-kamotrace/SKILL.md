@@ -24,7 +24,7 @@ browser on the next refresh, and theirs show up for you.
   `entry_id`. Never tag or annotate "everything matching a query"
   without first listing those events and checking that they are the ones you
   mean.
-- **Leads are not findings.** Suzaku detections and IP geography are leads.
+- **Leads are not findings.** Suzaku/Iwatobi detections and IP geography are leads.
   Tag or annotate only what the raw records support, and in notes, say which
   parts you observed and which you inferred.
 - **Acquired computer context is historical and bounded.** `describe_schema` reports prepared-source coverage and undated counts. Partial/unsupported/omitted sources are not absence. Computer cards separate stable host IDs, unverified labels and unattributed observations; acquisition/import time is not historical action time. Use `search_events` with `{"query":{"filters":[{"field":"time_local","op":"missing"}]}}` for undated observations, then `get_event` for original JSON, locators, time alternatives and current reviews. Opening a card never prepares or repairs inputs. Parsed browser/MCP metadata numbers may round; cite original JSON text for precise evidence values.
@@ -449,6 +449,7 @@ SSM/note chunks and event pages. Never send an export to an online service.
 
 ## Detections and enrichment
 
+- Native Iwatobi attachments appear in `list_detections.iwatobi` with bundle SHA256, run ID, selected coverage identity and linked/no_match/ambiguous/unsupported counts. Use `list_iwatobi_alerts(status="linked", limit=10)` to page retained native identities and exact `event_ids`; call `get_event(id)` on those IDs and verify original physical source references. `get_event.iwatobi_alerts` identifies attached alerts. Use the namespaced `iwatobi:` rule ID returned by `list_detections` in `search_events(query={rules: [id]})`. All alert members and every physical reference must resolve uniquely; partial/truncated alerts never produce hits. `no_match` means no exact occurrence in selected coverage, not no activity. Other locator kinds are unsupported, not guessed. Bundle SHA256 + run ID + ordinal disambiguates repeated native alert IDs. Startup `serve --iwatobi retained.json` reads retained outputs without re-ingestion or a detection rerun.
 - `list_detections` lists Suzaku rules (most severe first) with ATT&CK tags and
   linked event counts, plus provenance and unmatched/ambiguous counts. Search a
   rule's events with `query.rules: ["<rule_id>"]`, then verify them in the raw

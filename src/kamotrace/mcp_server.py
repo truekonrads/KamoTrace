@@ -35,7 +35,8 @@ mcp = MCPServer("kamotrace", subscriptions=False, instructions="""\
 Search the combined CloudTrail/other-event timeline in a local KamoTrace browser.
 Imported evidence is read-only. create_manual_event/edit_manual_event change only investigator-entered key events.
 Filter event_type (cloudtrail/other/manual); origin documents non-AWS sources. Manual authorship is self-reported.
-list_detections shows imported Suzaku rules and labelled GuardDuty contextual leads; filter with query.rules / min_level.
+list_detections shows Suzaku/Iwatobi rules and labelled GuardDuty contextual leads; filter with query.rules / min_level.
+list_iwatobi_alerts pages retained native alert identities/status and exact original event IDs, including unlinked alerts.
 GuardDuty context is not an exact CloudTrail event match. Verify original evidence before drawing conclusions.
 Call describe_schema first for valid fields, operators, sort fields, page sizes and time bounds.
 Times are ISO 8601 with an offset; query.timezone selects local display and bucket boundaries
@@ -79,7 +80,7 @@ class Query(BaseModel):
     command_key: str | None = Field(None, description="Only CloudTrail events linked to this SSM command key.")
     start: str | None = Field(None, description="Inclusive start, ISO 8601 with offset, e.g. 2026-01-02T00:00:00+07:00.")
     end: str | None = Field(None, description="Exclusive end, ISO 8601 with offset.")
-    rules: list[str] = Field([], description="Suzaku rule or GuardDuty context IDs from list_detections; events must match every one (AND).")
+    rules: list[str] = Field([], description="Suzaku/Iwatobi rule or GuardDuty context IDs from list_detections; events must match every one (AND).")
     min_level: Literal["informational", "low", "medium", "high", "critical"] | None = Field(
         None, description="Only events with a detection or contextual lead at or above this severity level.")
 
@@ -534,8 +535,23 @@ def list_detections() -> dict[str, Any]:
     includes distinct retained snapshots with their own level, title, occurrence count and detail id;
     the group level is highest retained, not latest, and its events count is distinct AWS rows.
     Search event_type = "guardduty" to include unlinked snapshots independently in the timeline.
-    Linked finding JSON is also available in get_event.guardduty_findings[].raw_finding."""
+    Linked finding JSON is also available in get_event.guardduty_findings[].raw_finding.
+    `iwatobi` is null unless a native retained bundle is loaded; otherwise it supplies bundle SHA256,
+    native run provenance, selected coverage identity and linked/no_match/ambiguous/unsupported alert counts.
+    Iwatobi rule IDs are namespaced iwatobi:. list_iwatobi_alerts returns paged native identities,
+    member statuses and exact event IDs; get_event.iwatobi_alerts identifies attached alerts.
+    Unlinked/incomplete alerts never contribute event hits. These are automated leads, not findings."""
     return call("/api/detections")
+
+
+@mcp.tool(annotations=READ)
+def list_iwatobi_alerts(status: Literal["linked", "no_match", "ambiguous", "unsupported"] | None = None,
+                        offset: int = 0, limit: int = 10) -> dict[str, Any]:
+    """Page retained native Iwatobi alert receipts (limit 1–50). Includes unmatched/ambiguous/unsupported
+    alerts, with native alert/rule identity and member statuses. Only fully linked alerts have event_ids
+    usable with get_event; member candidates in incomplete alerts are NOT alert attachments.
+    Bundle SHA256 + run_id + ordinal disambiguates duplicate native IDs. No detector or scan runs here."""
+    return call("/api/iwatobi", {"status": status, "offset": offset, "limit": limit})
 
 
 def main(argv=None):

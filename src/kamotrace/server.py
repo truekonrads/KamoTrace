@@ -249,7 +249,7 @@ def build_query(body, scalar_function, coverage=None):
 
 
 class Store:
-    def __init__(self, database=None, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=(), eks_export=None, *, case=None, units=None):
+    def __init__(self, database=None, enrichment=None, annotations=None, ssm_export=None, detections=None, inventory_export=None, guardduty=None, other_events=(), eks_export=None, *, case=None, units=None, iwatobi=None):
         if case is None or database is not None or other_events:
             raise ValueError("Legacy databases are not served; re-ingest original inputs into a new case with "
                              "import --case CASE --unit UNIT, run prepare, then serve --case CASE. "
@@ -389,6 +389,10 @@ class Store:
             stage_started = time.monotonic()
             self.suzaku_run = load_detections(self.connection, detections)
             self.startup_timing("detections", stage_started)
+            from .iwatobi import load as load_iwatobi
+            stage_started = time.monotonic()
+            self.iwatobi_run, self.iwatobi_alerts = load_iwatobi(self.connection, iwatobi, self.event_sources)
+            self.startup_timing("iwatobi", stage_started)
             from .guardduty import load as load_guardduty
             default = database.with_suffix(".guardduty.duckdb")
             guardduty = guardduty or (default if default.exists() else None)
@@ -1110,7 +1114,7 @@ class Store:
                 "facets": facets, "fields": FIELDS,
                 "pipeline_fields": PIPELINE_FIELDS,
                 "operators": sorted(OPERATORS), "sort_fields": sorted(SORT_FIELDS), "page_sizes": PAGE_SIZES,
-                "levels": LEVELS, "detections_loaded": self.suzaku_run is not None or self.guardduty_run is not None,
+                "levels": LEVELS, "detections_loaded": any(r is not None for r in (self.suzaku_run, self.iwatobi_run, self.guardduty_run)),
                 "enrichment": self.enrichment_run,
                 "timezone": zone, "timezones": TIMEZONES, "database": "events.duckdb", "read_only": True,
                 "manual_events_writable": True,
@@ -1378,6 +1382,7 @@ class Store:
                     row["editor"] = None
                 rows[0]["ssm_commands"] = self.commands.for_record(record)
                 rows[0]["detections"] = self.row_detections([record]).get(record, [])
+                rows[0]["iwatobi_alerts"] = [a for a in self.iwatobi_alerts if record in a["event_ids"]]
                 rows[0]["guardduty_findings"] = self.rows("""SELECT g.rule_id, g.raw_finding
                     FROM guardduty_findings g WHERE g.finding_record IN
                     (SELECT finding_record FROM guardduty_event_links WHERE source_record=?) ORDER BY g.finding_record""",
@@ -1421,7 +1426,22 @@ class Store:
             rules.sort(key=lambda rule: (-rule["level_rank"], -rule["events"], rule["title"]))
         for rule in rules:
             del rule["level_rank"]
-        return {"run": self.suzaku_run, "guardduty": self.guardduty_run, "rules": rules}
+        return {"run": self.suzaku_run, "iwatobi": self.iwatobi_run, "guardduty": self.guardduty_run, "rules": rules}
+
+    def iwatobi_list(self, body):
+        """Bounded native alert receipts, including alerts that have no evidence attachment."""
+        if set(body) - {"status", "offset", "limit"}:
+            raise ValueError("Unknown Iwatobi query field")
+        status = body.get("status")
+        if status not in (None, "linked", "no_match", "ambiguous", "unsupported"):
+            raise ValueError("Invalid Iwatobi status")
+        offset, limit = body.get("offset", 0), body.get("limit", 10)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("Expected offset >= 0 and limit 1–50")
+        alerts = [a for a in self.iwatobi_alerts if status is None or a["status"] == status]
+        return {"bundle_sha256": self.iwatobi_run["bundle_sha256"] if self.iwatobi_run else None,
+                "run_id": self.iwatobi_run["run"]["id"] if self.iwatobi_run else None,
+                "total": len(alerts), "offset": offset, "alerts": alerts[offset:offset + limit]}
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1585,7 +1605,7 @@ class Handler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/mcp":
             self.mcp_request()
             return
-        if self.path not in ("/api/operations", "/api/inventory", "/api/eks-pods", "/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
+        if self.path not in ("/api/iwatobi", "/api/operations", "/api/inventory", "/api/eks-pods", "/api/computers", "/api/manual-events", "/api/pipeline", "/api/meta", "/api/schema", "/api/notes", "/api/events", "/api/histogram", "/api/column-values", "/api/reviews", "/api/ssm", "/api/ssm-sheet", "/api/ssm-detail", "/api/ssm-event", "/api/ssm-log", "/api/ssm-log-review", "/api/ssm-log-orphans", "/api/ssm-log-text", "/api/ssm-log-reattach", "/api/ssm-log-batch", "/api/reference", "/api/exports"):
             self.respond({"error": "Not found"}, 404)
             return
         try:
@@ -1602,6 +1622,7 @@ class Handler(SimpleHTTPRequestHandler):
                          "/api/manual-events": self.store.manual_write,
                          "/api/computers": self.store.computers,
                          "/api/eks-pods": self.store.eks_pods,
+                         "/api/iwatobi": self.store.iwatobi_list,
                          "/api/inventory": self.store.inventory.query,
                          "/api/schema": self.store.schema, "/api/notes": self.store.notes_read,
                          "/api/pipeline": describe_pipeline,
@@ -1664,6 +1685,8 @@ def main(argv=None):
                         help="Verified local EKS export for current inventory/map context; no AWS calls (attach its imported database separately for timeline logs)")
     parser.add_argument("--detections", type=Path,
                         help="Suzaku detections from `kamotrace suzaku` (default: <database>.detections.duckdb if present)")
+    parser.add_argument("--iwatobi", type=Path,
+                        help="Retained native Iwatobi forensic JSON; attach exact prepared UAC occurrences without rerunning detection")
     parser.add_argument("--guardduty", type=Path,
                         help="GuardDuty context sidecar (default: <database>.guardduty.duckdb if present)")
     parser.add_argument("--log-level", choices=("debug", "info", "warning", "error"),
@@ -1685,7 +1708,7 @@ def main(argv=None):
     logging.getLogger("kamotrace").setLevel(args.log_level.upper())
     started = time.monotonic()
     logger.info("Starting KamoTrace; loading local data before accepting requests")
-    for name in ("database", "case", "enrichment", "ssm_export", "detections", "guardduty"):
+    for name in ("database", "case", "enrichment", "ssm_export", "detections", "guardduty", "iwatobi"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             parser.error(f"--{name.replace('_', '-')} not found: {path}")
@@ -1697,7 +1720,7 @@ def main(argv=None):
         store = Store(args.database and args.database.resolve(), args.enrichment and args.enrichment.resolve(), args.annotations,
                       args.ssm_export, args.detections and args.detections.resolve(), inventory_export=args.inventory_export,
                       guardduty=args.guardduty and args.guardduty.resolve(), other_events=args.other_events,
-                      eks_export=args.eks_export, case=args.case, units=args.units)
+                      eks_export=args.eks_export, case=args.case, units=args.units, iwatobi=args.iwatobi)
     except ValueError as error:  # e.g. a sidecar built for different evidence, or an invalid SSM export
         parser.error(str(error))
     logger.info("Binding HTTP server to %s:%s", args.bind, args.port)

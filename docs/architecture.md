@@ -36,6 +36,7 @@ Python modules live in `src/kamotrace/`; frontend files are in its `static/` dir
 | `other_events.py` | Stream provider-neutral JSONL into immutable DuckDB datasets and publish revisioned investigator-entered manual events separately. |
 | `datasets.py` | Own the JSON case manifest, durable block reservations and immutable raw-unit registration. |
 | `suzaku.py`, `guardduty.py`, `enrich.py` | Build evidence-bound derived sidecars and load them read-only for investigation. |
+| `iwatobi.py` | Read retained native alert JSON and attach exact physical UAC occurrences within selected prepared coverage; no detector or persistent evidence writes. |
 | `get_suzaku.py`, `get_dbip.py` | Download and verify optional external tools/data, separately from the application distribution. |
 | `inventory.py`, `inventory_store.py` | Collect/analyze configuration snapshots, then index them for offline inventory and reference lookups. |
 | `computers.py` | Summarize bounded historical computer facts from declared prepared acquisitions, selected by stable unit key. |

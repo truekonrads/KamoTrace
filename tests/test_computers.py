@@ -10,6 +10,8 @@ import hashlib
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -50,7 +52,7 @@ def dataset(root, name, changes):
                     "time": {"basis": "source_claim", "selected": "claim",
                              "candidates": [{"id": "claim", "value": stamp}]}}}
             row.update(change)
-            raw = json.dumps(row)
+            raw = precise_json.dumps(row, use_decimal=True)
             content = hashlib.sha256(raw.encode()).hexdigest()
             identity = hashlib.sha256(f"{name}:{i}".encode()).hexdigest()
             connection.execute("INSERT INTO raw_events VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -237,6 +239,164 @@ class ComputerContract(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             self.call("/api/uac-alerts")
         self.assertEqual(error.exception.code, 404)
+
+    def test_native_iwatobi_exact_occurrences_filters_and_mcp(self):
+        acquisition = {"id": "case-native", "status": "supplied"}
+        def ref(line, **changes):
+            return {"collection_id": "collection-native", "exact": True,
+                "path": "original/synthetic.log", "sha256": "a" * 64,
+                "locator": {"kind": "text_line", "coordinate": "decoded_decompressed_1_based", "line": line}, **changes}
+        def observation(line):
+            return {"message": "Identical text is not occurrence identity",
+                    "uac": {"acquisition": acquisition, "collection": {"id": "collection-native"},
+                            "source_refs": [ref(line)], "time": {"basis": "source_claim"}}}
+        database = dataset(self.root, "native", [observation(n) for n in (5, 7, 9, 9)])
+        def alert(name, references, **changes):
+            return {"id": name, "kind": "single", "rule": {"id": name, "name": "Synthetic " + name, "level": "high"},
+                "uac": {"acquisition": acquisition}, "evidence_status": "exact", "members_total": len(references),
+                "members_truncated": False, "members": [{"evidence": {"location": {
+                    "status": "exact", "source_refs": [r]}}} for r in references], **changes}
+        alerts = [alert("line-five", [ref(5)]), alert("line-seven", [ref(7)]),
+                  alert("correlation", [ref(5), ref(7)], kind="correlation"),
+                  alert("duplicate", [ref(9)]), alert("partial", [ref(5), ref(20)], kind="correlation"),
+                  alert("truncated", [ref(5)], members_truncated=True),
+                  alert("inexact", [ref(5, exact=False)]),
+                  alert("coordinate", [ref(5, locator={"kind": "text_line", "coordinate": "bytes", "line": 5})])]
+        for field in ("collection_id", "path", "sha256"):
+            alerts.append(alert("wrong-" + field, [ref(5, **{field: "b" * 64 if field == "sha256" else "wrong"})]))
+        alerts.append(alert("wrong-acquisition", [ref(5)], uac={"acquisition": {"id": "different", "status": "supplied"}}))
+        alerts.append(alert("unbound", [ref(5)], uac={"acquisition": {"id": "case-native", "status": "unknown"}}))
+        # Unknown locator fields are unsupported, never silently discarded.
+        alerts.append(alert("full-locator", [ref(5, locator={**ref(5)["locator"], "extra": "not present"})]))
+        bundle = {"schema": "iwatobi-forensic-1.0.0", "source_reference_profile": "uac-1.0.0",
+                  "run": {"id": "retained-native-run", "rules": []}, "alerts": alerts}
+        path = self.root / "native-iwatobi.json"
+        path.write_text(json.dumps(bundle))
+        before = sha256(path)
+        self.start(database, iwatobi=path)
+        with urlopen(self.url + "/api/detections") as response:
+            detections = json.load(response)
+        self.assertEqual(detections["iwatobi"]["counts"], {"linked": 3, "no_match": 5, "ambiguous": 1, "unsupported": 5})
+        self.assertEqual(detections["iwatobi"]["bundle_sha256"], before)
+        self.assertEqual({r["rule_id"]: r["events"] for r in detections["rules"]},
+                         {"iwatobi:line-five": 1, "iwatobi:line-seven": 1, "iwatobi:correlation": 2})
+        receipts = self.call("/api/iwatobi", {"limit": 50})["alerts"]
+        self.assertEqual(receipts[0]["event_ids"], [1])
+        self.assertEqual(receipts[1]["event_ids"], [2])
+        self.assertEqual(receipts[2]["event_ids"], [1, 2])
+        self.assertTrue(all(not a["event_ids"] for a in receipts[3:]))
+        self.assertEqual(self.call("/api/iwatobi", {"status": "ambiguous"})["alerts"][0]["members"][0]["candidates"], 2)
+        self.assertEqual(self.call("/api/iwatobi", {"offset": 1, "limit": 1})["alerts"][0]["id"], "line-seven")
+        query = {"rules": ["iwatobi:correlation", "iwatobi:line-seven"]}
+        self.assertEqual([r["id"] for r in self.call("/api/events", query)["data"]], [2])
+        self.assertEqual(self.call("/api/histogram", query)["total"], 1)
+        self.assertEqual(self.call("/api/events", {"rules": ["iwatobi:partial"]})["last_row"], 0)
+        for bad in ({"limit": True}, {"status": "partial"}, {"offset": -1}, {"path": "anything"}):
+            with self.assertRaises(HTTPError) as error:
+                self.call("/api/iwatobi", bad)
+            self.assertEqual(error.exception.code, 400)
+        async def session():
+            async with Client(self.url + "/mcp") as client:
+                native = (await client.call_tool("list_iwatobi_alerts", {"status": "linked"})).structured_content
+                self.assertEqual((native["total"], native["run_id"]), (3, "retained-native-run"))
+                rules = (await client.call_tool("list_detections", {})).structured_content
+                self.assertEqual(rules["iwatobi"]["counts"], detections["iwatobi"]["counts"])
+                found = (await client.call_tool("search_events", {"query": query})).structured_content
+                self.assertEqual((found["total"], found["events"][0]["id"]), (1, 2))
+                original = (await client.call_tool("get_event", {"id": 2})).structured_content
+                self.assertTrue(original["raw_json_matches_hash"])
+                self.assertEqual(json.loads(original["raw_json"])["uac"]["source_refs"][0]["locator"]["line"], 7)
+                self.assertEqual({a["id"] for a in original["iwatobi_alerts"]}, {"line-seven", "correlation"})
+        anyio.run(session)
+        self.assertEqual(sha256(path), before)
+
+        # Reopening a narrower declared selection must not search the excluded
+        # acquisition, even though its immutable files remain in the same case.
+        from case_fixtures import case_for
+        excluded = dataset(self.root, "other-acquisition", [{}])
+        case = case_for(database, [excluded])
+        narrow = Store(case=case, units=[str(excluded)], iwatobi=path,
+                       annotations=self.root / "narrow.annotations.sqlite3")
+        try:
+            self.assertEqual(narrow.detections_list()["iwatobi"]["counts"],
+                             {"linked": 0, "no_match": 9, "ambiguous": 0, "unsupported": 5})
+            self.assertEqual(narrow.query({"rules": ["iwatobi:line-five"]})["last_row"], 0)
+            self.assertNotEqual(narrow.detections_list()["iwatobi"]["selection_id"],
+                                detections["iwatobi"]["selection_id"])
+        finally:
+            narrow.connection.close()
+            narrow.reviews.close()
+            narrow.selection_directory.cleanup()
+
+    def test_native_iwatobi_integer_locators_rest_and_mcp(self):
+        acquisition = {"id": "precise-acquisition", "status": "supplied"}
+        # An integer identifier must not pass through a fixed-width numeric type.
+        locator = {"kind": "text_line", "coordinate": "decoded_decompressed_1_based", "line": 1000000000000000000000000000001}
+        reference = {"collection_id": "precise-collection", "path": "synthetic.log", "sha256": "c" * 64,
+                     "exact": True, "locator": locator}
+        extended = {**reference, "locator": {**locator, "extension": {"fraction": Decimal("1.00000000000000000000001")}}}
+        database = dataset(self.root, "precise-native", [{"uac": {
+            "acquisition": acquisition, "source_refs": [ref]}} for ref in (reference, extended)])
+        alerts = []
+        for name, loc in (("exact", locator), ("neighbor", {**locator, "line": 1000000000000000000000000000000}),
+                          ("extended", extended["locator"]),
+                          ("rounded-extension", {**locator, "extension": {"fraction": Decimal("1.0")}}),
+                          ("fractional-line", {**locator, "line": Decimal("1.5")})):
+            ref = {**reference, "locator": loc}
+            alerts.append({"id": name, "kind": "single", "rule": {"id": name, "name": name, "level": "high"},
+                "uac": {"acquisition": acquisition}, "evidence_status": "exact", "members_total": 1,
+                "members_truncated": False, "members": [{"evidence": {"location": {
+                    "status": "exact", "source_refs": [ref]}}}]})
+        path = self.root / "precise-native.json"
+        path.write_text(precise_json.dumps({"schema": "iwatobi-forensic-1.0.0",
+            "source_reference_profile": "uac-1.0.0", "run": {"id": "precise-run"}, "alerts": alerts}, use_decimal=True))
+        protected = (sha256(database), sha256(path))
+        self.start(database, iwatobi=path)
+        expected = [("linked", [1]), ("no_match", []), ("unsupported", []), ("unsupported", []), ("unsupported", [])]
+        receipts = self.call("/api/iwatobi", {"limit": 50})["alerts"]
+        self.assertEqual([(a["status"], a["event_ids"]) for a in receipts], expected)
+        self.assertEqual(self.call("/api/events", {"rules": ["iwatobi:exact"]})["last_row"], 1)
+        for rule in ("neighbor", "extended", "rounded-extension", "fractional-line"):
+            self.assertEqual(self.call("/api/events", {"rules": ["iwatobi:" + rule]})["last_row"], 0)
+        async def session():
+            async with Client(self.url + "/mcp") as client:
+                result = (await client.call_tool("list_iwatobi_alerts", {"limit": 50})).structured_content
+                self.assertEqual([(a["status"], a["event_ids"]) for a in result["alerts"]], expected)
+                original = (await client.call_tool("get_event", {"id": 1})).structured_content
+                self.assertTrue(original["raw_json_matches_hash"])
+                raw = precise_json.loads(original["raw_json"], use_decimal=True)
+                self.assertEqual(raw["uac"]["source_refs"][0]["locator"], locator)
+        anyio.run(session)
+        self.assertEqual((sha256(database), sha256(path)), protected)
+
+    def test_native_iwatobi_invalid_identity_and_rules_cli_errors(self):
+        from case_fixtures import case_for
+        database = dataset(self.root, "invalid-native", [{}])
+        case = case_for(database)
+        path = self.root / "invalid-native.json"
+        bundle = {"schema": "iwatobi-forensic-1.0.0", "source_reference_profile": "uac-1.0.0",
+            "run": {"id": "native-run", "rules": []}, "alerts": [{"id": "native-alert",
+            "rule": {"id": "native-rule"}, "uac": {"run_id": "native-member-run"}, "members": []}]}
+        cases = [("run.id", {"structured": "identity"}), ("alerts.0.id", 123),
+                 ("alerts.0.rule.id", True), ("alerts.0.rule", {}), ("run.id", ""), ("run.rules", None),
+                 ("alerts.0.uac.run_id", []), ("sources", None)]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                candidate = json.loads(json.dumps(bundle))
+                target = candidate
+                parts = field.split(".")
+                for part in parts[:-1]:
+                    target = target[int(part)] if isinstance(target, list) else target[part]
+                target[parts[-1]] = value
+                path.write_text(json.dumps(candidate))
+                try:
+                    result = subprocess.run([sys.executable, "-m", "kamotrace", "serve", "--case", str(case),
+                        "--iwatobi", str(path), "--port", "0"], capture_output=True, text=True, timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.fail("Invalid native bundle was accepted instead of failing startup")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("native Iwatobi", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_legacy_registry_is_never_adopted_or_modified(self):
         primary = dataset(self.root, "primary", [{}])

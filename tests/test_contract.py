@@ -929,7 +929,7 @@ class BrowserContract(unittest.TestCase):
                 self.assertLessEqual({"describe_schema", "search_events", "get_event", "tag_events", "untag_events",
                                       "create_note", "edit_note", "link_note_events", "unlink_note_events",
                                       "search_ssm_commands", "get_ssm_command", "search_ssm_log", "get_ssm_log_entry", "edit_ssm_log_entry"}, names)
-                self.assertEqual(await tool("list_detections"), {"run": None, "guardduty": None, "rules": []})
+                self.assertEqual(await tool("list_detections"), {"run": None, "iwatobi": None, "guardduty": None, "rules": []})
                 schema = await tool("describe_schema")
                 self.assertIn("not_missing", schema["operators"])
                 self.assertEqual(schema["timezone"], "UTC")
@@ -1214,7 +1214,7 @@ class BrowserContract(unittest.TestCase):
             store.reviews.close()
         # Without detections the same filter is valid and simply matches nothing.
         self.assertEqual(self.call("/api/events", {"rules": ["rule-low"]})[1]["last_row"], 0)
-        self.assertEqual(self.call("/api/detections")[1], {"run": None, "guardduty": None, "rules": []})
+        self.assertEqual(self.call("/api/detections")[1], {"run": None, "iwatobi": None, "guardduty": None, "rules": []})
 
     def test_large_detection_sidecar_preserves_all_rules_and_lists(self):
         sidecar = Path(self.temp.name) / "bulk.detections.duckdb"
