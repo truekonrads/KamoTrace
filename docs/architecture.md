@@ -287,18 +287,22 @@ is not a pressure diagnosis. Performance changes need equivalent results and
 separate startup, request and peak-memory measurements, not just a faster tiny
 fixture. See [diagnostics](user-guide.md#investigating-slow-requests).
 
-Optional assets are fetched at runtime: `get_suzaku.py` verifies the official
+Optional assets use explicit installers: `get_suzaku.py` verifies the official
 release checksum and archive paths; `get_dbip.py` verifies published decompressed
-checksums and database types. Suzaku (AGPL-3.0) and geolocation data are not
-bundled. Do not download MaxMind data; users supply it under their licence.
+checksums and database types. The Python package does not bundle tools;
+the Docker image downloads Suzaku (AGPL-3.0) at build time. Geolocation data is
+not bundled. Do not download MaxMind data; users supply it under their licence.
 `get_iwatobi.py` uses the same tools-folder convention to build Konrads's
 Iwatobi fork at a fixed full Git revision with locked Cargo dependencies,
 retaining source/rules/config/licence and a binary-hash receipt. Both forensic
 flags and a synthetic three-member correlation with exact decoded-text-line
 references must pass before private staging is published. It refuses existing
-targets and never scans evidence or changes case configuration. Iwatobi
-(RPL-1.5) and its Git/Rust/native-build prerequisites are not bundled.
-Keep DB-IP Lite's CC BY 4.0 attribution. The two-stage Docker image uses Debian
+targets and never scans evidence or changes case configuration. The Docker
+builder runs both fork installers, retaining Iwatobi (RPL-1.5), TraceQuarry,
+their sources/licences/receipts and the isolated Python/native helper in the
+runtime stage, without Rust/Git/compiler prerequisites. Bundled Suzaku seeds
+fresh `/tools` volumes; separate `/case` storage holds all persistent case state.
+Keep DB-IP Lite's CC BY 4.0 attribution. The multi-stage Docker image uses Debian
 trixie for Suzaku's glibc requirements; its wildcard container bind requires
 loopback-only host port publishing. See [Docker](user-guide.md#docker).
 

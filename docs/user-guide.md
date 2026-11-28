@@ -679,39 +679,172 @@ Reports name accounts, buckets and trails: keep them private and out of Git.
 
 ## Docker
 
-The image contains KamoTrace and all its Python dependencies. It does not
-contain Suzaku (AGPL-3.0) or IP geolocation data: `get-suzaku` and `get-dbip`
-download Suzaku and the free DB-IP Lite databases into a persistent `/tools`
-volume, or you mount your own GeoLite2 folder. Build it from a checkout:
+The image contains KamoTrace, its locked Python environment, **Suzaku 3.0.0**
+(official release, verified against GitHub's published SHA256), and the compatible
+fork builds below. No host Python, Rust, linker or parser installation is needed.
+Building needs Internet access and substantial disk/RAM for Rust compilation;
+subsequent parsing, import, preparation and investigation can run offline.
+Geolocation databases are **not** included; use `get-dbip` explicitly or mount
+your own licensed GeoLite2 data.
 
-```powershell
-docker build -t kamotrace C:\path\to\KamoTrace
+| Bundled tool | Source and retained provenance |
+| --- | --- |
+| Iwatobi | `truekonrads/iwatobi`, `d4b5f02cbd7fe7a044f8a5e1153157355489bd5b`; locked build, rules/config/source/licence and `kamotrace-download.json` under `/opt/tools/iwatobi-COMMIT` |
+| TraceQuarry | `truekonrads/TraceQuarry`, `26c941fb575347c055f79a1c10ed68ba9bdb8a2d` from `kamotrace-uac`; isolated Python 3.12, tzdata, Rust 1.100.0 locked native journal helper, source and `kamotrace-install.json` under `/opt/tools/tracequarry-COMMIT` |
+| Suzaku | `/tools/suzaku-3.0.0`, including rules/config/AGPL notice and checksum receipt; matching v3.0.0 source pinned at `c88eca3a03227a0d9a55d59a1c45677315cf4fc8` under `/opt/tools/suzaku-source-3.0.0`; never substituted for Iwatobi's UAC attachment contract |
+
+Build-time installers run their synthetic native-reader and exact-reference
+capability checks. Runtime `tracequarry-python` selects the bundled isolated
+interpreter; `TRACEQUARRY_JOURNAL_READER` already selects its matching native helper.
+`iwatobi` is on PATH. No compiler is shipped in the final stage. Suzaku is
+AGPL-3.0 and Iwatobi is RPL-1.5: retain the included notices and review source and
+redistribution obligations before sharing an image; KamoTrace's MIT licence does
+not relicense them. Suzaku's source revision is retained in
+`kamotrace-source-revision`; its GeoLite test databases and Git object database
+are excluded so no geolocation databases are bundled.
+
+### Published release images
+
+Publishing a GitHub Release triggers `.github/workflows/release-image.yml` to
+build its exact tag for **Linux amd64**, run the offline Docker qualification,
+then publish `ghcr.io/truekonrads/kamotrace:TAG`. Stable releases also update
+`:latest`; prereleases publish only their exact tag. Pushing a Git tag alone or
+saving a draft release does not publish an image. Release tags must be valid
+Docker tags (for example `v0.1.0`); `latest` is reserved.
+
+The workflow uses GitHub's automatic `GITHUB_TOKEN` with `contents: read` and
+`packages: write`; no registry password secret is needed. After the first
+publication, the repository owner should check the linked GitHub package's
+visibility and set it to **public** if anonymous pulls are intended. GitHub
+packages can initially be private even for public repositories.
+
+Once that release has been published, use it without building locally:
+
+```sh
+docker pull ghcr.io/truekonrads/kamotrace:v0.1.0
+docker tag ghcr.io/truekonrads/kamotrace:v0.1.0 kamotrace
 ```
 
-Put the export and any optional JSONL or SSM files in a case folder and mount it
-at `/case`. In these commands, `kamotrace` is the Docker image name. The image
-already starts the KamoTrace command:
+Replace `v0.1.0` with an actual published release tag. The local `kamotrace`
+alias lets all commands below work unchanged; skip their `docker build` step.
+Prefer an exact release tag or digest over `latest` for a repeatable tool
+environment. Updating the image does not replace your case/tools volumes.
 
-```powershell
-docker run --rm -v C:\case:/case kamotrace import --source /case/event_history.json --case /case/case.json --unit cloudtrail-1
-docker run --rm -v C:\case:/case kamotrace prepare --case /case/case.json --unit cloudtrail-1
-docker run --rm -v kamotrace-tools:/tools kamotrace get-suzaku
-docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace suzaku --case /case/case.json --source /case/event_history.json
+### Build and first case
+
+These examples are shell commands for Linux/macOS with Docker's **Linux** engine
+(also usable from WSL2). In PowerShell, replace `$PWD/inputs` with an absolute
+Windows directory such as `C:\exports`; named volumes work unchanged. Native
+Windows containers are not supported. Verified here on native Linux amd64 with
+Docker Engine 29.9.3; ARM64, Docker Desktop/macOS/Windows and amd64 emulation
+remain untested here.
+Use `--platform linux/amd64` on both build and run if deliberately using emulation.
+
+```sh
+docker build -t kamotrace .
+docker volume create kamotrace-case
+docker volume create kamotrace-tools
+docker run --rm --network none -v "$PWD/inputs:/input:ro" -v kamotrace-case:/case kamotrace import --source /input/event_history.json --case /case/case.json --unit cloudtrail-1
+docker run --rm --network none -v kamotrace-case:/case kamotrace prepare --case /case/case.json --unit cloudtrail-1
+docker run -d --name kamotrace -p 127.0.0.1:8765:8765 -v kamotrace-case:/case -v kamotrace-tools:/tools kamotrace
+```
+
+Open **http://127.0.0.1:8765** on the Docker host. The default command is
+`serve --case /case/case.json`; an empty volume deliberately fails with an
+actionable missing-case error rather than discovering or importing evidence.
+Override it with any normal KamoTrace CLI command, including `--help`.
+Originals stay in the separate read-only `/input` mount; generated raw/prepared
+units, manifests, Findings/tags and derived sidecars go in the explicit writable
+`/case` volume. Do **not** use an anonymous volume for case storage: retain the
+same named volume or absolute bind path on every invocation.
+
+The default UID is 10001. Fresh named volumes are writable without a root
+entrypoint or recursive ownership changes. On Linux bind mounts, create a case
+directory you own and add `--user "$(id -u):$(id -g)"` consistently to every run.
+Do not make your original inputs writable just to fix output permissions.
+Avoid running multiple viewers/writers against the same case.
+
+### Parse and load UAC, without host dependencies
+
+Start from an **extracted UAC directory**, not an archive. Supply the actual
+year/timezone and supported accounting ABI assumptions; these are not inferred
+evidence. The output directory must be new. This can be the first unit in an
+empty case, or another unit in the case above (stop its viewer first).
+
+```sh
+docker run --rm --network none -v "$PWD/inputs:/input:ro" -v kamotrace-case:/case --entrypoint tracequarry-python kamotrace -m uac_parser.cli /input/uac-host-1 --parse-only --year 2025 --timezone UTC --utmp-layout linux-time32-le --acquisition-id host-1 --out /case/parsed-host-1
+docker run --rm --network none -v kamotrace-case:/case kamotrace import-uac --source /case/parsed-host-1 --case /case/case.json --unit host-1
+docker run --rm --network none -v kamotrace-case:/case kamotrace prepare --case /case/case.json --unit host-1
+```
+
+Review the retained `run_manifest.json` and `source_index.json`: finalized does
+not mean all sources/ABIs were supported or parsed completely. Keep originals
+and parsed exports. See [parser coverage and assumptions](preparation.md#set-up-tracequarry-for-uac).
+
+### Add data and recreate the viewer
+
+Stop and remove **only the viewer container**, not the volumes. Give each new
+acquisition a new immutable unit key; do not reuse an old key for changed input.
+Repeat the UAC commands with `host-2` and a new parse output, or admit another
+CloudTrail export as follows. Existing units and Findings remain intact.
+
+```sh
+docker stop kamotrace
+docker rm kamotrace
+docker run --rm --network none -v "$PWD/inputs:/input:ro" -v kamotrace-case:/case kamotrace import --source /input/additional.json --case /case/case.json --unit cloudtrail-2
+docker run --rm --network none -v kamotrace-case:/case kamotrace prepare --case /case/case.json --unit cloudtrail-2
+docker run -d --name kamotrace -p 127.0.0.1:8765:8765 -v kamotrace-case:/case -v kamotrace-tools:/tools kamotrace
+```
+
+Recreation reopens all declared prepared units. An ordinary `docker restart
+kamotrace` also preserves state, but does not add data itself. Stop sends SIGINT
+to the exec-form Python entrypoint so it closes the Store normally; choose a
+longer `docker stop --timeout 60 kamotrace` for busy cases. Back up the stopped
+case volume **in full**, including every referenced artifact and sidecar. Never
+run `docker volume rm kamotrace-case` or `docker compose down -v` unless you
+intend to delete the case. A rebuilt image does not upgrade an existing case.
+
+### Optional detectors and enrichment
+
+Suzaku is already installed: no runtime download is needed. New named `/tools`
+volumes inherit the bundled files; old/nonempty volumes retain their existing
+contents across image upgrades, and an empty **bind** mount masks bundled tools.
+For a fresh tool set use a new named tools volume, or explicitly run
+`get-suzaku --version 3.0.0` into the writable tools mount. This never changes
+case evidence. While the viewer is stopped:
+
+```sh
+docker run --rm --network none -v "$PWD/inputs:/input:ro" -v kamotrace-case:/case -v kamotrace-tools:/tools kamotrace suzaku --case /case/case.json --source /input/event_history.json
 docker run --rm -v kamotrace-tools:/tools kamotrace get-dbip
-docker run --rm -v C:\case:/case -v kamotrace-tools:/tools kamotrace enrich --case /case/case.json --geolite2 /tools/dbip-lite-2026-10
-docker run --rm --name kamotrace -p 127.0.0.1:8765:8765 -v C:\case:/case kamotrace serve --case /case/case.json
+docker run --rm --network none -v kamotrace-case:/case -v kamotrace-tools:/tools kamotrace enrich --case /case/case.json --geolite2 /tools/dbip-lite-2026-10
 ```
 
-Then open **http://127.0.0.1:8765**. Sidecars (notes/tags, detections,
-enrichment) are written beside the case JSON, so stop the container before
-backing it up with all referenced artifacts. Evidence remains read-only.
+Use the actual folder printed by `get-dbip`, not the example's month. Adding
+units changes selection-bound detection/enrichment identities: rebuild those
+sidecars explicitly for the final selection (with `--replace` where required)
+before reopening; stale sidecars fail closed. Findings/tags bind to the stable
+case instead and are retained.
+
+Run Iwatobi explicitly, with rules relative to its retained installation:
+
+```sh
+docker run --rm --network none -v "$PWD/inputs:/input:ro" -v kamotrace-case:/case --workdir /opt/tools/iwatobi-d4b5f02cbd7fe7a044f8a5e1153157355489bd5b --entrypoint iwatobi kamotrace dfir-timeline -f /input/uac-host-1/var/log/apache2/access.log -r rules/iwatobi/web/webserver/web_rapid_posts_to_php_index.yml -z UTC --forensic-output /case/iwatobi.json --evidence-manifest /input/iwatobi-evidence-manifest.json -q -K -w -Q
+docker run -d --name kamotrace -p 127.0.0.1:8765:8765 -v kamotrace-case:/case kamotrace serve --case /case/case.json --iwatobi /case/iwatobi.json
+```
+
+Create a manifest matching the parsed acquisition's exact source IDs, hashes,
+paths and decoded-line references as described under [native attachment](#native-iwatobi-attachments).
+It is not guessed from time/IP. Stop/remove any existing `kamotrace` container
+first. Browsing only reads retained results; it never runs a detector.
 
 Inside the container the server must listen on all interfaces
 (`KAMOTRACE_BIND=0.0.0.0`) so Docker can publish the port. **Always publish it
 as `-p 127.0.0.1:PORT:PORT`**: there is no authentication, and a plain
 `-p 8765:8765` exposes the evidence to your network. The Host/Origin checks stay
 on, which means the host and container port must be the same; for another port
-use `--port 8766 -p 127.0.0.1:8766:8766`. Other containers on the same Docker
+publish `-p 127.0.0.1:8766:8766` and pass
+`serve --case /case/case.json --port 8766` after the image name.
+Other containers on the same Docker
 network can also reach the port; don't attach the container to shared
 networks.
 
@@ -818,8 +951,9 @@ Attachment is rebuilt in disposable runtime state on explicit reopen, streaming 
 ## Suzaku detections
 
 [Suzaku](https://yamato-security.github.io/suzaku/) (Yamato Security) is a
-Sigma-based threat-hunting and timeline tool for cloud logs. KamoTrace does not
-bundle it (Suzaku is AGPL-3.0). Supported input is Suzaku 3.x `aws-ct-timeline`
+Sigma-based threat-hunting and timeline tool for cloud logs. The Python package
+does not bundle it; the Docker image includes verified Suzaku 3.0.0 (AGPL-3.0).
+Supported input is Suzaku 3.x `aws-ct-timeline`
 DuckDB output (`suzaku_meta` schema version 1, UTC timestamps).
 
 ### Download and run Suzaku
@@ -2082,7 +2216,9 @@ Review screenshots and exports before sharing them. Run the
 ## Open-source components
 
 KamoTrace is released under the [MIT licence](../LICENSE). Suzaku is a separate,
-AGPL-3.0 tool that you install yourself; KamoTrace only runs it or reads its output.
+AGPL-3.0 tool, installed explicitly for Python users and included in Docker.
+Iwatobi (RPL-1.5) and TraceQuarry retain their own licences and pinned sources
+in the Docker image; those licences are not replaced by KamoTrace's MIT licence.
 
 [DuckDB](https://duckdb.org/) handles local event queries;
 [Tabulator](https://github.com/olifolkerd/tabulator) provides the grids and
@@ -2113,8 +2249,10 @@ Source paths and usage attribution are in `static/vendor/aws-icons/NOTICE.md`.
 ### Read CI results
 
 GitHub Actions runs the HTTP/MCP contract suite on Python 3.14 (matching the
-Dockerfile) for pushes and pull requests, plus JavaScript syntax, package-build
-and Docker image-build checks. Jobs use the pinned Ubuntu 24.04 runner.
+Dockerfile) for pushes and pull requests, plus JavaScript syntax and package-build
+checks. A separate Docker job builds both pinned forks and Suzaku, then runs
+`tests/docker_smoke.py` against the real image, offline, with synthetic evidence.
+Jobs use the pinned Ubuntu 24.04 runner.
 A Chromium smoke test opens the real app with disposable synthetic evidence,
 verifies all five events render, then searches and checks the three matching
 `SendCommand` rows. Each run uploads `browser-test-results` (screenshots, log
@@ -2141,11 +2279,16 @@ uv run python -m unittest discover -s tests
 node --check src/kamotrace/static/app.js
 uv build
 docker build -t kamotrace .
+python tests/docker_smoke.py --image kamotrace
 ```
 
 Only the optional JavaScript syntax check needs Node. There is no Node build.
-The unit tests never download Suzaku or DB-IP; check `get-suzaku`, `get-dbip`
-and a real Suzaku run in the container by hand, on synthetic data.
+The unit tests never download Suzaku or DB-IP. The separate Docker build downloads
+Suzaku and fork sources; its smoke test exercises real parsing, explicit admission
+and preparation, search, exact Iwatobi attachment, a real Suzaku run, additive
+loading, persisted Findings/tags, container recreation/restart, clean stop,
+read-only inputs and the published loopback port's Host check. `get-dbip` remains
+an optional manual network check, never part of the image or synthetic tests.
 
 ### Understand test coverage
 

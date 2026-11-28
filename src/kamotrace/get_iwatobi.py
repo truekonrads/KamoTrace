@@ -1,6 +1,7 @@
 """Build and verify the pinned Iwatobi forensic-export fork (requires Git and Rust 1.88+).
 
-Iwatobi is not bundled. The qualified fork, not an upstream 1.0.0 release,
+The Python package does not bundle Iwatobi; Docker runs this installer at build time.
+The qualified fork, not an upstream 1.0.0 release,
 provides the exact source references understood by KamoTrace's native attachment.
 Only synthetic packaged examples are scanned during installation.
 """

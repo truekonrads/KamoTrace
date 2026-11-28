@@ -1,6 +1,7 @@
 """Download the official Suzaku 3.x release for this platform and verify its published SHA-256.
 
-KamoTrace never bundles Suzaku (AGPL-3.0, Yamato Security). This helper fetches the analyst's own
+The Python package does not bundle Suzaku (AGPL-3.0, Yamato Security); Docker runs this helper at build time.
+This helper fetches the analyst's own
 copy from https://github.com/Yamato-Security/suzaku/releases into a tools folder, where
 `kamotrace suzaku` finds it. GitHub's asset digest guards against corrupted or altered downloads;
 it cannot vouch for the release itself.

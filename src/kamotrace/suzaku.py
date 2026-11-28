@@ -2,7 +2,7 @@
 
 Suzaku's `aws-ct-timeline -t duckdb` output is read as untrusted data and re-expressed in KamoTrace's
 own model: one row per (evidence record, rule match), linked by exact eventID, region and event time.
-The evidence database is attached read-only and never modified; Suzaku itself is never bundled.
+The evidence database is attached read-only and never modified; only the Docker image bundles Suzaku.
 """
 import argparse
 from contextlib import nullcontext

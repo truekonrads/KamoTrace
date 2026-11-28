@@ -66,8 +66,6 @@ jobs:
           set -o pipefail
           uv run --locked --with playwright==1.64.1 python tests/browser_smoke.py 2>&1 | tee test-results/browser.log
           uv run --locked --with playwright==1.64.1 python tests/browser_computers.py 2>&1 | tee test-results/computers.log
-      - name: Build Docker image
-        run: docker build -t kamotrace:ci .
       - uses: actions/upload-artifact@v7.0.2
         id: browser-results
         if: always()
@@ -88,3 +86,14 @@ jobs:
             echo "[Download screenshots, browser log and Playwright trace]($RESULTS_URL)"
             echo 'Screenshots: events.png and search.png. On browser failures, also inspect failure.png and trace.zip.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  docker:
+    name: Integrated Docker workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build pinned native tools and KamoTrace
+        run: docker build -t kamotrace:ci .
+      - name: Offline parsing, detection, additive case and recreation
+        run: python3 tests/docker_smoke.py --image kamotrace:ci

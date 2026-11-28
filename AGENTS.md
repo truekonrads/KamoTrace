@@ -43,7 +43,8 @@ public interface changes; recheck changed skill examples through a real MCP sess
   gaps; neither date prefixes nor an event-time extent proves complete logs.
 - Keep AWS audits read-only and bounded. `trailcheck` never reads object bodies;
   `ssmcheck` never reads output payloads or reports parameter values/caller ARNs.
-  Browsing never triggers AWS/DNS/network lookups. Do not bundle Suzaku or geolocation
+  Browsing never triggers AWS/DNS/network lookups. The Docker image may bundle
+  checksum-verified Suzaku with its licence/provenance; do not bundle geolocation
   data, download MaxMind databases, or remove DB-IP Lite's CC BY 4.0 attribution.
 - SSM command/output data is currently JSON-backed in memory, not persistent
   DuckDB tables. Do not describe it as imported into DuckDB.

@@ -26,6 +26,11 @@ For UAC parsing, [`get-tracequarry`](docs/preparation.md#set-up-tracequarry-for-
 
 ## Get started
 
+Prefer containers? The [integrated Docker workflow](docs/user-guide.md#docker)
+includes KamoTrace, Suzaku and both pinned UAC fork builds, with persistent case
+volumes, read-only inputs and explicit additive loads; no host compiler or Python
+setup is needed.
+
 You need Python 3.11+, [uv](https://docs.astral.sh/uv/getting-started/installation/)
 and a local checkout of this repository. No database server, Docker or Node.js
 build is required. These examples use PowerShell; replace the paths and AWS
@@ -221,8 +226,10 @@ filters, value counts and the timeline.
 
 ## Licence and credits
 
-KamoTrace uses the [MIT licence](LICENSE). Suzaku is a separate AGPL-3.0 tool;
-it is not bundled. Geolocation data is not bundled either. If you use DB-IP Lite
+KamoTrace uses the [MIT licence](LICENSE). The Docker image additionally includes
+Suzaku (AGPL-3.0), Iwatobi (RPL-1.5) and TraceQuarry with their own licences and
+provenance; the Python package does not bundle these tools. Geolocation data is
+not bundled. If you use DB-IP Lite
 in reports, credit [IP Geolocation by DB-IP](https://db-ip.com) under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 See [component licences](docs/user-guide.md#open-source-components).

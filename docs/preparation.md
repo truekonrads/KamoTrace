@@ -41,7 +41,7 @@ Manifest/artifact publication fsyncs files and, on POSIX, their parent directori
 
 ## Set up TraceQuarry for UAC
 
-`get-tracequarry` installs the separate [truekonrads/TraceQuarry fork](https://github.com/truekonrads/TraceQuarry) at exact commit `26c941fb575347c055f79a1c10ed68ba9bdb8a2d` (tree `a328e04ab6dbc2f53083905d5cdc608c0fe874a3`). Upstream and the fork's current `main` are **not substitutes**: they lack the required ECS parse-only/native-reader contract. Nothing is bundled with KamoTrace, and import, preparation and browsing never download or execute TraceQuarry.
+`get-tracequarry` installs the separate [truekonrads/TraceQuarry fork](https://github.com/truekonrads/TraceQuarry) at exact commit `26c941fb575347c055f79a1c10ed68ba9bdb8a2d` (tree `a328e04ab6dbc2f53083905d5cdc608c0fe874a3`). Upstream and the fork's current `main` are **not substitutes**: they lack the required ECS parse-only/native-reader contract. The Python package does not bundle it; the [Docker image](user-guide.md#docker) builds and includes it using this installer. Import, preparation and browsing never download or execute TraceQuarry.
 
 The required source is published on the fork's [`kamotrace-uac` branch](https://github.com/truekonrads/TraceQuarry/tree/kamotrace-uac). Setup verifies the exact commit rather than following future branch changes. If that object is unavailable, it fails rather than falling back to `main`. No private evidence, developer source bundle or prebuilt helper is needed for normal setup.
 

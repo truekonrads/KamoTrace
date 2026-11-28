@@ -1,0 +1,65 @@
+name: Publish release image
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-image-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Qualify and publish Linux amd64 image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - name: Select release image tags
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "$RELEASE_TAG" == latest || ! "$RELEASE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+            echo 'Use a valid Docker release tag (1–128 letters, digits, underscores, dots or hyphens); latest is reserved.'
+            exit 1
+          fi
+          echo "IMAGE=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "VERSION=$RELEASE_TAG" >> "$GITHUB_ENV"
+      - name: Build the tagged source with pinned tools
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=$SOURCE_URL" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            -t "$IMAGE:$VERSION" .
+      - name: Qualify offline parsing, detection and persistent cases
+        run: python3 tests/docker_smoke.py --image "$IMAGE:$VERSION"
+      - name: Sign in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+      - name: Publish the qualified image
+        env:
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          docker push "$IMAGE:$VERSION"
+          if [[ "$PRERELEASE" == 'false' ]]; then
+            docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+      - name: Sign out of the registry
+        if: always()
+        run: docker logout ghcr.io

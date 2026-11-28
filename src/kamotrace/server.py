@@ -1748,7 +1748,11 @@ def main(argv=None):
             print(setup, flush=True)
             from .memory import MemoryMonitor
             transports.enter_context(MemoryMonitor(store))
-            server.serve_forever()
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                # Close MCP's async lifespan normally, without wrapping Ctrl-C in an exception group.
+                pass
     except KeyboardInterrupt:
         pass
     finally:
